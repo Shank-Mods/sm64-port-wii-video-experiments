@@ -21,10 +21,22 @@
 
 // Debug log for hardware testing: appends a line to sm64_debug.txt in the root of every
 // mounted FAT device (SD and USB), closing the file each time so nothing is lost on a hang
+static bool dbg_fat_ready;
+
+// fatInitDefault() once; calling it a second time re-initialises the USB driver
+static void fat_init_once(void)
+{
+#ifdef TARGET_GX
+    if (!dbg_fat_ready) {
+        fatInitDefault();
+        dbg_fat_ready = true;
+    }
+#endif
+}
+
 void dbglog(const char *fmt, ...)
 {
 #ifdef TARGET_GX
-    static bool fat_ready;
     static bool header_done;
 #ifndef DBGLOG_NAME
 #define DBGLOG_NAME "sm64_debug.txt"
@@ -33,10 +45,7 @@ void dbglog(const char *fmt, ...)
     char line[256];
     va_list ap;
 
-    if (!fat_ready) {
-        fatInitDefault();
-        fat_ready = true;
-    }
+    fat_init_once();
 
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
@@ -339,25 +348,29 @@ void configfile_switch_storage_device(unsigned int newDevice) {
 void configfile_load(const char *filename) {
     const char *path = filename;
 #ifdef __wii__
-    fatInitDefault();
+    fat_init_once();
+    dbglog("config: fat ready");
     // ALways prefer SD
     configStorageDevice = STORAGE_DEVICE_SD;
     char probe[64];
     build_storage_path(probe, sizeof(probe), STORAGE_DEVICE_SD, filename);
     FILE *probeFile = fopen(probe, "r");
+    dbglog("config: sd probe %s", probeFile ? "found" : "none");
     if (probeFile != NULL) {
         fclose(probeFile);
     } else {
         build_storage_path(probe, sizeof(probe), STORAGE_DEVICE_USB, filename);
         probeFile = fopen(probe, "r");
+        dbglog("config: usb probe %s", probeFile ? "found" : "none");
         if (probeFile != NULL) {
             fclose(probeFile);
             configStorageDevice = STORAGE_DEVICE_USB;
         }
     }
     path = get_storage_path(filename);
+    dbglog("config: path %s", path);
 #elif defined(TARGET_GX)
-    fatInitDefault();
+    fat_init_once();
 #endif
     FILE *file;
     char *line;
@@ -368,7 +381,9 @@ void configfile_load(const char *filename) {
     if (file == NULL) {
         // Create a new config file and save defaults
         printf("Config file '%s' not found. Creating it.\n", path);
+        dbglog("config: not found, saving defaults");
         configfile_save(filename);
+        dbglog("config: defaults saved");
         return;
     }
 
@@ -466,10 +481,10 @@ void configfile_resolve_widescreen(void) {
 void configfile_save(const char *filename) {
     const char *path = filename;
 #ifdef __wii__
-    fatInitDefault();
+    fat_init_once();
     path = get_storage_path(filename);
 #elif defined(TARGET_GX)
-    fatInitDefault();
+    fat_init_once();
 #endif
     FILE *file;
 

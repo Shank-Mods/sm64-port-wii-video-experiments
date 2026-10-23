@@ -197,6 +197,7 @@ void main_func(void) {
 #ifdef HIRES_FORCE
     configHires1280 = HIRES_FORCE;
 #endif
+    dbglog("config load returned");
     configfile_resolve_widescreen();
     dbglog("config loaded: hires_1280x240p=%d 240p=%d widescreen=%d storage=%u",
            configHires1280, config240p, configWidescreen, configStorageDevice);
