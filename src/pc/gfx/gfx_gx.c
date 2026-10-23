@@ -1144,6 +1144,11 @@ static void hr_replay(void)
             GX_CallDispList(hr_dl + seg->offset, seg->size);
         }
 
+        // The copy's clear only writes Z (and colour) when those updates are enabled, and
+        // the frame may have ended with depth writes off
+        GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+        GX_SetColorUpdate(GX_TRUE);
+        GX_SetAlphaUpdate(GX_TRUE);
         GX_CopyDisp((uint8_t *)xfb + t * HIRES_TILE_WIDTH * 2, GX_TRUE);
     }
 
