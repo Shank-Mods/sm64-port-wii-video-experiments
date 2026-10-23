@@ -26,7 +26,10 @@ void dbglog(const char *fmt, ...)
 #ifdef TARGET_GX
     static bool fat_ready;
     static bool header_done;
-    static const char *const paths[] = { "sd:/sm64_debug.txt", "usb:/sm64_debug.txt" };
+#ifndef DBGLOG_NAME
+#define DBGLOG_NAME "sm64_debug.txt"
+#endif
+    static const char *const paths[] = { "sd:/" DBGLOG_NAME, "usb:/" DBGLOG_NAME };
     char line[256];
     va_list ap;
 
