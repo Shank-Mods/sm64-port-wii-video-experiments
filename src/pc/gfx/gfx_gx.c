@@ -52,6 +52,36 @@ static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 #define GX_DECAL_BIAS 0.0001f
 #define GX_TEXTURE_EDGE_ALPHA_THRESHOLD 76
 
+// 1280x240p tiled rendering
+// The EFB is 640 pixels wide, so a 1280 pixel wide frame is rendered twice: once for the left
+// half and once for the right half, each copied into its half of the 1280 wide XFB. The frame's
+// GX commands are recorded into display list segments once, then replayed for each tile. Viewport
+// and scissor are kept out of the recorded commands (each segment remembers them) so they can be
+// adjusted per tile. Tile 1 shifts the viewport 300 pixels left and uses a scissor offset of 340,
+// so the screen-space x range 640..1279 lands on EFB x 0..639.
+#define HIRES_DL_SIZE (6 * 1024 * 1024)
+#define HIRES_MAX_SEGS 8192
+#define HIRES_TILE1_VP_SHIFT 300
+
+struct HiresSeg {
+    uint32_t offset;
+    uint32_t size;
+    int vp[4];
+    f32 far_z;
+    int sc[4];
+};
+
+static bool hr_enabled;
+static uint8_t *hr_dl;
+static struct HiresSeg hr_segs[HIRES_MAX_SEGS];
+static int hr_nseg;
+static uint32_t hr_pos;
+static bool hr_recording;
+static bool hr_seg_drawn;
+static bool hr_overflow;
+
+static int sc_x, sc_y, sc_w, sc_h; // current scissor, in GX_SetScissor terms
+
 static Mtx44 gx_perspective_mtx; // 3D feeds -w as z, GX divides by real w
 static Mtx44 gx_ortho_mtx;       // 2D/HUD: pass-through of already-NDC coords
 
@@ -269,7 +299,7 @@ static int update_tev_combiner(struct ShaderProgram *prg)
     }
 
     GX_SetNumTexGens(has_tex ? 1 : 0);
-    if (has_tex)
+    if (has_tex && !hr_enabled)
     {
         GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
     }
@@ -374,9 +404,31 @@ static void update_tev(struct ShaderProgram *prg)
     }
 }
 
+// Fixed vertex format used in 1280x240p mode, so the recorded display lists never need to
+// change CP vertex descriptor registers: position, two colours and one texture coordinate.
+static void gx_set_fixed_vtx_desc(void)
+{
+    GX_InvVtxCache();
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+    GX_SetVtxDesc(GX_VA_CLR1, GX_DIRECT);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
+    GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+    // Matrix index registers live in CP too; the texgen never changes, so set it once
+    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+    GX_Flush(); // push the CP register writes out now, outside any display list
+}
+
 static void update_vtx_desc(struct ShaderProgram *prg)
 {
     bool has_tex = prg->cc_features.used_textures[0] || prg->cc_features.used_textures[1];
+
+    if (hr_enabled)
+        return;
 
     // clear description
     GX_InvVtxCache();
@@ -517,6 +569,9 @@ static void gx_defer_texture_free(uint16_t *data)
 
     if (deferred_texture_free_count == TEXTURE_POOL_SIZE)
     {
+        // Can't wait for the GPU while a frame is being recorded; leak instead (very rare)
+        if (hr_recording)
+            return;
         GX_DrawDone();
         gx_free_deferred_texture_data();
     }
@@ -573,6 +628,8 @@ static void gfx_gx_upload_texture(const uint8_t *rgba32_buf, int width, int heig
     uint16_t *dest = memalign(32, texture_size);
     if (dest == NULL)
     {
+        if (hr_recording)
+            return;
         GX_DrawDone();
         gx_free_deferred_texture_data();
         dest = memalign(32, texture_size);
@@ -636,10 +693,76 @@ static void gfx_gx_set_depth_mask(bool z_upd)
     set_z_mode();
 }
 
+static void hr_seg_capture(struct HiresSeg *seg)
+{
+    seg->vp[0] = vp_x;
+    seg->vp[1] = vp_y;
+    seg->vp[2] = vp_w;
+    seg->vp[3] = vp_h;
+    seg->far_z = applied_far_z;
+    seg->sc[0] = sc_x;
+    seg->sc[1] = sc_y;
+    seg->sc[2] = sc_w;
+    seg->sc[3] = sc_h;
+}
+
+static void hr_begin_seg(void)
+{
+    struct HiresSeg *seg = &hr_segs[hr_nseg];
+    seg->offset = hr_pos;
+    seg->size = 0;
+    hr_seg_capture(seg);
+    hr_seg_drawn = false;
+    GX_BeginDispList(hr_dl + hr_pos, HIRES_DL_SIZE - hr_pos);
+}
+
+static void hr_end_seg(void)
+{
+    u32 n = GX_EndDispList();
+    if (n == 0)
+    {
+        hr_overflow = true;
+        return;
+    }
+    hr_segs[hr_nseg].size = n;
+    hr_pos += n;
+    hr_nseg++;
+}
+
+// Viewport or scissor changed while recording
+static void hr_state_changed(void)
+{
+    if (hr_overflow)
+        return; // the list overflowed; the rest of this frame draws directly and is discarded
+    if (!hr_seg_drawn || hr_overflow || hr_nseg >= HIRES_MAX_SEGS - 1
+        || hr_pos + 64 * 1024 > HIRES_DL_SIZE)
+    {
+        // Nothing drawn under the old state yet (or out of room): just retarget this segment
+        hr_seg_capture(&hr_segs[hr_nseg]);
+        return;
+    }
+    hr_end_seg();
+    if (hr_overflow)
+        return;
+    hr_begin_seg();
+}
+
+static void hr_apply_scissor(int x, int y, int w, int h)
+{
+    // Direct (unrecorded) scissor while in hires mode: keep it inside the left tile
+    int x1 = MIN(x + w, HIRES_TILE_WIDTH);
+    GX_SetScissor(x, y, x1 > x ? x1 - x : 0, h);
+}
+
 static void gx_issue_viewport(f32 far_z)
 {
-    GX_SetViewport((f32)vp_x, (f32)vp_y, (f32)vp_w, (f32)vp_h, 0.0f, far_z); // near z, far z
     applied_far_z = far_z;
+    if (hr_recording)
+    {
+        hr_state_changed();
+        return;
+    }
+    GX_SetViewport((f32)vp_x, (f32)vp_y, (f32)vp_w, (f32)vp_h, 0.0f, far_z); // near z, far z
 }
 
 static void gfx_gx_set_zmode_decal(bool zmode_decal)
@@ -687,11 +810,23 @@ static void gfx_gx_set_scissor(int x, int y, int width, int height)
     int sw = gx_map_w(width, rmode->fbWidth);
     int sy = y * rmode->efbHeight / DESIRED_SCREEN_HEIGHT;
     int sh = height * rmode->efbHeight / DESIRED_SCREEN_HEIGHT;
-    GX_SetScissor(sx, rmode->efbHeight - sy - sh, sw, sh);
+    sc_x = sx;
+    sc_y = rmode->efbHeight - sy - sh;
+    sc_w = sw;
+    sc_h = sh;
+    if (hr_recording)
+        hr_state_changed();
+    else if (hr_enabled)
+        hr_apply_scissor(sc_x, sc_y, sc_w, sc_h);
+    else
+        GX_SetScissor(sc_x, sc_y, sc_w, sc_h);
 }
+
+static bool cur_use_alpha;
 
 static void gfx_gx_set_use_alpha(bool use_alpha)
 {
+    cur_use_alpha = use_alpha;
     if (use_alpha)
     {
         GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR); // guess
@@ -737,6 +872,9 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     if (want_far_z != applied_far_z)
         gx_issue_viewport(want_far_z);
 
+    if (hr_recording)
+        hr_seg_drawn = true;
+
     GX_Begin(GX_TRIANGLES, GX_VTXFMT0, 3 * buf_vbo_num_tris);
     {
         uint32_t offset = 0;
@@ -773,6 +911,36 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
                 fog_b = buf_vbo[offset + vtxOffs + 2];
                 fog_a = buf_vbo[offset + vtxOffs + 3]; // fog factor
                 vtxOffs += 4;
+            }
+            if (hr_enabled)
+            {
+                // Fixed format: always two colours and a texcoord
+                uint8_t col[2][4] = { { 0, 0, 0, 255 }, { 0, 0, 0, 255 } };
+                int ci = 0;
+                for (int j = 0; j < num_inputs; j++)
+                {
+                    if (ci < 2)
+                    {
+                        col[ci][0] = float_to_u8(buf_vbo[offset + vtxOffs + 0]);
+                        col[ci][1] = float_to_u8(buf_vbo[offset + vtxOffs + 1]);
+                        col[ci][2] = float_to_u8(buf_vbo[offset + vtxOffs + 2]);
+                        col[ci][3] = hasAlpha ? float_to_u8(buf_vbo[offset + vtxOffs + 3]) : 255;
+                        ci++;
+                    }
+                    vtxOffs += hasAlpha ? 4 : 3;
+                }
+                if (emit_fog && ci < 2)
+                {
+                    col[ci][0] = float_to_u8(fog_r);
+                    col[ci][1] = float_to_u8(fog_g);
+                    col[ci][2] = float_to_u8(fog_b);
+                    col[ci][3] = float_to_u8(fog_a);
+                }
+                GX_Color4u8(col[0][0], col[0][1], col[0][2], col[0][3]);
+                GX_Color4u8(col[1][0], col[1][1], col[1][2], col[1][3]);
+                GX_TexCoord2f32(s, t);
+                offset += num_floats;
+                continue;
             }
             for (int j = 0; j < num_inputs; j++)
             {
@@ -819,9 +987,21 @@ static void gx_setup_efb(void)
     vp_w = rmode->fbWidth;
     vp_h = rmode->efbHeight;
     gx_issue_viewport(1.0f); // plain (0, 1) range
-    GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
+    sc_x = 0;
+    sc_y = 0;
+    sc_w = rmode->fbWidth;
+    sc_h = rmode->efbHeight;
     GX_SetDispCopyYScale((f32)rmode->xfbHeight / (f32)rmode->efbHeight);
-    GX_SetDispCopySrc(0, 0, rmode->fbWidth, rmode->efbHeight);
+    if (hr_enabled)
+    {
+        hr_apply_scissor(sc_x, sc_y, sc_w, sc_h);
+        GX_SetDispCopySrc(0, 0, HIRES_TILE_WIDTH, rmode->efbHeight);
+    }
+    else
+    {
+        GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
+        GX_SetDispCopySrc(0, 0, rmode->fbWidth, rmode->efbHeight);
+    }
     GX_SetDispCopyDst(rmode->fbWidth, rmode->xfbHeight);
     gx_apply_copy_filter();
     GX_SetFieldMode(rmode->field_rendering, ((rmode->viHeight == 2 * rmode->xfbHeight) ? GX_ENABLE : GX_DISABLE));
@@ -859,6 +1039,21 @@ static void gx_init()
 {
     // initialise graphics
     GX_Init(gp_fifo, DEFAULT_FIFO_SIZE);
+
+    if (gfx_gx_wm_hires())
+    {
+        hr_dl = memalign(32, HIRES_DL_SIZE);
+        if (hr_dl != NULL)
+        {
+            // The CPU never touches the list; make sure no stale cache lines get written over it
+            DCInvalidateRange(hr_dl, HIRES_DL_SIZE);
+            hr_enabled = true;
+            // Keep libogc's register shadows as recorded, rather than rolling them back at the
+            // end of every display list segment
+            GX_SetMisc(GX_MT_DL_SAVE_CTX, 0);
+            gx_set_fixed_vtx_desc();
+        }
+    }
 
     gx_setup_efb();
 
@@ -905,12 +1100,68 @@ static void gfx_gx_start_frame(void)
         gx_apply_copy_filter();
     }
 
+    if (hr_enabled)
+    {
+        hr_nseg = 0;
+        hr_pos = 0;
+        hr_overflow = false;
+        hr_recording = true;
+        hr_begin_seg();
+
+        // Each tile replays this frame from the state the previous replay left behind, so the
+        // frame has to start by setting everything gfx_pc expects to carry over between frames
+        if (shader_program_pool_size > 0)
+            gfx_gx_load_shader(&shader_program_pool[current_shader]);
+        gfx_gx_set_use_alpha(cur_use_alpha);
+        GX_SetColorUpdate(GX_TRUE);
+    }
+
     GX_InvalidateTexAll();
     set_z_mode();
 }
 
+static void hr_replay(void)
+{
+    void *xfb = gfx_gx_wm_get_back_buffer();
+
+    for (int t = 0; t < 2; t++)
+    {
+        int shift = t ? HIRES_TILE1_VP_SHIFT : 0;
+        int tile_x0 = t * HIRES_TILE_WIDTH;
+        int tile_x1 = tile_x0 + HIRES_TILE_WIDTH;
+
+        GX_SetScissorBoxOffset(tile_x0 - shift, 0);
+
+        for (int i = 0; i < hr_nseg; i++)
+        {
+            const struct HiresSeg *seg = &hr_segs[i];
+            int x0 = MAX(seg->sc[0], tile_x0);
+            int x1 = MIN(seg->sc[0] + seg->sc[2], tile_x1);
+
+            GX_SetViewport((f32)(seg->vp[0] - shift), (f32)seg->vp[1], (f32)seg->vp[2], (f32)seg->vp[3],
+                           0.0f, seg->far_z);
+            GX_SetScissor(x0 - shift, seg->sc[1], x1 > x0 ? x1 - x0 : 0, seg->sc[3]);
+            GX_CallDispList(hr_dl + seg->offset, seg->size);
+        }
+
+        GX_CopyDisp((uint8_t *)xfb + t * HIRES_TILE_WIDTH * 2, GX_TRUE);
+    }
+
+    GX_SetScissorBoxOffset(0, 0);
+    GX_Flush();
+}
+
 static void gfx_gx_end_frame(void)
 {
+    if (hr_recording)
+    {
+        if (!hr_overflow)
+            hr_end_seg();
+        hr_recording = false;
+        if (!hr_overflow)
+            hr_replay();
+    }
+
     GX_DrawDone();
     gx_free_deferred_texture_data();
 

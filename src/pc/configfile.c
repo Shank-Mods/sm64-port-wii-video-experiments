@@ -46,6 +46,7 @@ bool configWidescreen            = false; // resolved at startup from configWide
 unsigned int configWidescreenMode = WIDESCREEN_AUTO; // anamorphic 16:9
 bool configPillarbox             = false; // render 4:3 into the centre 3/4 so a 16:9 display's stretch restores correct 4:3
 bool config240p                  = false; // Output a true 240p signal instead of 480i/480p
+bool configHires1280             = true;  // 1280x240p (4:3) output, rendered as two 640x240 tiles
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
 bool configInvertCamera          = false; // Invert camera controls
 bool configRumble                = true;  // Shindou controller rumble
@@ -116,6 +117,7 @@ static const struct ConfigOption options[] = {
     {.name = "60fps",          .type = CONFIG_TYPE_BOOL, .boolValue = &config60Fps},
     {.name = "widescreen",     .type = CONFIG_TYPE_WIDESCREEN, .uintValue = &configWidescreenMode},
     {.name = "240p",           .type = CONFIG_TYPE_BOOL, .boolValue = &config240p},
+    {.name = "hires_1280x240p", .type = CONFIG_TYPE_BOOL, .boolValue = &configHires1280},
     {.name = "antialias",      .type = CONFIG_TYPE_BOOL, .boolValue = &configAntialias},
     {.name = "invert_camera",  .type = CONFIG_TYPE_BOOL, .boolValue = &configInvertCamera},
     {.name = "rumble",         .type = CONFIG_TYPE_BOOL, .boolValue = &configRumble},
@@ -415,7 +417,8 @@ void configfile_resolve_widescreen(void) {
             break;
         case WIDESCREEN_AUTO:
         default:
-            configWidescreen = configfile_console_is_widescreen();
+            // 1280x240p is a 4:3 mode, so "auto" follows the mode rather than the console setting
+            configWidescreen = configHires1280 ? false : configfile_console_is_widescreen();
             break;
     }
 #endif

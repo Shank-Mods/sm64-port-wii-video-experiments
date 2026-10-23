@@ -2716,6 +2716,7 @@ static const struct GxConfigRow sGxConfigPuppy[] = {
 };
 static const struct GxConfigRow sGxConfigRestart[] = {
     { .label = "240P",          .kind = GX_KIND_BOOL,   .boolVal = &config240p },
+    { .label = "1280X240P",     .kind = GX_KIND_BOOL,   .boolVal = &configHires1280 },
     { .label = "ANTIALIAS",     .kind = GX_KIND_BOOL,   .boolVal = &configAntialias },
     { .label = "SAVE AND RESTART", .kind = GX_KIND_ACTION, .action  = GX_ACT_SAVE_QUIT },
     { .label = "BACK",          .kind = GX_KIND_ACTION, .action  = GX_ACT_BACK },

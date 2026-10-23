@@ -32,6 +32,7 @@ extern unsigned int configWidescreenMode;
 extern bool         configPillarbox;
 extern bool         config240p;
 extern bool         configAntialias;
+extern bool         configHires1280;
 extern bool         configInvertCamera;
 extern bool         configRumble;
 extern bool         configFog;
