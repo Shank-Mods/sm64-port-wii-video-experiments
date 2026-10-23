@@ -10,6 +10,7 @@
 #include <fat.h>
 #ifdef __wii__
 #include <sys/stat.h>
+#include <sys/iosupport.h>
 #include <wiiuse/wpad.h>
 #include <ogc/conf.h>
 #endif
@@ -282,8 +283,16 @@ static void build_storage_path(char *buf, size_t size, unsigned int device, cons
     snprintf(buf, size, "%s/apps/sm64/%s", device_root(device), filename);
 }
 
+// True if the device ("sd:" or "usb:") was mounted by fatInitDefault()
+static bool storage_device_mounted(unsigned int device) {
+    return FindDevice(device_root(device)) >= 0;
+}
+
 static void ensure_storage_dir(unsigned int device) {
     char dir[64];
+    // mkdir() on a device that isn't mounted crashes with some newlib versions
+    if (!storage_device_mounted(device))
+        return;
     snprintf(dir, sizeof(dir), "%s/apps", device_root(device));
     mkdir(dir, 0777);
     snprintf(dir, sizeof(dir), "%s/apps/sm64", device_root(device));
@@ -365,8 +374,14 @@ void configfile_load(const char *filename) {
         if (probeFile != NULL) {
             fclose(probeFile);
             configStorageDevice = STORAGE_DEVICE_USB;
+        } else if (!storage_device_mounted(STORAGE_DEVICE_SD)
+                   && storage_device_mounted(STORAGE_DEVICE_USB)) {
+            // No SD card: keep the config and save on the USB drive
+            configStorageDevice = STORAGE_DEVICE_USB;
         }
     }
+    dbglog("config: mounted sd=%d usb=%d", storage_device_mounted(STORAGE_DEVICE_SD),
+           storage_device_mounted(STORAGE_DEVICE_USB));
     path = get_storage_path(filename);
     dbglog("config: path %s", path);
 #elif defined(TARGET_GX)
