@@ -20,8 +20,6 @@
 #include "configfile.h"
 #include <stdarg.h>
 
-// Debug log for hardware testing: appends a line to sm64_debug.txt in the root of every
-// mounted FAT device (SD and USB), closing the file each time so nothing is lost on a hang
 static bool dbg_fat_ready;
 
 // fatInitDefault() once; calling it a second time re-initialises the USB driver
@@ -35,9 +33,12 @@ static void fat_init_once(void)
 #endif
 }
 
+// Debug log for hardware testing, compiled in only with -DDBGLOG: appends a line to
+// sm64_debug.txt in the root of every mounted FAT device (SD and USB), closing the file each
+// time so nothing is lost on a hang
 void dbglog(const char *fmt, ...)
 {
-#ifdef TARGET_GX
+#if defined(TARGET_GX) && defined(DBGLOG)
     static bool header_done;
 #ifndef DBGLOG_NAME
 #define DBGLOG_NAME "sm64_debug.txt"

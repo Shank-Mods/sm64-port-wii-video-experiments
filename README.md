@@ -18,12 +18,32 @@ I didn't test enough on Gamecube to make the same claim, but it should be able t
 
 ![Enhancements Menu](docs/settings.png)
 
+## 1280x240p mode (Wii, this fork)
+
+This fork adds an experimental **1280x240p** output mode for the Wii: a 240p signal with 1280
+pixels per line (4:3), for scalers and digital video mods that pass the full horizontal
+resolution through. It is **on by default** in this fork.
+
+- Toggle it in the pause menu under RESTART OPTIONS > 1280X240P, or set
+  `hires_1280x240p true`/`false` in `apps/sm64/sm64config.txt`. It takes priority over 240P.
+- WIDESCREEN AUTO resolves to 4:3 in this mode.
+- Tested on a Wii with a GCVideo-based digital output (Wii Dual). The analog component output
+  (AVE-RVL) blanks this mode.
+
+How it works: the Wii's embedded framebuffer is only 640 pixels wide, so each frame is recorded
+once into display lists and drawn twice, once per 640x240 half. Each half uses a viewport the
+size of the framebuffer, with the projection rescaled so its slice of the frame fills it, and is
+copied into its half of a 1280-wide XFB. The VI scans that out with a 54 MHz pixel clock.
+
+If the game can't find an SD card, it now keeps its config and saves on the USB drive.
+
 ## Enhancements Menu Options
 | Enhancement    | Options                 | Description                                                                                                                                                                                                             |
 |----------------|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 60FPS          | On/Off                  | Enable interpolated 60FPS mode.                                                                                                                                                                                         |
 | WIDESCREEN     | On/Off/Auto/Pillarboxed | Enable/Disable widescreen. Auto goes based on Wii's system settings. Pillarboxing is for 4:3 on 16:9 displays to not get stretching.                                                                                    |
 | 240P           | On/Off                  | Output at 240p over 480i/p [Requires restart to apply].                                                                                                                                                                 |
+| 1280X240P      | On/Off                  | (This fork) Output 1280x240p (4:3), rendered as two 640x240 halves [Requires restart to apply].                                                                                                                       |
 | ANTIALIAS      | On/Off                  | Enable/Disable antialiasing [Only applies when 240p is on and requires restart to apply].                                                                                                                               |
 | INVERT CAMERA  | On/Off                  | Flip the camera movement caused by right and left c-buttons [Set to off if using Puppycam].                                                                                                                             |
 | RUMBLE         | On/Off                  | Enable/Disable the Shindou version's rumble on any region.                                                                                                                                                              |
