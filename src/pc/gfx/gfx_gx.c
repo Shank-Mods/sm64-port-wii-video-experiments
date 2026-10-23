@@ -57,11 +57,12 @@ static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 // half and once for the right half, each copied into its half of the 1280 wide XFB. The frame's
 // GX commands are recorded into display list segments once, then replayed for each tile. Viewport
 // and scissor are kept out of the recorded commands (each segment remembers them) so they can be
-// adjusted per tile. Tile 1 shifts the viewport 300 pixels left and uses a scissor offset of 340,
-// so the screen-space x range 640..1279 lands on EFB x 0..639.
+// adjusted per tile. The projection matrix is kept out too: for each tile the hardware viewport
+// is exactly the 640 pixel EFB, and the projection is rescaled so that tile's slice of the frame
+// fills it. Geometry outside the tile is then clipped by the transform unit, so no screen
+// coordinate ever lands far outside the EFB (the rasterizer mangles triangles that do).
 #define HIRES_DL_SIZE (6 * 1024 * 1024)
 #define HIRES_MAX_SEGS 8192
-#define HIRES_TILE1_VP_SHIFT 300
 
 struct HiresSeg {
     uint32_t offset;
@@ -69,7 +70,10 @@ struct HiresSeg {
     int vp[4];
     f32 far_z;
     int sc[4];
+    bool is_2d;
 };
+
+static bool cur_is_2d; // projection the current draws use (orthographic for 2D)
 
 static bool hr_enabled;
 static uint8_t *hr_dl;
@@ -704,6 +708,7 @@ static void hr_seg_capture(struct HiresSeg *seg)
     seg->sc[1] = sc_y;
     seg->sc[2] = sc_w;
     seg->sc[3] = sc_h;
+    seg->is_2d = cur_is_2d;
 }
 
 static void hr_begin_seg(void)
@@ -863,7 +868,16 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     // gfx_pc emits 2D rectangles with w == 1
     bool is_2d = (buf_vbo[3] == 1.0f);
 
-    if (is_2d)
+    if (hr_recording)
+    {
+        // Projection is applied per tile at replay time
+        if (is_2d != cur_is_2d)
+        {
+            cur_is_2d = is_2d;
+            hr_state_changed();
+        }
+    }
+    else if (is_2d)
         GX_LoadProjectionMtx(gx_ortho_mtx, GX_ORTHOGRAPHIC);
     else
         GX_LoadProjectionMtx(gx_perspective_mtx, GX_PERSPECTIVE);
@@ -1122,17 +1136,28 @@ static void gfx_gx_start_frame(void)
     set_z_mode();
 }
 
+// Projection for one segment on one tile: x_ndc' = a * x_ndc + b maps the part of the segment's
+// viewport (in 1280 wide frame coordinates) that falls inside the tile onto a 640 wide viewport
+static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0)
+{
+    Mtx44 m;
+    const f32 a = (f32)seg->vp[2] / (f32)HIRES_TILE_WIDTH;
+    const f32 b = (2.0f * (f32)(seg->vp[0] - tile_x0) + (f32)seg->vp[2]) / (f32)HIRES_TILE_WIDTH - 1.0f;
+
+    memcpy(m, seg->is_2d ? gx_ortho_mtx : gx_perspective_mtx, sizeof(m));
+    for (int j = 0; j < 4; j++)
+        m[0][j] = a * m[0][j] + b * m[3][j];
+    GX_LoadProjectionMtx(m, seg->is_2d ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
+}
+
 static void hr_replay(void)
 {
     void *xfb = gfx_gx_wm_get_back_buffer();
 
     for (int t = 0; t < 2; t++)
     {
-        int shift = t ? HIRES_TILE1_VP_SHIFT : 0;
         int tile_x0 = t * HIRES_TILE_WIDTH;
         int tile_x1 = tile_x0 + HIRES_TILE_WIDTH;
-
-        GX_SetScissorBoxOffset(tile_x0 - shift, 0);
 
         for (int i = 0; i < hr_nseg; i++)
         {
@@ -1140,9 +1165,10 @@ static void hr_replay(void)
             int x0 = MAX(seg->sc[0], tile_x0);
             int x1 = MIN(seg->sc[0] + seg->sc[2], tile_x1);
 
-            GX_SetViewport((f32)(seg->vp[0] - shift), (f32)seg->vp[1], (f32)seg->vp[2], (f32)seg->vp[3],
+            hr_load_tile_projection(seg, tile_x0);
+            GX_SetViewport(0.0f, (f32)seg->vp[1], (f32)HIRES_TILE_WIDTH, (f32)seg->vp[3],
                            0.0f, seg->far_z);
-            GX_SetScissor(x0 - shift, seg->sc[1], x1 > x0 ? x1 - x0 : 0, seg->sc[3]);
+            GX_SetScissor(x0 - tile_x0, seg->sc[1], x1 > x0 ? x1 - x0 : 0, seg->sc[3]);
             GX_CallDispList(hr_dl + seg->offset, seg->size);
         }
 
@@ -1154,7 +1180,6 @@ static void hr_replay(void)
         GX_CopyDisp((uint8_t *)xfb + t * HIRES_TILE_WIDTH * 2, GX_TRUE);
     }
 
-    GX_SetScissorBoxOffset(0, 0);
     GX_Flush();
 }
 
