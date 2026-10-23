@@ -192,8 +192,14 @@ void main_func(void) {
 #endif
     gEffectsMemoryPool = mem_pool_init(0x4000, MEMORY_POOL_LEFT);
 
+    dbglog("main_func start (build " __DATE__ " " __TIME__ ")");
     configfile_load(CONFIG_FILE);
+#ifdef HIRES_FORCE
+    configHires1280 = HIRES_FORCE;
+#endif
     configfile_resolve_widescreen();
+    dbglog("config loaded: hires_1280x240p=%d 240p=%d widescreen=%d storage=%u",
+           configHires1280, config240p, configWidescreen, configStorageDevice);
     atexit(save_config);
 
 #ifdef TARGET_WEB
@@ -223,6 +229,7 @@ void main_func(void) {
 #endif
 
     gfx_init(wm_api, rendering_api, "Super Mario 64 PC-Port", configFullscreen);
+    dbglog("gfx_init done");
 
     wm_api->set_fullscreen_changed_callback(on_fullscreen_changed);
     wm_api->set_keyboard_callbacks(keyboard_on_key_down, keyboard_on_key_up, keyboard_on_all_keys_up);
@@ -255,6 +262,7 @@ void main_func(void) {
     if (audio_api == NULL) {
         audio_api = &audio_null;
     }
+    dbglog("audio init done (%s)", audio_api == &audio_null ? "null" : "ok");
 
 #if defined(TARGET_GX) && defined(VERSION_EU)
     if (gfx_gx_wm_get_field_rate() == 60) {

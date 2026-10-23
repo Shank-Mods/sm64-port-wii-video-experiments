@@ -33,6 +33,8 @@ extern bool         configPillarbox;
 extern bool         config240p;
 extern bool         configAntialias;
 extern bool         configHires1280;
+
+void dbglog(const char *fmt, ...);
 extern bool         configInvertCamera;
 extern bool         configRumble;
 extern bool         configFog;

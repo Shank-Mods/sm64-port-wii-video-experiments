@@ -92,18 +92,34 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
     }
 }
 
+static void dbg_vi_regs(const char *tag)
+{
+    volatile u16 *vi = (volatile u16 *)0xCC002000;
+    for (int r = 0; r < 0x78; r += 16)
+        dbglog("VI %s %02X: %04X %04X %04X %04X %04X %04X %04X %04X", tag, r,
+               vi[r / 2], vi[r / 2 + 1], vi[r / 2 + 2], vi[r / 2 + 3],
+               vi[r / 2 + 4], vi[r / 2 + 5], vi[r / 2 + 6], vi[r / 2 + 7]);
+}
+
 static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fullscreen)
 {
+    dbglog("wm_init: VIDEO_Init");
     VIDEO_Init();
     VIDEO_SetBlack(true);
+    dbglog("wm_init: tvmode=%d component=%d", VIDEO_GetCurrentTvMode(), VIDEO_HaveComponentCable());
+    dbg_vi_regs("boot");
 
     rmode = gfx_gx_wm_select_mode();
+    dbglog("wm_init: mode viTVMode=%u fb=%ux%u efb=%u vi=%ux%u hires=%d", rmode->viTVMode,
+           rmode->fbWidth, rmode->xfbHeight, rmode->efbHeight, rmode->viWidth, rmode->viHeight, hires_active);
 
     // double-buffering
     framebuffer[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
     framebuffer[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
 
+    dbglog("wm_init: fb0=%p fb1=%p", framebuffer[0], framebuffer[1]);
     VIDEO_Configure(rmode);
+    dbglog("wm_init: configured");
 
     VIDEO_SetNextFramebuffer(framebuffer[fb]);
     VIDEO_SetBlack(false);
@@ -112,10 +128,18 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     if (rmode->viTVMode & VI_NON_INTERLACE)
         VIDEO_WaitVSync();
 
+    dbg_vi_regs("libogc");
     if (hires_active) {
+#ifndef HIRES_NO_VI_POKE
         gfx_gx_wm_apply_hires_timing();
+        dbglog("wm_init: hires timing applied");
+#else
+        dbglog("wm_init: hires timing NOT applied (test build)");
+#endif
         VIDEO_WaitVSync();
+        dbg_vi_regs("hires");
     }
+    dbglog("wm_init: done");
 }
 
 GXRModeObj *gfx_gx_wm_get_rmode(void)
@@ -178,6 +202,13 @@ static bool gfx_gx_wm_start_frame(void)
 
 static void gfx_gx_wm_swap_buffers_begin(void)
 {
+    static unsigned int frames;
+    frames++;
+    if (frames <= 3 || frames % 600 == 0)
+        dbglog("swap: frame %u", frames);
+    if (frames == 120 && hires_active)
+        dbg_vi_regs("frame120");
+
     fb ^= 1; // flip frame buffer
 
     // In 1280x240p the renderer has already copied both tiles into this buffer

@@ -1040,9 +1040,11 @@ static void gx_init()
     // initialise graphics
     GX_Init(gp_fifo, DEFAULT_FIFO_SIZE);
 
+    dbglog("gx_init: GX_Init done");
     if (gfx_gx_wm_hires())
     {
         hr_dl = memalign(32, HIRES_DL_SIZE);
+        dbglog("gx_init: hires display list buffer %p", hr_dl);
         if (hr_dl != NULL)
         {
             // The CPU never touches the list; make sure no stale cache lines get written over it
@@ -1158,6 +1160,10 @@ static void hr_replay(void)
 
 static void gfx_gx_end_frame(void)
 {
+    static unsigned int ef;
+    ef++;
+    if (hr_enabled && (ef <= 3 || ef % 600 == 0))
+        dbglog("end_frame %u: segs=%d bytes=%u overflow=%d", ef, hr_nseg, (unsigned)hr_pos, hr_overflow);
     if (hr_recording)
     {
         if (!hr_overflow)

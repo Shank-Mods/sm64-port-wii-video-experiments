@@ -17,6 +17,41 @@
 #endif
 
 #include "configfile.h"
+#include <stdarg.h>
+
+// Debug log for hardware testing: appends a line to sm64_debug.txt in the root of every
+// mounted FAT device (SD and USB), closing the file each time so nothing is lost on a hang
+void dbglog(const char *fmt, ...)
+{
+#ifdef TARGET_GX
+    static bool fat_ready;
+    static bool header_done;
+    static const char *const paths[] = { "sd:/sm64_debug.txt", "usb:/sm64_debug.txt" };
+    char line[256];
+    va_list ap;
+
+    if (!fat_ready) {
+        fatInitDefault();
+        fat_ready = true;
+    }
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    for (unsigned int i = 0; i < 2; i++) {
+        FILE *f = fopen(paths[i], header_done ? "a" : "w");
+        if (f != NULL) {
+            fputs(line, f);
+            fputs("\n", f);
+            fclose(f);
+        }
+    }
+    header_done = true;
+#else
+    (void)fmt;
+#endif
+}
 
 #define ARRAY_LEN(arr) (sizeof(arr) / sizeof(arr[0]))
 
