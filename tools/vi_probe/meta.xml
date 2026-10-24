@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>VI probe (read-only)</name>
+  <coder>Shank-Mods</coder>
+  <version>1</version>
+  <short_description>Logs VI timing and clock registers</short_description>
+  <long_description>Switches through 480i, 480p, 240p and 1280x240p, measures the real VI timing and logs the Hollywood PLL registers to vi_probe.txt on SD/USB. Writes no clock registers. Returns to the Homebrew Channel when done (about 20 seconds).</long_description>
+  <ahb_access/>
+</app>
