@@ -16,23 +16,33 @@
 # restored. All of these registers also reset on a console power cycle.
 #
 # -----------------------------------------------------------------------------
-# Boot values observed by vi_probe on a retail Wii (480p), for reference:
-#   0x1A0 = 0C0000EE   (bit31=0 -> undivided/54MHz; bit31=1 -> /2 -> 27MHz)
-#   0x1C4 = 002006C0   <- "PLLVI", prime multiplier candidate
-#   0x1C8 = D870700E   <- "PLLVIEXT"
-# 54 MHz is the undivided PLL output. Targets: 74250 kHz (720p/1080i), 148500 kHz.
+# DECODED from run 1 (0x1C4, boot 0x002006C0 = 54 MHz):
+#   byte1  bits 8-15  = FEEDBACK MULTIPLIER.  Fout ~ (54/7) * Nfb,  Nfb = byte1 + 1.
+#                       Clean & linear 7..23 (54..177 MHz).  <-- main clock knob.
+#   byte0  bits 0-7   = OUTPUT DIVIDER.  bit0 set (0xC1) => /2.  (full encoding TBD)
+#   byte2  bits 16-23 = SHARED/CRITICAL CLOCK.  Writing 0x21 HARD-HANGS the console.
+#                       ***NEVER set byte2 to anything but 0x20.***
+#   bit31             = PLL-lock status, set by hardware; ignore.
+#   0x1A0 bit31       = inert (status mirror), not a usable divider control.
+# 0x1C8 (boot D870700E) = still being mapped; candidate FINE control for exact clocks.
+#
+# Predicted multiplier values (byte0=0xC0, byte2=0x20):
+#   Nfb= 9 -> 1C4=002008C0 ~ 69.4 MHz     Nfb=10 -> 1C4=002009C0 ~ 77.1 MHz  (720p bracket)
+#   Nfb=19 -> 1C4=002012C0 ~146.6 MHz     Nfb=20 -> 1C4=002013C0 ~154.3 MHz  (1080i bracket)
+# Targets: 74250 kHz (720p/1080i) and 148500 kHz sit BETWEEN integer Nfb steps, so the
+# fine tuning must come from byte0 (divider) and/or 0x1C8.
 # -----------------------------------------------------------------------------
 #
-# EXAMPLES (commented out -- uncomment/edit after you have a field map from the
-# default sweep so you know which nibble is the multiplier):
+# ROUND-3 EXAMPLES (uncomment/edit). Lines run top-to-bottom; a hang stops the rest,
+# so put your most-wanted tries first. Keep 0x1C4 byte2 = 0x20 ALWAYS.
 #
-# Nudge the low field of 0x1C4 up a little and watch the clock:
-# TRY 1C4=002006C8
-# TRY 1C4=002006D0
-# TRY 1C4=00200700
+# Bracket 148.5 MHz and try fine-tuning it down with byte0 and 0x1C8:
+# TRY 1C4=002013C0
+# TRY 1C4=002012C0
+# TRY 1C4=002012C0 1C8=D870700F
+# TRY 1C4=002012E0
 #
-# Try changing 0x1C4 and 0x1C8 together in one shot:
-# TRY 1C4=002006E0 1C8=D870700F
-#
-# Re-confirm the divide bit as a sanity check any time:
-# TRY 1A0=8C0000EE
+# Bracket 74.25 MHz:
+# TRY 1C4=002009C0
+# TRY 1C4=002008C0
+# TRY 1C4=002008C0 1C8=D870700F

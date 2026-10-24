@@ -238,6 +238,7 @@ typedef struct {
     RegW  w[8];
     int   nw;
     u32   hold_ms;        // extra hold after measure (0 = none)
+    int   nfb;            // if >0, log the model-predicted clock for this feedback multiplier
 } Experiment;
 
 static Experiment exps[96];
@@ -294,43 +295,63 @@ static void apply_hires(void)
     tb_delay_ms(300);
 }
 
+// Compose a 0x1C4 value: byte3=0x00 (HW re-sets the lock bit itself), byte2 FORCED to
+// 0x20 -- writing 0x21 there hard-hangs the console, so the default sweep never does -- ,
+// byte1 = feedback multiplier field (Nfb-1), byte0 = output divider field.
+static u32 mk1c4(u32 mbyte, u32 dbyte)
+{
+    return 0x00200000u | ((mbyte & 0xFF) << 8) | (dbyte & 0xFF);
+}
+
 // ----------------------------------------------------------------------------
-// Build the default experiment list.
+// Build the default experiment list (v2).
+//
+// Findings from the first run decoded 0x1C4 (boot 0x002006C0 = 54 MHz):
+//   bits 8-15  = feedback multiplier, Fout ~ (54/7)*Nfb, Nfb = field+1 (clean & linear)
+//   bits 0-7   = output divider (bit0 set => /2)
+//   bits 16-23 = shared/critical clock: writing 0x21 HARD-HANGS -> never touched here
+//   bit31      = PLL-lock status, HW-controlled
+// 0x1C8 (PLLVIEXT) was never reached last run (the hang stopped it); it is the prime
+// candidate for the FINE control needed to hit exact 74.25 / 148.5 MHz.
+//
+// Ordered safe-data-first so a hang in a later (riskier) block cannot cost the earlier
+// results: A multiplier curve (byte1 only, proven safe) -> B divider map (byte0) ->
+// C 0x1C8 fine map (unknown, riskiest) last.
 // ----------------------------------------------------------------------------
 static void build_default_experiments(void)
 {
     Experiment *e;
+    char nm[96];
 
-    // --- CONTROL 0: rewrite PLLVI with its own value (no change). Proves writes land
-    //     and read back, and that the measurement is stable with a benign write. ---
-    e = new_exp("CONTROL rewrite 0x1C4 with its own boot value (no change)", true);
-    exp_add_w(e, 0x1C4, HW(0x1C4), FULL);
+    // CONTROL: rewrite 0x1C4 with its boot value (no change) -- writes land, stable.
+    e = new_exp("CONTROL rewrite 0x1C4 boot value (no change)", true);
+    exp_add_w(e, 0x1C4, 0x002006C0u, FULL);
 
-    // --- CONTROL 1: set 0x1A0 bit31 (the documented 27/54 divide select) while the VI
-    //     timing stays at the 54 MHz config. If this bit is a live divider, the measured
-    //     clock should HALVE (~27 MHz). If nothing changes, the bit is a status mirror.
-    //     Either outcome is informative and fully reversible. ---
-    e = new_exp("CONTROL set 0x1A0 bit31 (=1, expect /2 -> ~27 MHz if it is a live divider)", true);
-    exp_add_w(e, 0x1A0, 0x80000000u, 0x80000000u);
-
-    // --- FIELD MAP: perturb one nibble of 0x1C4 at a time (+1 at each nibble LSB).
-    //     A nibble that raises the clock when incremented is (part of) a feedback
-    //     multiplier; one that lowers it is a divider; one with no effect is config. ---
-    for (int sh = 0; sh <= 28; sh += 4) {
-        u32 base = HW(0x1C4);
-        char nm[96];
-        snprintf(nm, sizeof(nm), "MAP 0x1C4 += 1<<%d  (probe nibble @ bit %d)", sh, sh);
+    // --- BLOCK A: multiplier curve. byte1 = Nfb-1, byte0=0xC0, byte2=0x20 (safe). ---
+    // Includes the exact brackets for 720p/1080i (Nfb 9/10) and 1080i-class (Nfb 19/20).
+    static const u32 mb[] = {0x06,0x07,0x08,0x09,0x0A,0x0C,0x0E,0x10,0x11,0x12,0x13,0x14,0x16,0x18};
+    for (unsigned i = 0; i < sizeof(mb)/sizeof(mb[0]); i++) {
+        snprintf(nm, sizeof(nm), "A MULT 0x1C4 byte1=0x%02X (Nfb=%u)", (unsigned)mb[i], (unsigned)mb[i] + 1);
         e = new_exp(nm, true);
-        exp_add_w(e, 0x1C4, base + (1u << sh), FULL);
+        exp_add_w(e, 0x1C4, mk1c4(mb[i], 0xC0), FULL);
+        e->nfb = (int)mb[i] + 1;
     }
 
-    // --- FIELD MAP: same for 0x1C8 (PLLVIEXT). ---
-    for (int sh = 0; sh <= 28; sh += 4) {
-        u32 base = HW(0x1C8);
-        char nm[96];
-        snprintf(nm, sizeof(nm), "MAP 0x1C8 += 1<<%d  (probe nibble @ bit %d)", sh, sh);
+    // --- BLOCK B: output-divider map at base multiplier (byte0 sweep, proven-safe lane). ---
+    static const u32 db[] = {0xC0,0xC2,0xC4,0xC8,0xD0,0xE0,0x80,0x40,0x00,0xC1};
+    for (unsigned i = 0; i < sizeof(db)/sizeof(db[0]); i++) {
+        snprintf(nm, sizeof(nm), "B DIV 0x1C4 byte0=0x%02X (base mult, Nfb=7)", (unsigned)db[i]);
         e = new_exp(nm, true);
-        exp_add_w(e, 0x1C8, base + (1u << sh), FULL);
+        exp_add_w(e, 0x1C4, mk1c4(0x06, db[i]), FULL);
+    }
+
+    // --- BLOCK C: 0x1C8 (PLLVIEXT) fine-control map, 0x1C4 left at 54 MHz base. Unknown
+    //     register -> riskiest, so it runs LAST; low nibbles first (likely the fine field). ---
+    u32 b8 = HW(0x1C8);
+    for (int sh = 0; sh <= 28; sh += 4) {
+        snprintf(nm, sizeof(nm), "C EXT 0x1C8 += 1<<%d  -> %08X", sh, (unsigned)(b8 + (1u << sh)));
+        e = new_exp(nm, true);
+        exp_add_w(e, 0x1C8, b8 + (1u << sh), FULL);
     }
 }
 
@@ -427,6 +448,10 @@ static void run_experiment(int idx, Experiment *e, u32 base_eff)
     // Read back what actually stuck (PLLs may ignore or massage written bits).
     for (int i = 0; i < e->nw; i++)
         logf_("  readback HW %03X = %08X", (unsigned)e->w[i].off, (unsigned)HW(e->w[i].off));
+
+    if (e->nfb > 0)
+        logf_("  model predicts ~ %u kHz for Nfb=%d  ( (base/7)*Nfb )",
+              (u32)((u64)base_eff * (u32)e->nfb / 7u), e->nfb);
 
     tb_delay_ms(250);            // let the PLL attempt to relock
     Meas m = measure();
