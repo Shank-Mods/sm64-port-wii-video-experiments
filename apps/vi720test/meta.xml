@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>VI 720p test (experimental)</name>
+  <coder>Shank-Mods</coder>
+  <version>1</version>
+  <short_description>Draws a test pattern at 74.25 MHz 720p-rate timing</short_description>
+  <long_description>EXPERIMENTAL. Shows a bold test pattern first in the proven 1280x240p 54 MHz mode, then attempts a 720p-rate raster at the confirmed 74.25 MHz VI clock, measuring the real line/field rate and total lines and logging to vi720.txt on USB (and SD). The display may roll, offset, or stay black; the measurements say how close the timing is. PLL and VI are restored at the end and all registers reset on reboot. HOME/Start advances or exits.</long_description>
+  <ahb_access/>
+</app>
