@@ -46,19 +46,23 @@ jobs:
 
       - name: Publish boot.dol to vi-pll-dist branch
         if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
-          cp tools/vi_pll/boot.dol /tmp/boot.dol
-          cp tools/vi_pll/meta.xml /tmp/meta.xml
+          # Self-contained repo in a temp dir with an explicitly authenticated remote,
+          # to avoid any safe.directory / orphan-checkout issues inside the container.
+          PUB=/tmp/pub
+          rm -rf "$PUB" && mkdir -p "$PUB/apps/vi_pll"
+          cp tools/vi_pll/boot.dol "$PUB/apps/vi_pll/boot.dol"
+          cp tools/vi_pll/meta.xml "$PUB/apps/vi_pll/meta.xml"
+          echo "vi_pll build $(date -u +%Y-%m-%dT%H:%M:%SZ) from commit ${GITHUB_SHA}" > "$PUB/BUILD_INFO.txt"
+          cd "$PUB"
+          git init -q
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Build an orphan commit holding just the deliverables, force-push it.
-          git checkout --orphan vi-pll-dist
-          git reset --hard
-          mkdir -p apps/vi_pll
-          cp /tmp/boot.dol apps/vi_pll/boot.dol
-          cp /tmp/meta.xml apps/vi_pll/meta.xml
-          echo "vi_pll build $(date -u +%Y-%m-%dT%H:%M:%SZ) from commit ${GITHUB_SHA}" > BUILD_INFO.txt
-          git add apps/vi_pll/boot.dol apps/vi_pll/meta.xml BUILD_INFO.txt
-          git commit -m "vi_pll boot.dol build [skip ci]"
+          git add -A
+          git commit -q -m "vi_pll boot.dol build [skip ci]"
+          git branch -M vi-pll-dist
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push -f origin vi-pll-dist
