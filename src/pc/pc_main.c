@@ -199,8 +199,8 @@ void main_func(void) {
 #endif
     dbglog("config load returned");
     configfile_resolve_widescreen();
-    dbglog("config loaded: hires_1280x240p=%d 240p=%d widescreen=%d storage=%u",
-           configHires1280, config240p, configWidescreen, configStorageDevice);
+    dbglog("config loaded: hires_1280x240p=%d 240p=%d widescreen=%d",
+           configHires1280, config240p, configWidescreen);
     atexit(save_config);
 
 #ifdef TARGET_WEB

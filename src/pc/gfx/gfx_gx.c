@@ -61,8 +61,9 @@ static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 // is exactly the 640 pixel EFB, and the projection is rescaled so that tile's slice of the frame
 // fills it. Geometry outside the tile is then clipped by the transform unit, so no screen
 // coordinate ever lands far outside the EFB (the rasterizer mangles triangles that do).
-#define HIRES_DL_SIZE (6 * 1024 * 1024)
-#define HIRES_MAX_SEGS 8192
+// Frames record well under 100 KB on hardware; keep headroom without costing GameCube memory
+#define HIRES_DL_SIZE (1024 * 1024)
+#define HIRES_MAX_SEGS 2048
 
 struct HiresSeg {
     uint32_t offset;
