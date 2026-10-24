@@ -10,6 +10,39 @@ original values afterwards, so a bad value costs you a reboot, nothing more.
 
 ---
 
+## RESULT (runs 1-2): the VI clock is fully reprogrammable
+
+Confirmed on a retail Wii, 1280x240p anchor, clean up to 193 MHz with no lock loss, every
+value fully recovered:
+
+**F = 54 MHz x Nfb / V**
+- **Nfb = `0x1C4` bits 8-15 (byte1) + 1** — feedback multiplier, baseline 7. Linear 7..25
+  (54..193 MHz), step 54/7 = 7.714 MHz.
+- **V = `0x1C8` bits 20-23** — output divider, baseline 7. Confirmed 7->8 = x7/8 (47.25 MHz).
+
+Exact HD pixel clocks:
+
+| Target | 54 x Nfb/V | `0x1C4` | `0x1C8` |
+| --- | --- | --- | --- |
+| 74.25 MHz (720p/1080i) | 54 x 11/8 | `0x00200AC0` | `0xD880700E` |
+| 148.5 MHz              | 54 x 22/8 | `0x002015C0` | `0xD880700E` |
+| 148.5 MHz (alt)        | 54 x 11/4 | `0x00200AC0` | `0xD840700E` |
+
+Secondary / danger notes:
+- `0x1C4` **byte2 (bits 16-23) HARD-HANGS** when incremented (0x20->0x21). Never written by
+  the default sweep. Keep byte2 = `0x20`.
+- `0x1C4` byte0 = output post-divider: `0xC0`=/1 (54), `0xC1`=/2 (27), `0xC2`=/3 (18);
+  larger low-nibble values lost lock in the base config. byte0 bits 6-7 give a small fine
+  trim (~2 MHz/bit). Not needed once Nfb and V hit the target exactly (leave byte0 = `0xC0`).
+- `0x1A0` bit31 is an inert status mirror, not a usable control.
+
+Clock generation is confirmed; a valid HD *video signal* still needs the VI horizontal/
+vertical timing reprogrammed. Note HTR0's half-line width is 10-bit: 720p htotal 1650
+(half 825) fits; 1080i htotal 2200 (half 1100) does NOT, so 1080i needs a different timing
+approach (see the briefing's open VI-timing questions).
+
+---
+
 ## What it does
 
 1. **Snapshots** the candidate registers and logs their boot values.
