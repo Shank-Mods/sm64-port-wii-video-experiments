@@ -239,6 +239,7 @@ typedef struct {
     int   nw;
     u32   hold_ms;        // extra hold after measure (0 = none)
     int   nfb;            // if >0, log the model-predicted clock for this feedback multiplier
+    u32   predict_khz;    // if >0, log this expected clock (kHz) for the experiment
 } Experiment;
 
 static Experiment exps[96];
@@ -303,56 +304,68 @@ static u32 mk1c4(u32 mbyte, u32 dbyte)
     return 0x00200000u | ((mbyte & 0xFF) << 8) | (dbyte & 0xFF);
 }
 
+// Compose a 0x1C8 value with a given V (output-divider nibble, bits 20-23), keeping the
+// rest of the boot value. Boot 0x1C8 = 0xD870700E, V baseline = 7.
+static u32 mk1c8(u32 v)
+{
+    return (0xD870700Eu & ~0x00F00000u) | ((v & 0xF) << 20);
+}
+
 // ----------------------------------------------------------------------------
-// Build the default experiment list (v2).
+// Build the default experiment list (v3 -- ROUND 3 TARGET CONFIRMATION).
 //
-// Findings from the first run decoded 0x1C4 (boot 0x002006C0 = 54 MHz):
-//   bits 8-15  = feedback multiplier, Fout ~ (54/7)*Nfb, Nfb = field+1 (clean & linear)
-//   bits 0-7   = output divider (bit0 set => /2)
-//   bits 16-23 = shared/critical clock: writing 0x21 HARD-HANGS -> never touched here
-//   bit31      = PLL-lock status, HW-controlled
-// 0x1C8 (PLLVIEXT) was never reached last run (the hang stopped it); it is the prime
-// candidate for the FINE control needed to hit exact 74.25 / 148.5 MHz.
+// Clock law decoded in runs 1-2:  F = 54 MHz * Nfb / V
+//   Nfb = 0x1C4 bits 8-15 (byte1) + 1   (baseline 7)
+//   V   = 0x1C8 bits 20-23              (baseline 7)
+// byte2 of 0x1C4 forced to 0x20 (0x21 hard-hangs); byte0 = 0xC0 (post-divide 1).
 //
-// Ordered safe-data-first so a hang in a later (riskier) block cannot cost the earlier
-// results: A multiplier curve (byte1 only, proven safe) -> B divider map (byte0) ->
-// C 0x1C8 fine map (unknown, riskiest) last.
+// This default now CONFIRMS the exact HD pixel clocks and verifies the V divider.
+// Targets run first so a hang later cannot cost them. (A full field sweep is still
+// available by dropping a vi_pll.cfg on the USB root; that overrides this list.)
 // ----------------------------------------------------------------------------
 static void build_default_experiments(void)
 {
     Experiment *e;
-    char nm[96];
 
     // CONTROL: rewrite 0x1C4 with its boot value (no change) -- writes land, stable.
     e = new_exp("CONTROL rewrite 0x1C4 boot value (no change)", true);
     exp_add_w(e, 0x1C4, 0x002006C0u, FULL);
 
-    // --- BLOCK A: multiplier curve. byte1 = Nfb-1, byte0=0xC0, byte2=0x20 (safe). ---
-    // Includes the exact brackets for 720p/1080i (Nfb 9/10) and 1080i-class (Nfb 19/20).
-    static const u32 mb[] = {0x06,0x07,0x08,0x09,0x0A,0x0C,0x0E,0x10,0x11,0x12,0x13,0x14,0x16,0x18};
-    for (unsigned i = 0; i < sizeof(mb)/sizeof(mb[0]); i++) {
-        snprintf(nm, sizeof(nm), "A MULT 0x1C4 byte1=0x%02X (Nfb=%u)", (unsigned)mb[i], (unsigned)mb[i] + 1);
+    // TARGET 1: 74.25 MHz = 54 * 11/8  (Nfb=11 byte1=0x0A, V=8)
+    e = new_exp("TARGET 74.25 MHz  (Nfb=11, V=8)", true);
+    exp_add_w(e, 0x1C4, mk1c4(0x0A, 0xC0), FULL);
+    exp_add_w(e, 0x1C8, mk1c8(8), FULL);
+    e->predict_khz = 74250;
+
+    // TARGET 2: 148.5 MHz = 54 * 22/8  (Nfb=22 byte1=0x15, V=8)
+    e = new_exp("TARGET 148.5 MHz  (Nfb=22, V=8)", true);
+    exp_add_w(e, 0x1C4, mk1c4(0x15, 0xC0), FULL);
+    exp_add_w(e, 0x1C8, mk1c8(8), FULL);
+    e->predict_khz = 148500;
+
+    // TARGET 2 (alt): 148.5 MHz = 54 * 11/4  (Nfb=11, V=4)  -- tests V below baseline
+    e = new_exp("TARGET 148.5 MHz alt  (Nfb=11, V=4)", true);
+    exp_add_w(e, 0x1C4, mk1c4(0x0A, 0xC0), FULL);
+    exp_add_w(e, 0x1C8, mk1c8(4), FULL);
+    e->predict_khz = 148500;
+
+    // V linearity check at base Nfb=7:  F = 54 * 7 / V = 378 / V MHz
+    static const u32 vv[] = { 6, 5, 9, 10 };
+    for (unsigned i = 0; i < sizeof(vv)/sizeof(vv[0]); i++) {
+        char nm[96];
+        snprintf(nm, sizeof(nm), "V-check 0x1C8 V=%u (base Nfb=7)", (unsigned)vv[i]);
         e = new_exp(nm, true);
-        exp_add_w(e, 0x1C4, mk1c4(mb[i], 0xC0), FULL);
-        e->nfb = (int)mb[i] + 1;
+        exp_add_w(e, 0x1C8, mk1c8(vv[i]), FULL);
+        e->predict_khz = (u32)(54000ull * 7 / vv[i]);
     }
 
-    // --- BLOCK B: output-divider map at base multiplier (byte0 sweep, proven-safe lane). ---
-    static const u32 db[] = {0xC0,0xC2,0xC4,0xC8,0xD0,0xE0,0x80,0x40,0x00,0xC1};
-    for (unsigned i = 0; i < sizeof(db)/sizeof(db[0]); i++) {
-        snprintf(nm, sizeof(nm), "B DIV 0x1C4 byte0=0x%02X (base mult, Nfb=7)", (unsigned)db[i]);
-        e = new_exp(nm, true);
-        exp_add_w(e, 0x1C4, mk1c4(0x06, db[i]), FULL);
-    }
-
-    // --- BLOCK C: 0x1C8 (PLLVIEXT) fine-control map, 0x1C4 left at 54 MHz base. Unknown
-    //     register -> riskiest, so it runs LAST; low nibbles first (likely the fine field). ---
-    u32 b8 = HW(0x1C8);
-    for (int sh = 0; sh <= 28; sh += 4) {
-        snprintf(nm, sizeof(nm), "C EXT 0x1C8 += 1<<%d  -> %08X", sh, (unsigned)(b8 + (1u << sh)));
-        e = new_exp(nm, true);
-        exp_add_w(e, 0x1C8, b8 + (1u << sh), FULL);
-    }
+    // Isolation sanity: each target knob alone.
+    e = new_exp("SANITY Nfb=11 alone (V=7)", true);
+    exp_add_w(e, 0x1C4, mk1c4(0x0A, 0xC0), FULL);
+    e->predict_khz = 84857;
+    e = new_exp("SANITY V=8 alone (Nfb=7)", true);
+    exp_add_w(e, 0x1C8, mk1c8(8), FULL);
+    e->predict_khz = 47250;
 }
 
 // ----------------------------------------------------------------------------
@@ -452,6 +465,8 @@ static void run_experiment(int idx, Experiment *e, u32 base_eff)
     if (e->nfb > 0)
         logf_("  model predicts ~ %u kHz for Nfb=%d  ( (base/7)*Nfb )",
               (u32)((u64)base_eff * (u32)e->nfb / 7u), e->nfb);
+    if (e->predict_khz > 0)
+        logf_("  EXPECTED ~ %u kHz", e->predict_khz);
 
     tb_delay_ms(250);            // let the PLL attempt to relock
     Meas m = measure();
