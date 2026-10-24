@@ -10,23 +10,25 @@ original values afterwards, so a bad value costs you a reboot, nothing more.
 
 ---
 
-## RESULT (runs 1-2): the VI clock is fully reprogrammable
+## RESULT (runs 1-3): the VI clock is fully reprogrammable and CONFIRMED
 
 Confirmed on a retail Wii, 1280x240p anchor, clean up to 193 MHz with no lock loss, every
-value fully recovered:
+value fully recovered. Run 3 hit the HD pixel clocks exactly (measured against the CPU
+timebase):
 
 **F = 54 MHz x Nfb / V**
 - **Nfb = `0x1C4` bits 8-15 (byte1) + 1** — feedback multiplier, baseline 7. Linear 7..25
   (54..193 MHz), step 54/7 = 7.714 MHz.
-- **V = `0x1C8` bits 20-23** — output divider, baseline 7. Confirmed 7->8 = x7/8 (47.25 MHz).
+- **V = `0x1C8` bits 20-23** — output divider, baseline 7. Linear, F = 54*7/V at base Nfb
+  (V=4..10 verified: 94.5/75.6/63.0/54/47.25/42.0/37.8 MHz; V=4 stable).
 
-Exact HD pixel clocks:
+Exact HD pixel clocks (measured):
 
-| Target | 54 x Nfb/V | `0x1C4` | `0x1C8` |
-| --- | --- | --- | --- |
-| 74.25 MHz (720p/1080i) | 54 x 11/8 | `0x00200AC0` | `0xD880700E` |
-| 148.5 MHz              | 54 x 22/8 | `0x002015C0` | `0xD880700E` |
-| 148.5 MHz (alt)        | 54 x 11/4 | `0x00200AC0` | `0xD840700E` |
+| Target | 54 x Nfb/V | `0x1C4` | `0x1C8` | measured |
+| --- | --- | --- | --- | --- |
+| 74.25 MHz (720p/1080i) | 54 x 11/8 | `0x00200AC0` | `0xD880700E` | 74 250 kHz (exact) |
+| 148.5 MHz              | 54 x 22/8 | `0x002015C0` | `0xD880700E` | 148 512 kHz (+0.008%) |
+| 148.5 MHz (alt)        | 54 x 11/4 | `0x00200AC0` | `0xD840700E` | 148 506 kHz (+0.004%) |
 
 Secondary / danger notes:
 - `0x1C4` **byte2 (bits 16-23) HARD-HANGS** when incremented (0x20->0x21). Never written by
