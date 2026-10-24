@@ -1,0 +1,38 @@
+# vi_pll.cfg -- optional. Put this (renamed to vi_pll.cfg) in the ROOT of the USB
+# drive (or SD). If present, it REPLACES the built-in control+field-map sweep with
+# the explicit tries listed here. Edit on your PC between runs -- no rebuild needed.
+#
+# Syntax (data only; malformed lines are skipped and noted in the log):
+#   # comment or blank line            -> ignored
+#   TRY    OFF=VAL [OFF2=VAL2 ...]      -> one experiment, anchored at 1280x240p/54MHz
+#   TRYRAW OFF=VAL [OFF2=VAL2 ...]      -> one experiment, current mode kept (no anchor)
+#
+#   OFF = Hollywood register offset in hex. ONLY these offsets are accepted
+#         (they are the ones the tool snapshots and restores):
+#             1A0 1A4 1A8 1AC 1C4 1C8
+#   VAL = full 32-bit value to write, in hex.
+#
+# Each experiment is logged write-ahead, measured, then the ORIGINAL values are
+# restored. All of these registers also reset on a console power cycle.
+#
+# -----------------------------------------------------------------------------
+# Boot values observed by vi_probe on a retail Wii (480p), for reference:
+#   0x1A0 = 0C0000EE   (bit31=0 -> undivided/54MHz; bit31=1 -> /2 -> 27MHz)
+#   0x1C4 = 002006C0   <- "PLLVI", prime multiplier candidate
+#   0x1C8 = D870700E   <- "PLLVIEXT"
+# 54 MHz is the undivided PLL output. Targets: 74250 kHz (720p/1080i), 148500 kHz.
+# -----------------------------------------------------------------------------
+#
+# EXAMPLES (commented out -- uncomment/edit after you have a field map from the
+# default sweep so you know which nibble is the multiplier):
+#
+# Nudge the low field of 0x1C4 up a little and watch the clock:
+# TRY 1C4=002006C8
+# TRY 1C4=002006D0
+# TRY 1C4=00200700
+#
+# Try changing 0x1C4 and 0x1C8 together in one shot:
+# TRY 1C4=002006E0 1C8=D870700F
+#
+# Re-confirm the divide bit as a sanity check any time:
+# TRY 1A0=8C0000EE

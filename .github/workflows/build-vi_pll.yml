@@ -1,0 +1,64 @@
+name: build-vi_pll
+
+# Builds tools/vi_pll into boot.dol using the official devkitPro PowerPC toolchain
+# container (GitHub's runners have the network access this needs). The result is both
+# uploaded as a workflow artifact AND force-pushed to the `vi-pll-dist` branch as
+# boot.dol, so it can be retrieved with a plain `git fetch` even without the Actions API.
+
+on:
+  push:
+    branches: [ vi-pll-tool ]
+    paths:
+      - 'tools/vi_pll/**'
+      - '.github/workflows/build-vi_pll.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitppc:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build vi_pll
+        run: |
+          set -eux
+          echo "DEVKITPRO=$DEVKITPRO  DEVKITPPC=$DEVKITPPC"
+          powerpc-eabi-gcc --version | head -1
+          cd tools/vi_pll
+          make
+          ls -l boot.dol boot.elf
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vi_pll-dol
+          path: |
+            tools/vi_pll/boot.dol
+            tools/vi_pll/boot.elf
+            tools/vi_pll/boot.dol.map
+
+      - name: Publish boot.dol to vi-pll-dist branch
+        if: success()
+        run: |
+          set -eux
+          cp tools/vi_pll/boot.dol /tmp/boot.dol
+          cp tools/vi_pll/meta.xml /tmp/meta.xml
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Build an orphan commit holding just the deliverables, force-push it.
+          git checkout --orphan vi-pll-dist
+          git reset --hard
+          mkdir -p apps/vi_pll
+          cp /tmp/boot.dol apps/vi_pll/boot.dol
+          cp /tmp/meta.xml apps/vi_pll/meta.xml
+          echo "vi_pll build $(date -u +%Y-%m-%dT%H:%M:%SZ) from commit ${GITHUB_SHA}" > BUILD_INFO.txt
+          git add apps/vi_pll/boot.dol apps/vi_pll/meta.xml BUILD_INFO.txt
+          git commit -m "vi_pll boot.dol build [skip ci]"
+          git push -f origin vi-pll-dist

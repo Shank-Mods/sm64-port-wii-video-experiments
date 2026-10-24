@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>VI PLL probe (writes clock regs)</name>
+  <coder>Shank-Mods</coder>
+  <version>1</version>
+  <short_description>Writes VI PLL candidates, measures the real clock, logs to USB</short_description>
+  <long_description>EXPERIMENTAL. Writes to the undocumented Hollywood VI clock/PLL registers (0x1C4/0x1C8 and the 0x1A0 group), measures the resulting VI pixel clock against the CPU timebase, and logs before/after values to vi_pll.txt on the USB drive (and SD if present). Each experiment holds briefly, then restores the original register values; all clock registers also reset on console power cycle. The display will lose sync during the run. Press A (or wait 10 s) to start; HOME/Start exits. Returns to the Homebrew Channel when done.</long_description>
+  <ahb_access/>
+</app>
