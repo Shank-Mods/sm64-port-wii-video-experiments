@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>Chroma subsampling test</name>
+  <coder>Shank-Mods</coder>
+  <version>1</version>
+  <short_description>4:2:2 torture test + brute-force 4:4:4</short_description>
+  <long_description>Test patterns for the YUV 4:2:2 video bus. D-pad left/right switches resolution (240p/480i/480p standard, and 240p/480i with every pixel doubled horizontally to 1280 wide). D-pad up/down switches pattern. HOME or START exits. The doubled modes put each source pixel on its own 4:2:2 pair, so an FPGA can reconstruct 4:4:4.</long_description>
+  <ahb_access/>
+</app>
