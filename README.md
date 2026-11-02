@@ -18,11 +18,76 @@ I didn't test enough on Gamecube to make the same claim, but it should be able t
 
 ![Enhancements Menu](docs/settings.png)
 
+## Uncapped benchmark (Wii, `wii-benchmark` branch)
+
+This branch turns the port into a repeatable **timedemo benchmark**, meant for comparing a stock
+Wii against an overclocked one. With `benchmark true` (the default on this branch):
+
+- The game runs **uncapped**: one game tick and one rendered frame per loop, as fast as the
+  hardware allows, so the game plays back in fast motion. The video output stays at its normal
+  rate (480p60 etc.). Frames go to three XFBs and only the newest finished frame is queued for
+  the next retrace, so there is no tearing and the TV never sees a mode change.
+- It plays the seven attract-mode demos (Bowser 1 arena, WF, CCM, BBH, JRB, HMC, PSS) in a loop with no
+  input, which makes every run the same workload. Controllers are ignored except HOME (exit).
+  The title screen waits 1 second instead of 27 between demos.
+- Audio is still synthesized every tick (it is real CPU work) but not played.
+- One **pass** is all seven demos. At the end of each pass the results are appended to
+  `apps/sm64/sm64_bench.txt`: avg FPS, 1% low FPS, worst frame per demo, a per-task CPU
+  breakdown and (on split passes) a GPU breakdown, ending in a `SCORE` line.
+
+### Overlay
+
+The corner overlay (refreshed twice a second) shows live FPS, frame time, how many frames per
+second actually reach the TV, the measured bus clock and an estimated CPU clock, the CPU time
+per task sorted by cost, the GPU time per task, and the scores of the last few passes.
+
+CPU tasks: game logic (Mario, objects, collision, camera), scene graph (display list building),
+audio synthesis, gfx_pc's display list decode and triangle setup, its software vertex transform,
+texture decoding, GX command submission, waiting for the GPU, presenting, and the overlay itself.
+
+GPU tasks: 3D world draws, 2D/orthographic draws (HUD, text, sky, transitions) and the EFB to
+XFB copy. In 1280x240p mode the GPU time is reported only as a total.
+
+### Overlapped and split passes
+
+Normally the GPU executes commands while the CPU is still writing them, so its time can't be
+separated from the CPU's. **Split** passes hold the GPU back with a command FIFO breakpoint until
+the CPU has finished the frame, then let it run: CPU time and GPU time are then measured cleanly
+(and the overlay shows the FPS each side alone would allow), at the cost of losing the overlap.
+**Overlapped** passes run the normal pipeline and give the real-world FPS.
+
+`bench_gpu_split` chooses: `0` overlapped only, `1` split only, `2` alternate (default: odd
+passes overlapped, even passes split). Compare overlapped scores for "how much faster is it",
+and split passes for "which side got faster".
+
+### Clock calibration
+
+The PowerPC timebase runs at a quarter of the bus clock, so an overclock speeds it up and would
+make every timing wrong by the overclock ratio. The benchmark instead counts timebase ticks
+between VI retrace interrupts, which come from the video clock that the overclock doesn't touch,
+and converts all times with the measured rate. The overlay and results show the resulting bus
+clock (243 MHz at stock) and an estimate of the CPU clock from a timed chain of dependent adds
+(729 MHz at stock), so you can confirm the overclock is active. The field rate is assumed to be
+59.94 Hz (50 Hz for PAL 50); 240p modes are actually ~0.2% slower, which shifts stock and
+overclocked results equally.
+
+### Options (`apps/sm64/sm64config.txt`)
+
+| option | default | |
+|---|---|---|
+| `benchmark` | `true` | uncapped timedemo; `false` restores normal play |
+| `bench_overlay` | `true` | show the overlay |
+| `bench_gpu_split` | `2` | 0 overlapped, 1 split, 2 alternate passes |
+
+The `60fps` interpolation option is ignored while benchmarking (one frame per tick). On this
+branch `hires_1280x240p` defaults to `false`, so the benchmark runs in the console's normal
+480p/480i mode; an existing config file keeps whatever it already says.
+
 ## 1280x240p mode (Wii, this fork)
 
 This fork adds an experimental **1280x240p** output mode for the Wii: a 240p signal with 1280
 pixels per line (4:3), for scalers and digital video mods that pass the full horizontal
-resolution through. It is **on by default** in this fork.
+resolution through. It is on by default on the `wii-1280x240p` branch.
 
 - Toggle it in the pause menu under RESTART OPTIONS > 1280X240P, or set
   `hires_1280x240p true`/`false` in `apps/sm64/sm64config.txt`. It takes priority over 240P.

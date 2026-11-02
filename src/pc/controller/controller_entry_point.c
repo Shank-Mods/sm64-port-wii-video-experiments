@@ -5,6 +5,7 @@
 
 #include "controller_recorded_tas.h"
 #include "controller_keyboard.h"
+#include "../configfile.h"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include "controller_xinput.h"
@@ -62,4 +63,12 @@ void osContGetReadData(OSContPad *pad) {
     for (size_t i = 0; i < sizeof(controller_implementations) / sizeof(struct ControllerAPI *); i++) {
         controller_implementations[i]->read(pad);
     }
+#ifdef TARGET_GX
+    // The timedemo must not be disturbed. Controllers are still polled so HOME still exits.
+    if (configBenchmark) {
+        pad->button = 0;
+        pad->stick_x = 0;
+        pad->stick_y = 0;
+    }
+#endif
 }

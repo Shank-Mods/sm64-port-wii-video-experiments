@@ -15,6 +15,13 @@
 #include "sm64.h"
 
 #define PRESS_START_DEMO_TIMER 800
+#ifdef TARGET_GX
+#include "pc/configfile.h"
+// The benchmark only needs the title screen long enough to start the next demo
+#define DEMO_START_TICKS (configBenchmark ? 30 : PRESS_START_DEMO_TIMER)
+#else
+#define DEMO_START_TICKS PRESS_START_DEMO_TIMER
+#endif
 
 #define STUB_LEVEL(textname, _1, _2, _3, _4, _5, _6, _7, _8) textname,
 #define DEFINE_LEVEL(textname, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10) textname,
@@ -43,7 +50,12 @@ s32 run_press_start_demo_timer(s32 timer) {
 
     if (timer == 0) {
         if (!gPlayer1Controller->buttonDown && !gPlayer1Controller->stickMag) {
-            if ((++gDemoCountdown) == PRESS_START_DEMO_TIMER) {
+            if ((++gDemoCountdown) == DEMO_START_TICKS) {
+#ifndef TARGET_N64
+                // On N64 this file's segment is reloaded with the title screen, which resets the
+                // countdown; the PC port keeps it, so without this only the first demo ever plays
+                gDemoCountdown = 0;
+#endif
                 // start the demo. 800 frames has passed while
                 // player is idle on PRESS START screen.
 

@@ -31,6 +31,9 @@ bool gfx_gx_wm_hires(void);
 // The framebuffer that the next swap will display
 void *gfx_gx_wm_get_back_buffer(void);
 
+// True when frames are presented without waiting for vsync (benchmark mode)
+bool gfx_gx_wm_uncapped(void);
+
 // Field rate of the selected video mode in Hz.
 int gfx_gx_wm_get_field_rate(void);
 

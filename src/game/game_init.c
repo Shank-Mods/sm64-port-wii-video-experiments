@@ -9,6 +9,9 @@
 #include "buffers/zbuffer.h"
 #include "engine/level_script.h"
 #include "game_init.h"
+#ifndef TARGET_N64
+#include "pc/bench.h"
+#endif
 #include "main.h"
 #include "memory.h"
 #include "profiler.h"
@@ -671,10 +674,12 @@ void game_loop_one_iteration(void) {
             osContStartReadData(&gSIEventMesgQueue);
         }
 
+        bench_push(BENCH_LOGIC);
         audio_game_loop_tick();
         config_gfx_pool();
         read_controller_inputs();
         levelCommandAddr = level_script_execute(levelCommandAddr);
+        bench_pop();
         display_and_vsync();
 
         // when debug info is enabled, print the "BUF %d" information.

@@ -37,6 +37,7 @@
 #include "controller/controller_keyboard.h"
 
 #include "configfile.h"
+#include "bench.h"
 
 #include "compat.h"
 
@@ -88,11 +89,20 @@ static void patch_interpolations(void) {
     patch_interpolated_snow_particles();
 }
 
+// 60fps interpolation draws a second frame per game tick; the benchmark draws one per tick
+static bool interpolate_60fps(void) {
+#ifdef TARGET_GX
+    if (configBenchmark)
+        return false;
+#endif
+    return config60Fps;
+}
+
 void send_display_list(struct SPTask *spTask) {
     if (!inited) {
         return;
     }
-    if (!config60Fps) {
+    if (!interpolate_60fps()) {
         // At 30fps only real frames are shown
         patch_interpolations();
     }
@@ -113,7 +123,35 @@ void send_display_list(struct SPTask *spTask) {
 static u32 samples_high = SAMPLES_HIGH;
 static u32 samples_low = SAMPLES_LOW;
 
+#ifdef TARGET_GX
+// Benchmark mode: the game runs uncapped, so audio is still synthesized (it is real CPU work the
+// game does every tick) but never played. 544, 528, 528 averages the 533.3 samples a 60 Hz
+// half-tick needs at 32 kHz.
+static void bench_audio(void) {
+    static const u16 pattern[3] = { SAMPLES_HIGH, SAMPLES_LOW, SAMPLES_LOW };
+    static u32 step;
+    s16 audio_buffer[SAMPLES_HIGH * 2 * 2];
+    u32 num_audio_samples = pattern[step++ % 3];
+    bench_push(BENCH_AUDIO);
+    for (int i = 0; i < 2; i++) {
+        create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
+    }
+    bench_pop();
+}
+#endif
+
 void produce_one_frame(void) {
+#ifdef TARGET_GX
+    if (gBenchOn) {
+        bench_frame_begin();
+        gfx_start_frame();
+        game_loop_one_iteration();
+        bench_tick_done();
+        bench_audio();
+        gfx_end_frame();
+        return;
+    }
+#endif
     gfx_start_frame();
     game_loop_one_iteration();
 
@@ -133,7 +171,7 @@ void produce_one_frame(void) {
 
     gfx_end_frame();
 
-    if (config60Fps) {
+    if (interpolate_60fps()) {
         gfx_start_frame();
         patch_interpolations();
         send_display_list(gGfxSPTask);
@@ -274,6 +312,9 @@ void main_func(void) {
 
     audio_init();
     sound_init();
+#ifdef TARGET_GX
+    bench_init();
+#endif
 
     thread5_game_loop(NULL);
 #ifdef TARGET_WEB

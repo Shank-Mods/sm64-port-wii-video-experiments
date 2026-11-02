@@ -13,9 +13,15 @@
 #include "gfx_screen_config.h"
 
 #include "../configfile.h"
+#include "../bench.h"
 
 #define TEXTURE_POOL_SIZE 4096
-#define DEFAULT_FIFO_SIZE 256 * 1024
+#ifdef __wii__
+// Large enough to hold a whole frame while the GPU is held back for split timing
+#define DEFAULT_FIFO_SIZE (512 * 1024)
+#else
+#define DEFAULT_FIFO_SIZE (256 * 1024)
+#endif
 
 // shaders
 struct ShaderProgram {
@@ -557,6 +563,128 @@ static uint32_t round_up(uint32_t number, uint32_t multiple)
     return ((number + multiple - 1) / multiple) * multiple;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Benchmark GPU timing
+//
+// Split frames hold the GPU back with a command processor FIFO breakpoint placed at the start of
+// the frame, so it executes nothing while the CPU builds the frame. At the end of the frame the
+// breakpoint is removed and the GPU runs the whole frame on its own: the time from release to
+// GX_DrawDone returning is pure GPU time. Draw-sync tokens at each change between 3D and 2D
+// draws (and before the XFB copy) are timestamped from their interrupt, splitting that time by
+// task. Overlapped frames run normally (GPU consuming while the CPU writes), which is how the
+// game really runs, but they can't separate GPU time.
+
+#define BENCH_MAX_TOKENS 60
+#define BENCH_TOKEN_BASE 0xB000
+#define BENCH_SPILL_BYTES (DEFAULT_FIFO_SIZE * 3 / 4)
+
+static vu32 *const pi_reg = (vu32 *)0xCC003000;
+static vu16 *const cp_reg = (vu16 *)0xCC000000;
+
+static bool bench_split;      // breakpoint set, GPU held back
+static bool bench_released;   // split frame whose GPU work was released at the end
+static bool bench_spilled;    // split frame released early because the FIFO filled up
+static uint32_t bench_t_release;
+static int bench_cur_cls = -1;
+static int bench_ntok;
+static uint8_t bench_tok_cls[BENCH_MAX_TOKENS + 1];
+static volatile uint32_t bench_tok_tb[BENCH_MAX_TOKENS + 1];
+
+static void bench_token_callback(u16 token)
+{
+    unsigned i = token - BENCH_TOKEN_BASE;
+    if (i >= 1 && i <= BENCH_MAX_TOKENS)
+        bench_tok_tb[i] = bench_tb();
+}
+
+static void bench_release_gpu(bool spilled)
+{
+    if (!bench_split)
+        return;
+    GX_Flush();
+    bench_t_release = bench_tb();
+    GX_DisableBreakPt();
+    bench_split = false;
+    bench_released = true;
+    bench_spilled = spilled;
+}
+
+static void bench_frame_start_gpu(void)
+{
+    bench_split = false;
+    bench_released = false;
+    bench_spilled = false;
+    bench_cur_cls = -1;
+    bench_ntok = 0;
+    if (!bench_split_this_frame())
+        return;
+
+    // The GPU is idle (the previous frame ended with GX_DrawDone), so its read pointer is at the
+    // write pointer; a breakpoint there stops it before this frame's first command
+    GX_Flush();
+    u32 wp = pi_reg[5] & 0x1FFFFFE0;
+    GX_EnableBreakPt((void *)MEM_PHYSICAL_TO_K0(wp));
+    bench_split = true;
+}
+
+static uint32_t bench_fifo_bytes(void)
+{
+    return ((uint32_t)cp_reg[25] << 16) | cp_reg[24];
+}
+
+// Called before each draw: marks the end of the previous draw class with a token
+static void bench_gpu_class(int cls)
+{
+    if (!bench_split)
+        return;
+    if (bench_fifo_bytes() > BENCH_SPILL_BYTES) {
+        bench_release_gpu(true);
+        return;
+    }
+    if (hr_enabled)
+        return; // tokens would fire once per tile; 1280x240p reports only the GPU total
+    if (bench_cur_cls < 0) {
+        bench_cur_cls = cls;
+        return;
+    }
+    if (cls == bench_cur_cls || bench_ntok >= BENCH_MAX_TOKENS)
+        return;
+    bench_ntok++;
+    bench_tok_cls[bench_ntok] = (uint8_t)bench_cur_cls;
+    bench_tok_tb[bench_ntok] = 0;
+    GX_SetDrawSync(BENCH_TOKEN_BASE + bench_ntok);
+    bench_cur_cls = cls;
+}
+
+static void bench_frame_end_gpu(uint32_t t_done)
+{
+    uint32_t task[BENCH_GPU_COUNT] = { 0 };
+    bool valid = bench_released && !bench_spilled;
+
+    if (valid) {
+        uint32_t prev = bench_t_release;
+        for (int i = 1; i <= bench_ntok; i++) {
+            uint32_t t = bench_tok_tb[i];
+            if (t == 0 || (int32_t)(t - prev) < 0)
+                continue; // token not seen; its time is counted with the next one
+            task[bench_tok_cls[i]] += t - prev;
+            prev = t;
+        }
+        if (hr_enabled)
+            task[BENCH_GPU_WORLD] += t_done - prev; // not split by task in 1280x240p
+        else
+            task[bench_cur_cls < 0 ? BENCH_GPU_COPY : bench_cur_cls] += t_done - prev;
+    }
+    bench_gpu_frame(valid, valid ? t_done - bench_t_release : 0, task, bench_spilled);
+}
+
+// Waits for the GPU outside the normal end of frame (rare texture memory pressure)
+static void gx_wait_gpu(void)
+{
+    bench_release_gpu(true);
+    GX_DrawDone();
+}
+
 // GX can still be reading old texture memory after commands enter the FIFO
 static void gx_free_deferred_texture_data(void)
 {
@@ -577,7 +705,7 @@ static void gx_defer_texture_free(uint16_t *data)
         // Can't wait for the GPU while a frame is being recorded; leak instead (very rare)
         if (hr_recording)
             return;
-        GX_DrawDone();
+        gx_wait_gpu();
         gx_free_deferred_texture_data();
     }
 
@@ -635,7 +763,7 @@ static void gfx_gx_upload_texture(const uint8_t *rgba32_buf, int width, int heig
     {
         if (hr_recording)
             return;
-        GX_DrawDone();
+        gx_wait_gpu();
         gx_free_deferred_texture_data();
         dest = memalign(32, texture_size);
         if (dest == NULL)
@@ -869,6 +997,9 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     // gfx_pc emits 2D rectangles with w == 1
     bool is_2d = (buf_vbo[3] == 1.0f);
 
+    if (gBenchOn)
+        bench_gpu_class(is_2d ? BENCH_GPU_2D : BENCH_GPU_WORLD);
+
     if (hr_recording)
     {
         // Projection is applied per tile at replay time
@@ -983,6 +1114,103 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     GX_End();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Benchmark overlay: the text is rendered on the CPU into one RGB5A3 texture twice a second and
+// drawn every frame as a single quad, so it costs next to nothing per frame
+
+#define OV_TEX_W BENCH_OV_W
+#define OV_TEX_H BENCH_OV_H
+
+static uint16_t *ov_tex;
+static GXTexObj ov_texobj;
+
+static void gx_bench_draw_overlay(void)
+{
+    if (!bench_overlay_enabled())
+        return;
+    bench_push(BENCH_OVERLAY);
+
+    if (ov_tex == NULL) {
+        ov_tex = memalign(32, OV_TEX_W * OV_TEX_H * sizeof(uint16_t));
+        if (ov_tex == NULL) {
+            bench_pop();
+            return;
+        }
+        memset(ov_tex, 0, OV_TEX_W * OV_TEX_H * sizeof(uint16_t));
+        GX_InitTexObj(&ov_texobj, ov_tex, OV_TEX_W, OV_TEX_H, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    }
+    if (bench_overlay_update(ov_tex, OV_TEX_W, OV_TEX_H)) {
+        DCFlushRange(ov_tex, OV_TEX_W * OV_TEX_H * sizeof(uint16_t));
+        GX_InvalidateTexAll();
+    }
+
+    bench_gpu_class(BENCH_GPU_2D);
+
+    GXRModeObj *rmode = gfx_gx_wm_get_rmode();
+    const f32 efb_w = hr_enabled ? HIRES_TILE_WIDTH : rmode->fbWidth;
+    const f32 efb_h = rmode->efbHeight;
+    const bool short_efb = efb_h < 400;          // 240-line modes: squeeze rows to fit
+    const f32 sx = hr_enabled ? 2.0f : 1.0f;     // 1280x240p pixels are half as wide
+    const f32 sy = short_efb ? 0.5f : 1.0f;
+    GX_InitTexObjFilterMode(&ov_texobj, short_efb ? GX_LINEAR : GX_NEAR, short_efb ? GX_LINEAR : GX_NEAR);
+
+    const f32 px0 = 24.0f;
+    const f32 py0 = 16.0f * sy;
+    const f32 px1 = px0 + OV_TEX_W * sx;
+    const f32 py1 = py0 + OV_TEX_H * sy;
+    const f32 x0 = -1.0f + 2.0f * px0 / efb_w, x1 = -1.0f + 2.0f * px1 / efb_w;
+    const f32 y0 = 1.0f - 2.0f * py0 / efb_h, y1 = 1.0f - 2.0f * py1 / efb_h;
+
+    GX_SetViewport(0.0f, 0.0f, efb_w, efb_h, 0.0f, 1.0f);
+    GX_SetScissor(0, 0, (u32)efb_w, (u32)efb_h);
+    GX_LoadProjectionMtx(gx_ortho_mtx, GX_ORTHOGRAPHIC);
+
+    if (!hr_enabled) {
+        GX_InvVtxCache();
+        GX_ClearVtxDesc();
+        GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+        GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+        GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+        GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+    }
+    GX_SetNumChans(1);
+    GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_VTX, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    GX_SetNumTexGens(1);
+    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+    GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+    GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    GX_SetZCompLoc(GX_TRUE);
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+    GX_LoadTexObj(&ov_texobj, GX_TEXMAP0);
+
+    const f32 vx[4] = { x0, x1, x1, x0 }, vy[4] = { y0, y0, y1, y1 };
+    const f32 vs[4] = { 0.0f, 1.0f, 1.0f, 0.0f }, vt[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+    GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+    for (int i = 0; i < 4; i++) {
+        GX_Position3f32(vx[i], vy[i], 0.0f);
+        GX_Color4u8(255, 255, 255, 255);
+        if (hr_enabled)
+            GX_Color4u8(255, 255, 255, 255);
+        GX_TexCoord2f32(vs[i], vt[i]);
+    }
+    GX_End();
+
+    // Put back what gfx_pc expects to persist into the next frame (1280x240p replays re-record it)
+    if (!hr_enabled) {
+        GX_SetViewport((f32)vp_x, (f32)vp_y, (f32)vp_w, (f32)vp_h, 0.0f, applied_far_z);
+        GX_SetScissor(sc_x, sc_y, sc_w, sc_h);
+        if (shader_program_pool_size > 0)
+            gfx_gx_load_shader(&shader_program_pool[current_shader]);
+        gfx_gx_set_use_alpha(cur_use_alpha);
+    }
+    bench_pop();
+}
+
 static void gx_apply_copy_filter(void)
 {
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
@@ -1074,6 +1302,9 @@ static void gx_init()
 
     gx_setup_efb();
 
+    if (configBenchmark)
+        GX_SetDrawSyncCallback(bench_token_callback);
+
     // other gx setup
     GX_SetCullMode(GX_CULL_NONE);
     GX_SetColorUpdate(GX_TRUE);
@@ -1133,6 +1364,9 @@ static void gfx_gx_start_frame(void)
         GX_SetColorUpdate(GX_TRUE);
     }
 
+    if (gBenchOn)
+        bench_frame_start_gpu();
+
     GX_InvalidateTexAll();
     set_z_mode();
 }
@@ -1173,6 +1407,9 @@ static void hr_replay(void)
             GX_CallDispList(hr_dl + seg->offset, seg->size);
         }
 
+        if (t == 0 && gBenchOn)
+            gx_bench_draw_overlay();
+
         // The copy's clear only writes Z (and colour) when those updates are enabled, and
         // the frame may have ended with depth writes off
         GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
@@ -1190,6 +1427,8 @@ static void gfx_gx_end_frame(void)
     ef++;
     if (hr_enabled && (ef <= 3 || ef % 600 == 0))
         dbglog("end_frame %u: segs=%d bytes=%u overflow=%d", ef, hr_nseg, (unsigned)hr_pos, hr_overflow);
+    bool uncapped = gfx_gx_wm_uncapped();
+
     if (hr_recording)
     {
         if (!hr_overflow)
@@ -1198,8 +1437,26 @@ static void gfx_gx_end_frame(void)
         if (!hr_overflow)
             hr_replay();
     }
+    else if (uncapped)
+    {
+        // Copy now, so one wait covers the frame and its copy, and the window manager can queue
+        // the buffer without waiting for vsync
+        if (gBenchOn)
+            gx_bench_draw_overlay();
+        bench_gpu_class(BENCH_GPU_COPY);
+        GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE); // the copy's clear only writes Z when Z updates are on
+        GX_SetColorUpdate(GX_TRUE);
+        GX_CopyDisp(gfx_gx_wm_get_back_buffer(), GX_TRUE);
+        GX_Flush();
+    }
 
+    if (gBenchOn)
+        bench_release_gpu(false);
+    bench_push(BENCH_GPUWAIT);
     GX_DrawDone();
+    bench_pop();
+    if (gBenchOn)
+        bench_frame_end_gpu(bench_tb());
     gx_free_deferred_texture_data();
 
     GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);

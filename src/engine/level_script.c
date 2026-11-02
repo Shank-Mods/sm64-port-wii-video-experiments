@@ -9,6 +9,9 @@
 #include "buffers/zbuffer.h"
 #include "game/area.h"
 #include "game/game_init.h"
+#ifndef TARGET_N64
+#include "pc/bench.h"
+#endif
 #include "game/mario.h"
 #include "game/memory.h"
 #include "game/object_helpers.h"
@@ -862,10 +865,12 @@ struct LevelCommand *level_script_execute(struct LevelCommand *cmd) {
     }
 
     profiler_log_thread5_time(LEVEL_SCRIPT_EXECUTE);
+    bench_push(BENCH_SCENE);
     init_render_image();
     render_game();
     end_master_display_list();
     alloc_display_list(0);
+    bench_pop();
 
     return sCurrentCmd;
 }

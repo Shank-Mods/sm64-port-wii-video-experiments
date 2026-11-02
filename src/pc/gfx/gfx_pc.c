@@ -16,6 +16,7 @@
 #include "gfx_rendering_api.h"
 #include "gfx_screen_config.h"
 #include "../configfile.h"
+#include "../bench.h"
 
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -188,7 +189,9 @@ static void gfx_flush(void) {
     if (buf_vbo_len > 0) {
         int num = buf_vbo_num_tris;
         unsigned long t0 = get_time();
+        bench_push(BENCH_SUBMIT);
         gfx_rapi->draw_triangles(buf_vbo, buf_vbo_len, buf_vbo_num_tris);
+        bench_pop();
         buf_vbo_len = 0;
         buf_vbo_num_tris = 0;
         unsigned long t1 = get_time();
@@ -501,7 +504,15 @@ static void import_texture_ci8(int tile) {
     gfx_rapi->upload_texture(rgba32_buf, width, height);
 }
 
+static void import_texture_impl(int tile);
+
 static void import_texture(int tile) {
+    bench_push(BENCH_TEXTURE);
+    import_texture_impl(tile);
+    bench_pop();
+}
+
+static void import_texture_impl(int tile) {
     uint8_t fmt = rdp.texture_tile.fmt;
     uint8_t siz = rdp.texture_tile.siz;
     uint32_t size_bytes = rdp.loaded_texture[tile].size_bytes;
@@ -650,7 +661,15 @@ static float gfx_adjust_x_for_aspect_ratio(float x) {
     return x * (4.0f / 3.0f) / gfx_current_dimensions.aspect_ratio;
 }
 
+static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *vertices);
+
 static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+    bench_push(BENCH_VERTEX);
+    gfx_sp_vertex_impl(n_vertices, dest_index, vertices);
+    bench_pop();
+}
+
+static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const Vtx_t *v = &vertices[i].v;
         const Vtx_tn *vn = &vertices[i].n;
@@ -1729,13 +1748,17 @@ void gfx_run(Gfx *commands) {
     dropped_frame = false;
 
     double t0 = gfx_wapi->get_time();
+    bench_push(BENCH_DLIST);
     gfx_rapi->start_frame();
     gfx_run_dl(commands);
     gfx_flush();
+    bench_pop();
     double t1 = gfx_wapi->get_time();
     //printf("Process %f %f\n", t1, t1 - t0);
     gfx_rapi->end_frame();
+    bench_push(BENCH_PRESENT);
     gfx_wapi->swap_buffers_begin();
+    bench_pop();
 }
 
 void gfx_end_frame(void) {

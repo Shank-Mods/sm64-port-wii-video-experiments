@@ -4,13 +4,35 @@
 
 #include "gfx_gx_wm.h"
 #include <ogc/machine/processor.h> // _CPU_ISR_Disable/Restore
+#include <ogc/irq.h>
 #include "gfx_screen_config.h"
 #include "../configfile.h" // for config60Fps, config240p, configAntialias, configHires1280
+#include "../bench.h"
 
 static GXRModeObj *rmode;
-static void *framebuffer[2];
+static void *framebuffer[3];
 static bool fb;
 static bool hires_active;
+
+// Benchmark mode presents without waiting for vsync. Three XFBs: the one the VI is scanning,
+// at most one queued for the next retrace, and one to render into. A newer frame replaces a
+// queued one that hasn't reached the screen yet, so the display stays at the field rate (no
+// tearing) while the game runs as fast as it can.
+static bool uncapped;
+static int draw_idx = -1;
+static volatile int shown_idx;
+static volatile int pending_idx = -1;
+
+static void retrace_callback(UNUSED u32 count)
+{
+    bool new_frame = false;
+    if (pending_idx >= 0 && VIDEO_GetCurrentFramebuffer() == framebuffer[pending_idx]) {
+        shown_idx = pending_idx;
+        pending_idx = -1;
+        new_frame = true;
+    }
+    bench_on_retrace(new_frame);
+}
 
 // 1280x240p (4:3): a 240p mode whose XFB is 1280 pixels wide, scanned out with a 54 MHz VI pixel
 // clock so all 1280 pixels fit in the active line. The EFB is only 640 wide, so gfx_gx.c renders
@@ -44,7 +66,25 @@ bool gfx_gx_wm_hires(void)
 
 void *gfx_gx_wm_get_back_buffer(void)
 {
-    return framebuffer[fb ^ 1];
+    if (!uncapped)
+        return framebuffer[fb ^ 1];
+
+    if (draw_idx < 0) {
+        u32 level = IRQ_Disable();
+        for (int i = 0; i < 3; i++) {
+            if (i != shown_idx && i != pending_idx) {
+                draw_idx = i;
+                break;
+            }
+        }
+        IRQ_Restore(level);
+    }
+    return framebuffer[draw_idx];
+}
+
+bool gfx_gx_wm_uncapped(void)
+{
+    return uncapped;
 }
 
 // Horizontal timing for 1280 active pixels at 54 MHz (858 clocks per half line), taken from a
@@ -113,9 +153,16 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     dbglog("wm_init: mode viTVMode=%u fb=%ux%u efb=%u vi=%ux%u hires=%d", rmode->viTVMode,
            rmode->fbWidth, rmode->xfbHeight, rmode->efbHeight, rmode->viWidth, rmode->viHeight, hires_active);
 
-    // double-buffering
+    // double-buffering (triple when uncapped)
     framebuffer[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
     framebuffer[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+    if (configBenchmark) {
+        void *third = SYS_AllocateFramebuffer(rmode);
+        if (third != NULL) {
+            framebuffer[2] = MEM_K0_TO_K1(third);
+            uncapped = true;
+        }
+    }
 
     dbglog("wm_init: fb0=%p fb1=%p", framebuffer[0], framebuffer[1]);
     VIDEO_Configure(rmode);
@@ -127,6 +174,11 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     VIDEO_WaitVSync();
     if (rmode->viTVMode & VI_NON_INTERLACE)
         VIDEO_WaitVSync();
+
+    if (uncapped) {
+        shown_idx = fb;
+        VIDEO_SetPostRetraceCallback(retrace_callback);
+    }
 
     dbg_vi_regs("libogc");
     if (hires_active) {
@@ -208,6 +260,19 @@ static void gfx_gx_wm_swap_buffers_begin(void)
         dbglog("swap: frame %u", frames);
     if (frames == 120 && hires_active)
         dbg_vi_regs("frame120");
+
+    if (uncapped) {
+        // The renderer has already copied the frame into the draw buffer and waited for it
+        if (draw_idx < 0)
+            return;
+        u32 level = IRQ_Disable();
+        pending_idx = draw_idx;
+        VIDEO_SetNextFramebuffer(framebuffer[draw_idx]);
+        VIDEO_Flush();
+        IRQ_Restore(level);
+        draw_idx = -1;
+        return;
+    }
 
     fb ^= 1; // flip frame buffer
 

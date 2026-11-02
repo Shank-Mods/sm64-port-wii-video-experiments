@@ -95,7 +95,7 @@ bool configWidescreen            = false; // resolved at startup from configWide
 unsigned int configWidescreenMode = WIDESCREEN_AUTO; // anamorphic 16:9
 bool configPillarbox             = false; // render 4:3 into the centre 3/4 so a 16:9 display's stretch restores correct 4:3
 bool config240p                  = false; // Output a true 240p signal instead of 480i/480p
-bool configHires1280             = true;  // 1280x240p (4:3) output, rendered as two 640x240 tiles
+bool configHires1280             = false; // 1280x240p (4:3) output, rendered as two 640x240 tiles
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
 bool configInvertCamera          = false; // Invert camera controls
 bool configRumble                = true;  // Shindou controller rumble
@@ -103,6 +103,9 @@ bool configFog                   = true;  // Distance fog (turning it off also e
 bool configForceNearest          = false; // Force GX_NEAR (nearest-neighbour) texture filtering instead of bilinear
 bool configViDeflicker           = true;  // Apply the VI deflicker filter
 bool configPuppycam              = false; // Use the Puppycam analogue camera instead of the original camera
+bool configBenchmark             = true;  // Uncapped timedemo: runs the attract-mode demos as fast as possible
+bool configBenchOverlay          = true;  // Frame time overlay in benchmark mode
+unsigned int configBenchSplit    = 2;     // GPU timing passes: 0 never, 1 always, 2 alternate passes
 unsigned int puppycam_sensitivityX = 75;
 unsigned int puppycam_sensitivityY = 75;
 unsigned int puppycam_invertX      = 0;
@@ -174,6 +177,9 @@ static const struct ConfigOption options[] = {
     {.name = "force_nearest",  .type = CONFIG_TYPE_BOOL, .boolValue = &configForceNearest},
     {.name = "vi_deflicker",   .type = CONFIG_TYPE_BOOL, .boolValue = &configViDeflicker},
     {.name = "puppycam",       .type = CONFIG_TYPE_BOOL, .boolValue = &configPuppycam},
+    {.name = "benchmark",      .type = CONFIG_TYPE_BOOL, .boolValue = &configBenchmark},
+    {.name = "bench_overlay",  .type = CONFIG_TYPE_BOOL, .boolValue = &configBenchOverlay},
+    {.name = "bench_gpu_split", .type = CONFIG_TYPE_UINT, .uintValue = &configBenchSplit},
     {.name = "puppycam_sensitivity_x",  .type = CONFIG_TYPE_UINT, .uintValue = &puppycam_sensitivityX},
     {.name = "puppycam_sensitivity_y",  .type = CONFIG_TYPE_UINT, .uintValue = &puppycam_sensitivityY},
     {.name = "puppycam_invert_x",       .type = CONFIG_TYPE_UINT, .uintValue = &puppycam_invertX},
