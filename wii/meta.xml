@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
  <app version="1">
-   <name>Super Mario 64</name>
-   <coder>mkst &amp; PalindromicBreadLoaf</coder>
-   <version>2.0</version>
-   <release_date>20260608</release_date>
-   <short_description>Super Mario 64 for Wii</short_description>
-   <long_description>Super Mario 64 Ported to Wii
-See https://github.com/mkst/sm64-port/tree/wii for more information.</long_description>
+   <name>Super Mario 64 (720p benchmark)</name>
+   <coder>mkst &amp; PalindromicBreadLoaf, 720p by Shank-Mods</coder>
+   <version>2.0-720p</version>
+   <release_date>20261102</release_date>
+   <short_description>SM64 rendered and output at 1280x720p</short_description>
+   <long_description>Super Mario 64 for Wii, rendered natively at 1280x720 and output as 720p60 by reprogramming the VI pixel clock to 148.5 MHz. Needs a digital video output that accepts it (e.g. a RetroGEM); analog and GCVideo outputs will not show it. Uncapped timedemo benchmark with a CPU/GPU frame-time overlay. Options in apps/sm64/sm64config.txt: video_mode, bench_demo, bench_uncapped, bench_overlay.
+See https://github.com/Shank-Mods/sm64-port-wii-video-experiments/tree/wii-720p</long_description>
+   <ahb_access/>
  </app>

@@ -25,8 +25,23 @@ GXRModeObj *gfx_gx_wm_get_rmode(void);
 #define HIRES_XFB_WIDTH 1280
 #define HIRES_TILE_WIDTH 640
 
-// True when the 1280x240p mode is in use
+// True when the frame is rendered in EFB tiles (1280x240p or 1280x720p)
 bool gfx_gx_wm_hires(void);
+
+// True when the 1280x720p mode is in use
+bool gfx_gx_wm_hd(void);
+
+// Tile grid of the tiled modes: 2x1 tiles of 640x240 in 1280x240p, 2x2 of 640x360 in 720p
+void gfx_gx_wm_get_tiles(int *tiles_x, int *tiles_y, int *tile_w, int *tile_h);
+
+// Height of the whole rendered frame in pixels (720 in 720p, otherwise the EFB height)
+int gfx_gx_wm_get_frame_height(void);
+
+// Puts the stock VI clock and the safe video mode back (no-op unless 720p is up)
+void gfx_gx_wm_shutdown(void);
+
+// Exact field rate of the selected video mode in Hz
+double gfx_gx_wm_get_field_hz(void);
 
 // The framebuffer that the next swap will display
 void *gfx_gx_wm_get_back_buffer(void);

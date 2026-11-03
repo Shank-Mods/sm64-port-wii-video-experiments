@@ -89,10 +89,10 @@ static void patch_interpolations(void) {
     patch_interpolated_snow_particles();
 }
 
-// 60fps interpolation draws a second frame per game tick; the benchmark draws one per tick
+// 60fps interpolation draws a second frame per game tick; uncapped draws one per tick
 static bool interpolate_60fps(void) {
 #ifdef TARGET_GX
-    if (configBenchmark)
+    if (configBenchUncapped)
         return false;
 #endif
     return config60Fps;
@@ -124,8 +124,8 @@ static u32 samples_high = SAMPLES_HIGH;
 static u32 samples_low = SAMPLES_LOW;
 
 #ifdef TARGET_GX
-// Benchmark mode: the game runs uncapped, so audio is still synthesized (it is real CPU work the
-// game does every tick) but never played. 544, 528, 528 averages the 533.3 samples a 60 Hz
+// Uncapped: the game runs as fast as it can, so audio is still synthesized (it is real CPU work
+// the game does every tick) but never played. 544, 528, 528 averages the 533.3 samples a 60 Hz
 // half-tick needs at 32 kHz.
 static void bench_audio(void) {
     static const u16 pattern[3] = { SAMPLES_HIGH, SAMPLES_LOW, SAMPLES_LOW };
@@ -142,7 +142,9 @@ static void bench_audio(void) {
 
 void produce_one_frame(void) {
 #ifdef TARGET_GX
-    if (gBenchOn) {
+    if (configBenchUncapped) {
+        // One game tick and one rendered frame, no vsync wait (bench_* are no-ops when the
+        // instrumentation is off)
         bench_frame_begin();
         gfx_start_frame();
         game_loop_one_iteration();
@@ -151,9 +153,16 @@ void produce_one_frame(void) {
         gfx_end_frame();
         return;
     }
+    // Capped: normal 30 Hz game logic, presented at vsync (with the 60fps option, a second
+    // interpolated frame per tick)
+    bench_frame_begin();
 #endif
     gfx_start_frame();
     game_loop_one_iteration();
+#ifdef TARGET_GX
+    bench_tick_done();
+    bench_push(BENCH_AUDIO);
+#endif
 
     int samples_left = audio_api->buffered();
     u32 num_audio_samples = samples_left < audio_api->get_desired_buffered() ? samples_high : samples_low;
@@ -168,10 +177,16 @@ void produce_one_frame(void) {
     }
     //printf("Audio samples before submitting: %d\n", audio_api->buffered());
     audio_api->play((u8 *)audio_buffer, 2 * num_audio_samples * 4);
+#ifdef TARGET_GX
+    bench_pop();
+#endif
 
     gfx_end_frame();
 
     if (interpolate_60fps()) {
+#ifdef TARGET_GX
+        bench_frame_begin();
+#endif
         gfx_start_frame();
         patch_interpolations();
         send_display_list(gGfxSPTask);
@@ -237,8 +252,9 @@ void main_func(void) {
 #endif
     dbglog("config load returned");
     configfile_resolve_widescreen();
-    dbglog("config loaded: hires_1280x240p=%d 240p=%d widescreen=%d",
-           configHires1280, config240p, configWidescreen);
+    dbglog("config loaded: video_mode=%u hires_1280x240p=%d 240p=%d widescreen=%d bench_demo=%d bench_uncapped=%d bench_overlay=%d",
+           configVideoMode, configHires1280, config240p, configWidescreen, configBenchmark,
+           configBenchUncapped, configBenchOverlay);
     atexit(save_config);
 
 #ifdef TARGET_WEB

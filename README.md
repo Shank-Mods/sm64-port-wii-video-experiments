@@ -18,6 +18,48 @@ I didn't test enough on Gamecube to make the same claim, but it should be able t
 
 ![Enhancements Menu](docs/settings.png)
 
+## 1280x720p output (Wii, `wii-720p` branch)
+
+This branch renders the game **natively at 1280x720** and outputs a real **720p60** signal, for
+digital video mods that accept HD pixel clocks from the Wii (e.g. a PixelFX RetroGEM). Analog
+outputs and GCVideo-based boards (rated to 54 MHz) will not show it.
+
+- **Video:** the VI pixel clock is reprogrammed to 148.5 MHz (PLL Nfb 22, V 8: the bus moves one
+  74.25 MHz pixel every two clocks) and the VI gets a complete SMPTE 296M register image
+  (1650 x 750 total, 1280 x 720 active, exactly 60.000 Hz). Timing, PLL law and register layout
+  come from [Wii-VI-Experiments](https://github.com/Shank-Mods/Wii-VI-Experiments)
+  (`tools/vimodetest`, `docs/VI_PLL.md`). libogc is left on the console's normal mode
+  underneath; framebuffer flips are written straight to the VI from the retrace interrupt. On
+  exit (HOME, power, reset) the stock clock and mode are put back before anything else.
+- **Rendering:** the GPU's embedded framebuffer is at most 640x528, so each frame is recorded
+  into display lists once and replayed as a **2x2 grid of 640x360 tiles**, each copied into its
+  quadrant of the 1280x720 XFB (the 1280x240p tiling, extended to two rows). The CPU-side work
+  (game logic, display list decode, software vertex transform) happens once per frame; the GPU
+  draws the scene four times with about 3x the pixels of 480p, so expect GPU time to dominate.
+- Widescreen AUTO resolves to 16:9 (native square pixels). Antialiasing is not used in 720p.
+- The app needs `<ahb_access/>` (in `meta.xml`) to reach the PLL registers.
+- The startup log (`sm64_debug.txt` in the root of the SD card / USB drive) records every VI register and PLL
+  value written.
+
+**Check the mode first:** if 720p doesn't show, try the `1280x720p` entry in Wii-VI-Experiments'
+`vimodetest` on the same setup. If its patterns look right, the problem is in the game; if not,
+it's the VI timing or the video chain. Set `video_mode default` to go back to 480p.
+
+### Options (`apps/sm64/sm64config.txt`)
+
+| option | default | |
+|---|---|---|
+| `video_mode` | `720p` | `720p`, or `default` for the console's own mode (480p/480i, or 240p / 1280x240p if those are enabled) |
+| `bench_demo` | `true` | timedemo: plays the attract demos in a loop, input ignored, results logged. `false` = normal play with your controller |
+| `bench_uncapped` | `true` | one game tick per rendered frame and no vsync wait, so game logic runs as fast as the hardware allows (fast motion, audio silent). `false` = normal 30 Hz logic presented at vsync, with the `60fps` option's interpolation |
+| `bench_overlay` | `true` | the frame-time overlay, in demo mode and in normal play |
+| `bench_gpu_split` | `2` | 0 overlapped, 1 split, 2 alternate (in normal play: one 0.5 s window in four is split) |
+
+`benchmark` (the `wii-benchmark` branch's name for `bench_demo`) is still read.
+
+In capped mode the overlay's FPS is the presented rate; the **busy** line shows the time per
+frame excluding the vsync wait, and the frame rate that alone would allow.
+
 ## Uncapped benchmark (Wii, `wii-benchmark` branch)
 
 This branch turns the port into a repeatable **timedemo benchmark**, meant for comparing a stock
@@ -73,11 +115,8 @@ overclocked results equally.
 
 ### Options (`apps/sm64/sm64config.txt`)
 
-| option | default | |
-|---|---|---|
-| `benchmark` | `true` | uncapped timedemo; `false` restores normal play |
-| `bench_overlay` | `true` | show the overlay |
-| `bench_gpu_split` | `2` | 0 overlapped, 1 split, 2 alternate passes |
+See the option table in the 1280x720p section above (`benchmark` is now `bench_demo`, and
+`bench_uncapped` controls the uncapped part separately).
 
 The `60fps` interpolation option is ignored while benchmarking (one frame per tick). On this
 branch `hires_1280x240p` defaults to `false`, so the benchmark runs in the console's normal

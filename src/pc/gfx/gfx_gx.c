@@ -58,14 +58,15 @@ static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 #define GX_DECAL_BIAS 0.0001f
 #define GX_TEXTURE_EDGE_ALPHA_THRESHOLD 76
 
-// 1280x240p tiled rendering
-// The EFB is 640 pixels wide, so a 1280 pixel wide frame is rendered twice: once for the left
-// half and once for the right half, each copied into its half of the 1280 wide XFB. The frame's
+// Tiled rendering (1280x240p and 1280x720p)
+// The EFB is at most 640x528, so a 1280 pixel wide frame is rendered as a grid of tiles: 2x1
+// tiles of 640x240 in 1280x240p, 2x2 tiles of 640x360 in 720p, each copied into its place in the
+// XFB. The frame's
 // GX commands are recorded into display list segments once, then replayed for each tile. Viewport
 // and scissor are kept out of the recorded commands (each segment remembers them) so they can be
 // adjusted per tile. The projection matrix is kept out too: for each tile the hardware viewport
-// is exactly the 640 pixel EFB, and the projection is rescaled so that tile's slice of the frame
-// fills it. Geometry outside the tile is then clipped by the transform unit, so no screen
+// is exactly the EFB tile, and the projection is rescaled so that tile's slice of the frame
+// fills it (horizontally, and in 720p vertically too). Geometry outside the tile is then clipped by the transform unit, so no screen
 // coordinate ever lands far outside the EFB (the rasterizer mangles triangles that do).
 // Frames record well under 100 KB on hardware; keep headroom without costing GameCube memory
 #define HIRES_DL_SIZE (1024 * 1024)
@@ -83,6 +84,8 @@ struct HiresSeg {
 static bool cur_is_2d; // projection the current draws use (orthographic for 2D)
 
 static bool hr_enabled;
+static int hr_tiles_x = 2, hr_tiles_y = 1;      // tile grid
+static int hr_tile_w = HIRES_TILE_WIDTH, hr_tile_h = 240;
 static uint8_t *hr_dl;
 static struct HiresSeg hr_segs[HIRES_MAX_SEGS];
 static int hr_nseg;
@@ -883,9 +886,10 @@ static void hr_state_changed(void)
 
 static void hr_apply_scissor(int x, int y, int w, int h)
 {
-    // Direct (unrecorded) scissor while in hires mode: keep it inside the left tile
-    int x1 = MIN(x + w, HIRES_TILE_WIDTH);
-    GX_SetScissor(x, y, x1 > x ? x1 - x : 0, h);
+    // Direct (unrecorded) scissor while in a tiled mode: keep it inside the top left tile
+    int x1 = MIN(x + w, hr_tile_w);
+    int y1 = MIN(y + h, hr_tile_h);
+    GX_SetScissor(x, y, x1 > x ? x1 - x : 0, y1 > y ? y1 - y : 0);
 }
 
 static void gx_issue_viewport(f32 far_z)
@@ -925,13 +929,20 @@ static int gx_map_w(int width, int fbWidth)
     return width * fbWidth / DESIRED_SCREEN_WIDTH;
 }
 
+// Height of the whole frame: 720 in 720p (rendered as two rows of tiles), else the EFB height
+static int gx_frame_h(void)
+{
+    return gfx_gx_wm_get_frame_height();
+}
+
 static void gfx_gx_set_viewport(int x, int y, int width, int height)
 {
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
+    const int fh = gx_frame_h();
     vp_x = gx_map_x(x, rmode->fbWidth);
     vp_w = gx_map_w(width, rmode->fbWidth);
-    vp_y = y * rmode->efbHeight / DESIRED_SCREEN_HEIGHT;
-    vp_h = height * rmode->efbHeight / DESIRED_SCREEN_HEIGHT;
+    vp_y = y * fh / DESIRED_SCREEN_HEIGHT;
+    vp_h = height * fh / DESIRED_SCREEN_HEIGHT;
     gx_issue_viewport(1.0f);
 }
 
@@ -942,10 +953,11 @@ static void gfx_gx_set_scissor(int x, int y, int width, int height)
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
     int sx = gx_map_x(x, rmode->fbWidth);
     int sw = gx_map_w(width, rmode->fbWidth);
-    int sy = y * rmode->efbHeight / DESIRED_SCREEN_HEIGHT;
-    int sh = height * rmode->efbHeight / DESIRED_SCREEN_HEIGHT;
+    const int fh = gx_frame_h();
+    int sy = y * fh / DESIRED_SCREEN_HEIGHT;
+    int sh = height * fh / DESIRED_SCREEN_HEIGHT;
     sc_x = sx;
-    sc_y = rmode->efbHeight - sy - sh;
+    sc_y = fh - sy - sh;
     sc_w = sw;
     sc_h = sh;
     if (hr_recording)
@@ -1147,10 +1159,11 @@ static void gx_bench_draw_overlay(void)
     bench_gpu_class(BENCH_GPU_2D);
 
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
-    const f32 efb_w = hr_enabled ? HIRES_TILE_WIDTH : rmode->fbWidth;
-    const f32 efb_h = rmode->efbHeight;
-    const bool short_efb = efb_h < 400;          // 240-line modes: squeeze rows to fit
-    const f32 sx = hr_enabled ? 2.0f : 1.0f;     // 1280x240p pixels are half as wide
+    // In the tiled modes the overlay sits inside the top left tile, whose origin is the frame's
+    const f32 efb_w = hr_enabled ? hr_tile_w : rmode->fbWidth;
+    const f32 efb_h = hr_enabled ? hr_tile_h : rmode->efbHeight;
+    const bool short_efb = gx_frame_h() < 400;   // 240-line modes: squeeze rows to fit
+    const f32 sx = (hr_enabled && !gfx_gx_wm_hd()) ? 2.0f : 1.0f; // 1280x240p pixels are half as wide
     const f32 sy = short_efb ? 0.5f : 1.0f;
     GX_InitTexObjFilterMode(&ov_texobj, short_efb ? GX_LINEAR : GX_NEAR, short_efb ? GX_LINEAR : GX_NEAR);
 
@@ -1214,8 +1227,10 @@ static void gx_bench_draw_overlay(void)
 static void gx_apply_copy_filter(void)
 {
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
-    GX_SetCopyFilter(rmode->aa, rmode->sample_pattern,
-                     configViDeflicker ? GX_TRUE : GX_FALSE, rmode->vfilter);
+    // Not in 720p: the filter blends neighbouring lines, which would mark the seam between the
+    // two rows of tiles (each copy only sees its own tile), and progressive 720p has no flicker
+    const bool deflicker = configViDeflicker && !gfx_gx_wm_hd();
+    GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, deflicker ? GX_TRUE : GX_FALSE, rmode->vfilter);
 }
 
 // Configure the embedded framebuffer and the EFB->XFB copy
@@ -1228,24 +1243,27 @@ static void gx_setup_efb(void)
     vp_x = 0;
     vp_y = 0;
     vp_w = rmode->fbWidth;
-    vp_h = rmode->efbHeight;
+    vp_h = gx_frame_h();
     gx_issue_viewport(1.0f); // plain (0, 1) range
     sc_x = 0;
     sc_y = 0;
     sc_w = rmode->fbWidth;
-    sc_h = rmode->efbHeight;
-    GX_SetDispCopyYScale((f32)rmode->xfbHeight / (f32)rmode->efbHeight);
+    sc_h = gx_frame_h();
     if (hr_enabled)
     {
+        // Each tile is copied 1:1 into its place in the XFB
+        GX_SetDispCopyYScale(1.0f);
         hr_apply_scissor(sc_x, sc_y, sc_w, sc_h);
-        GX_SetDispCopySrc(0, 0, HIRES_TILE_WIDTH, rmode->efbHeight);
+        GX_SetDispCopySrc(0, 0, hr_tile_w, hr_tile_h);
+        GX_SetDispCopyDst(rmode->fbWidth, hr_tile_h);
     }
     else
     {
+        GX_SetDispCopyYScale((f32)rmode->xfbHeight / (f32)rmode->efbHeight);
         GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
         GX_SetDispCopySrc(0, 0, rmode->fbWidth, rmode->efbHeight);
+        GX_SetDispCopyDst(rmode->fbWidth, rmode->xfbHeight);
     }
-    GX_SetDispCopyDst(rmode->fbWidth, rmode->xfbHeight);
     gx_apply_copy_filter();
     GX_SetFieldMode(rmode->field_rendering, ((rmode->viHeight == 2 * rmode->xfbHeight) ? GX_ENABLE : GX_DISABLE));
 
@@ -1293,6 +1311,8 @@ static void gx_init()
             // The CPU never touches the list; make sure no stale cache lines get written over it
             DCInvalidateRange(hr_dl, HIRES_DL_SIZE);
             hr_enabled = true;
+            gfx_gx_wm_get_tiles(&hr_tiles_x, &hr_tiles_y, &hr_tile_w, &hr_tile_h);
+            dbglog("gx_init: tiles %dx%d of %dx%d", hr_tiles_x, hr_tiles_y, hr_tile_w, hr_tile_h);
             // Keep libogc's register shadows as recorded, rather than rolling them back at the
             // end of every display list segment
             GX_SetMisc(GX_MT_DL_SAVE_CTX, 0);
@@ -1302,7 +1322,7 @@ static void gx_init()
 
     gx_setup_efb();
 
-    if (configBenchmark)
+    if (bench_wanted())
         GX_SetDrawSyncCallback(bench_token_callback);
 
     // other gx setup
@@ -1372,27 +1392,38 @@ static void gfx_gx_start_frame(void)
 }
 
 // Projection for one segment on one tile: x_ndc' = a * x_ndc + b maps the part of the segment's
-// viewport (in 1280 wide frame coordinates) that falls inside the tile onto a 640 wide viewport
-static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0)
+// viewport (in frame coordinates) that falls inside the tile onto a viewport the size of the
+// tile. With more than one row of tiles y is remapped the same way (GX viewports run top down,
+// so NDC y = +1 is the viewport's top row vp[1]); with one row the viewport keeps its own y.
+static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int tile_y0)
 {
     Mtx44 m;
-    const f32 a = (f32)seg->vp[2] / (f32)HIRES_TILE_WIDTH;
-    const f32 b = (2.0f * (f32)(seg->vp[0] - tile_x0) + (f32)seg->vp[2]) / (f32)HIRES_TILE_WIDTH - 1.0f;
+    const f32 tw = (f32)hr_tile_w, th = (f32)hr_tile_h;
+    const f32 a = (f32)seg->vp[2] / tw;
+    const f32 b = (2.0f * (f32)(seg->vp[0] - tile_x0) + (f32)seg->vp[2]) / tw - 1.0f;
 
     memcpy(m, seg->is_2d ? gx_ortho_mtx : gx_perspective_mtx, sizeof(m));
     for (int j = 0; j < 4; j++)
         m[0][j] = a * m[0][j] + b * m[3][j];
+    if (hr_tiles_y > 1) {
+        const f32 ay = (f32)seg->vp[3] / th;
+        const f32 by = 1.0f - (2.0f * (f32)(seg->vp[1] - tile_y0) + (f32)seg->vp[3]) / th;
+        for (int j = 0; j < 4; j++)
+            m[1][j] = ay * m[1][j] + by * m[3][j];
+    }
     GX_LoadProjectionMtx(m, seg->is_2d ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
 }
 
 static void hr_replay(void)
 {
+    GXRModeObj *rmode = gfx_gx_wm_get_rmode();
     void *xfb = gfx_gx_wm_get_back_buffer();
 
-    for (int t = 0; t < 2; t++)
+    for (int ty = 0; ty < hr_tiles_y; ty++)
+    for (int tx = 0; tx < hr_tiles_x; tx++)
     {
-        int tile_x0 = t * HIRES_TILE_WIDTH;
-        int tile_x1 = tile_x0 + HIRES_TILE_WIDTH;
+        const int tile_x0 = tx * hr_tile_w, tile_x1 = tile_x0 + hr_tile_w;
+        const int tile_y0 = ty * hr_tile_h, tile_y1 = tile_y0 + hr_tile_h;
 
         for (int i = 0; i < hr_nseg; i++)
         {
@@ -1400,14 +1431,22 @@ static void hr_replay(void)
             int x0 = MAX(seg->sc[0], tile_x0);
             int x1 = MIN(seg->sc[0] + seg->sc[2], tile_x1);
 
-            hr_load_tile_projection(seg, tile_x0);
-            GX_SetViewport(0.0f, (f32)seg->vp[1], (f32)HIRES_TILE_WIDTH, (f32)seg->vp[3],
-                           0.0f, seg->far_z);
-            GX_SetScissor(x0 - tile_x0, seg->sc[1], x1 > x0 ? x1 - x0 : 0, seg->sc[3]);
+            hr_load_tile_projection(seg, tile_x0, tile_y0);
+            if (hr_tiles_y > 1) {
+                int y0 = MAX(seg->sc[1], tile_y0);
+                int y1 = MIN(seg->sc[1] + seg->sc[3], tile_y1);
+                GX_SetViewport(0.0f, 0.0f, (f32)hr_tile_w, (f32)hr_tile_h, 0.0f, seg->far_z);
+                GX_SetScissor(x0 - tile_x0, y1 > y0 ? y0 - tile_y0 : 0,
+                              x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0);
+            } else {
+                GX_SetViewport(0.0f, (f32)seg->vp[1], (f32)hr_tile_w, (f32)seg->vp[3],
+                               0.0f, seg->far_z);
+                GX_SetScissor(x0 - tile_x0, seg->sc[1], x1 > x0 ? x1 - x0 : 0, seg->sc[3]);
+            }
             GX_CallDispList(hr_dl + seg->offset, seg->size);
         }
 
-        if (t == 0 && gBenchOn)
+        if (tx == 0 && ty == 0 && bench_overlay_enabled())
             gx_bench_draw_overlay();
 
         // The copy's clear only writes Z (and colour) when those updates are enabled, and
@@ -1415,7 +1454,8 @@ static void hr_replay(void)
         GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
         GX_SetColorUpdate(GX_TRUE);
         GX_SetAlphaUpdate(GX_TRUE);
-        GX_CopyDisp((uint8_t *)xfb + t * HIRES_TILE_WIDTH * 2, GX_TRUE);
+        const uint32_t offset = ((uint32_t)tile_y0 * rmode->fbWidth + (uint32_t)tile_x0) * 2;
+        GX_CopyDisp((uint8_t *)xfb + offset, GX_TRUE);
     }
 
     GX_Flush();
@@ -1437,11 +1477,17 @@ static void gfx_gx_end_frame(void)
         if (!hr_overflow)
             hr_replay();
     }
-    else if (uncapped)
+    else if (!uncapped)
+    {
+        // Presenting at vsync: the window manager copies the frame when it swaps
+        if (bench_overlay_enabled())
+            gx_bench_draw_overlay();
+    }
+    else
     {
         // Copy now, so one wait covers the frame and its copy, and the window manager can queue
         // the buffer without waiting for vsync
-        if (gBenchOn)
+        if (bench_overlay_enabled())
             gx_bench_draw_overlay();
         bench_gpu_class(BENCH_GPU_COPY);
         GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE); // the copy's clear only writes Z when Z updates are on

@@ -25,6 +25,10 @@ void configfile_switch_storage_device(unsigned int newDevice);
 #define WIDESCREEN_AUTO      2u // follow the console's system 16:9 setting on Wii only
 #define WIDESCREEN_PILLARBOX 3u // Proper 4:3 on a 16:9 display. Doesn't work on some displays
 
+// configVideoMode
+#define VIDEO_MODE_DEFAULT 0u // the console's own mode (480p/480i), or 240p / 1280x240p if enabled
+#define VIDEO_MODE_720P    1u // 1280x720p60, VI pixel clock reprogrammed to 148.5 MHz
+
 extern bool         configFullscreen;
 extern bool         config60Fps;
 extern bool         configWidescreen;
@@ -33,6 +37,7 @@ extern bool         configPillarbox;
 extern bool         config240p;
 extern bool         configAntialias;
 extern bool         configHires1280;
+extern unsigned int configVideoMode;
 
 void dbglog(const char *fmt, ...);
 extern bool         configInvertCamera;
@@ -43,6 +48,7 @@ extern bool         configViDeflicker;
 extern bool         configPuppycam;
 extern bool         configBenchmark;
 extern bool         configBenchOverlay;
+extern bool         configBenchUncapped;
 extern unsigned int configBenchSplit;
 extern unsigned int puppycam_sensitivityX;
 extern unsigned int puppycam_sensitivityY;

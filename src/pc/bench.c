@@ -28,7 +28,7 @@ uint32_t gBenchAcc[BENCH_CPU_COUNT];
 
 static const char *const cpu_names[BENCH_CPU_COUNT] = {
     "Other", "Game logic", "Scene graph", "Audio synth", "DL+tri setup", "Vertex xform",
-    "Tex decode", "GX submit", "GPU wait", "Present", "Overlay",
+    "Tex decode", "GX submit", "GPU wait", "Present+vsync", "Overlay",
 };
 static const char *const gpu_names[BENCH_GPU_COUNT] = { "3D world", "2D/HUD/sky", "XFB copy" };
 
@@ -195,6 +195,12 @@ static char result_note[48];
 
 // ---------------------------------------------------------------------------------------------
 
+bool bench_wanted(void) {
+    return configBenchmark || configBenchOverlay;
+}
+
+static uint32_t win_no; // 0.5 s overlay windows closed so far
+
 static int split_setting(void) {
     // 0: never, 1: always, 2: alternate passes (odd passes overlapped, even passes split)
     return configBenchSplit > 2 ? 2 : (int)configBenchSplit;
@@ -205,6 +211,16 @@ static bool split_for_pass(int n) {
         case 0: return false;
         case 1: return true;
         default: return (n % 2) == 0;
+    }
+}
+
+// Normal play has no passes: with the alternating setting, one overlay window in four is split
+// so the GPU breakdown stays fresh without costing the overlap most of the time
+static bool split_for_play_window(uint32_t n) {
+    switch (split_setting()) {
+        case 0: return false;
+        case 1: return true;
+        default: return (n % 4) == 3;
     }
 }
 
@@ -258,6 +274,8 @@ static const char *video_desc(void) {
     GXRModeObj *r = gfx_gx_wm_get_rmode();
     if (r == NULL)
         return "?";
+    if (gfx_gx_wm_hd())
+        return "1280x720p";
     if (gfx_gx_wm_hires())
         return "1280x240p";
     char scan = (r->viTVMode & 3) == VI_INTERLACE ? 'i' : 'p';
@@ -340,7 +358,9 @@ static void finish_pass(void) {
     fprintf(f, "\n=== SM64 Wii benchmark, pass %d (%s) ===\n", pass_no,
             pass_split ? "split: GPU runs after CPU" : "overlapped: normal pipelining");
     fprintf(f, "build:  %s %s\n", __DATE__, __TIME__);
-    fprintf(f, "video:  %s, %.2f Hz assumed field rate\n", video_desc(), field_hz);
+    fprintf(f, "video:  %s, %.3f Hz field rate\n", video_desc(), field_hz);
+    fprintf(f, "mode:   %s\n", configBenchUncapped ? "uncapped (one game tick per frame, no vsync)"
+                                                  : "capped (presented at vsync)");
     fprintf(f, "clock:  timebase %.3f MHz -> bus %.1f MHz (x%.3f of stock)%s; CPU est. %.0f MHz\n",
             tb_hz / 1e6, tb_hz * 4.0 / 1e6, tb_hz / STOCK_TB_HZ,
             tb_calibrated ? "" : " [not yet calibrated]", cpu_mhz);
@@ -425,7 +445,8 @@ static void demo_end(void) {
 void bench_tick_done(void) {
     if (!gBenchOn)
         return;
-    bool active = gCurrDemoInput != NULL;
+    // Passes are only timed in demo mode (an idle title screen also plays demos)
+    bool active = configBenchmark && gCurrDemoInput != NULL;
     if (active && !demo_active)
         demo_start();
     else if (!active && demo_active)
@@ -490,7 +511,10 @@ static void build_overlay_text(void) {
     const struct Shown *s = &shown;
 
     char head[64];
-    if (pass_running) {
+    if (!configBenchmark) {
+        snprintf(head, sizeof(head), "PLAY %s%s", configBenchUncapped ? "UNCAPPED" : (config60Fps ? "60FPS" : "30FPS"),
+                 frame_split ? " \4SPLIT" : "");
+    } else if (pass_running) {
         const char *name = cur_demo != NULL ? level_name(cur_demo->level) : NULL;
         snprintf(head, sizeof(head), "P%d %s  DEMO %d/%d %s", pass_no, pass_split ? "SPLIT" : "OVERLAP",
                  pass_ndemo, demo_count(), name != NULL ? name : "");
@@ -506,6 +530,12 @@ static void build_overlay_text(void) {
     }
 
     ov_line("FPS \2%6.1f\1  frame %5.2fms  max %5.1f", s->fps, s->frame_ms, s->max_ms);
+    if (!configBenchUncapped) {
+        // At vsync most of the frame can be waiting; what's left is the real load
+        double busy = s->frame_ms - s->cat_ms[BENCH_PRESENT];
+        ov_line("\4busy %5.2fms  %3.0f%% of frame  (~%.0f fps)", busy,
+                s->frame_ms > 0 ? 100.0 * busy / s->frame_ms : 0.0, busy > 0 ? 1000.0 / busy : 0.0);
+    }
     ov_line("\4TV %4.1f fps  VI %5.2f Hz  %s", s->shown_fps, s->vi_hz, video_desc());
     if (!tb_calibrated)
         ov_line("\4bus %.1f MHz (calibrating...)", tb_hz * 4.0 / 1e6);
@@ -628,6 +658,7 @@ static void close_window(uint32_t now) {
         }
     }
 
+    win_no++;
     win_start = now;
     win_frames = 0;
     win_sum = 0;
@@ -705,14 +736,17 @@ void bench_frame_begin(void) {
     frame_gpu_valid = false;
     frame_spilled = false;
     frame_demo = false;
-    frame_split = split_for_pass(pass_running ? pass_no : pass_no + 1);
+    if (configBenchmark)
+        frame_split = split_for_pass(pass_running ? pass_no : pass_no + 1);
+    else
+        frame_split = split_for_play_window(win_no);
 }
 
 void bench_init(void) {
-    gBenchOn = configBenchmark;
+    gBenchOn = bench_wanted();
     if (!gBenchOn)
         return;
-    field_hz = gfx_gx_wm_get_field_rate() == 50 ? 50.0 : 60000.0 / 1001.0;
+    field_hz = gfx_gx_wm_get_field_hz();
     gBenchSp = 0;
     gBenchStack[0] = BENCH_OTHER;
     gBenchMark = bench_tb();

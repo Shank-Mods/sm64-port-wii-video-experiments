@@ -74,6 +74,7 @@ enum ConfigOptionType {
     CONFIG_TYPE_UINT,
     CONFIG_TYPE_FLOAT,
     CONFIG_TYPE_WIDESCREEN, // off / on / auto / pillarbox
+    CONFIG_TYPE_VIDEOMODE,  // 720p / default
 };
 
 struct ConfigOption {
@@ -96,6 +97,7 @@ unsigned int configWidescreenMode = WIDESCREEN_AUTO; // anamorphic 16:9
 bool configPillarbox             = false; // render 4:3 into the centre 3/4 so a 16:9 display's stretch restores correct 4:3
 bool config240p                  = false; // Output a true 240p signal instead of 480i/480p
 bool configHires1280             = false; // 1280x240p (4:3) output, rendered as two 640x240 tiles
+unsigned int configVideoMode     = VIDEO_MODE_720P; // 1280x720p output (takes priority over 240p/1280x240p)
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
 bool configInvertCamera          = false; // Invert camera controls
 bool configRumble                = true;  // Shindou controller rumble
@@ -103,8 +105,9 @@ bool configFog                   = true;  // Distance fog (turning it off also e
 bool configForceNearest          = false; // Force GX_NEAR (nearest-neighbour) texture filtering instead of bilinear
 bool configViDeflicker           = true;  // Apply the VI deflicker filter
 bool configPuppycam              = false; // Use the Puppycam analogue camera instead of the original camera
-bool configBenchmark             = true;  // Uncapped timedemo: runs the attract-mode demos as fast as possible
-bool configBenchOverlay          = true;  // Frame time overlay in benchmark mode
+bool configBenchmark             = true;  // bench_demo: timedemo, plays the attract-mode demos in a loop, input ignored
+bool configBenchOverlay          = true;  // Frame time overlay (in demo mode and in normal play)
+bool configBenchUncapped         = true;  // One game tick per rendered frame, no vsync wait: game logic runs fast too
 unsigned int configBenchSplit    = 2;     // GPU timing passes: 0 never, 1 always, 2 alternate passes
 unsigned int puppycam_sensitivityX = 75;
 unsigned int puppycam_sensitivityY = 75;
@@ -170,6 +173,7 @@ static const struct ConfigOption options[] = {
     {.name = "widescreen",     .type = CONFIG_TYPE_WIDESCREEN, .uintValue = &configWidescreenMode},
     {.name = "240p",           .type = CONFIG_TYPE_BOOL, .boolValue = &config240p},
     {.name = "hires_1280x240p", .type = CONFIG_TYPE_BOOL, .boolValue = &configHires1280},
+    {.name = "video_mode",     .type = CONFIG_TYPE_VIDEOMODE, .uintValue = &configVideoMode},
     {.name = "antialias",      .type = CONFIG_TYPE_BOOL, .boolValue = &configAntialias},
     {.name = "invert_camera",  .type = CONFIG_TYPE_BOOL, .boolValue = &configInvertCamera},
     {.name = "rumble",         .type = CONFIG_TYPE_BOOL, .boolValue = &configRumble},
@@ -177,7 +181,8 @@ static const struct ConfigOption options[] = {
     {.name = "force_nearest",  .type = CONFIG_TYPE_BOOL, .boolValue = &configForceNearest},
     {.name = "vi_deflicker",   .type = CONFIG_TYPE_BOOL, .boolValue = &configViDeflicker},
     {.name = "puppycam",       .type = CONFIG_TYPE_BOOL, .boolValue = &configPuppycam},
-    {.name = "benchmark",      .type = CONFIG_TYPE_BOOL, .boolValue = &configBenchmark},
+    {.name = "bench_demo",     .type = CONFIG_TYPE_BOOL, .boolValue = &configBenchmark},
+    {.name = "bench_uncapped", .type = CONFIG_TYPE_BOOL, .boolValue = &configBenchUncapped},
     {.name = "bench_overlay",  .type = CONFIG_TYPE_BOOL, .boolValue = &configBenchOverlay},
     {.name = "bench_gpu_split", .type = CONFIG_TYPE_UINT, .uintValue = &configBenchSplit},
     {.name = "puppycam_sensitivity_x",  .type = CONFIG_TYPE_UINT, .uintValue = &puppycam_sensitivityX},
@@ -422,6 +427,9 @@ void configfile_load(const char *filename) {
             if (numTokens == 2) {
                 const struct ConfigOption *option = NULL;
 
+                // "benchmark" was the name of bench_demo on the wii-benchmark branch
+                if (strcmp(tokens[0], "benchmark") == 0)
+                    tokens[0] = "bench_demo";
                 for (unsigned int i = 0; i < ARRAY_LEN(options); i++) {
                     if (strcmp(tokens[0], options[i].name) == 0) {
                         option = &options[i];
@@ -453,6 +461,13 @@ void configfile_load(const char *filename) {
                                 *option->uintValue = WIDESCREEN_ON;
                             else if (strcmp(tokens[1], "off") == 0 || strcmp(tokens[1], "false") == 0)
                                 *option->uintValue = WIDESCREEN_OFF;
+                            break;
+                        case CONFIG_TYPE_VIDEOMODE:
+                            if (strcmp(tokens[1], "720p") == 0)
+                                *option->uintValue = VIDEO_MODE_720P;
+                            else if (strcmp(tokens[1], "default") == 0 || strcmp(tokens[1], "480p") == 0
+                                     || strcmp(tokens[1], "480i") == 0 || strcmp(tokens[1], "auto") == 0)
+                                *option->uintValue = VIDEO_MODE_DEFAULT;
                             break;
                         default:
                             assert(0); // bad type
@@ -492,8 +507,12 @@ void configfile_resolve_widescreen(void) {
             break;
         case WIDESCREEN_AUTO:
         default:
-            // 1280x240p is a 4:3 mode, so "auto" follows the mode rather than the console setting
-            configWidescreen = configHires1280 ? false : configfile_console_is_widescreen();
+            // 720p is a 16:9 mode and 1280x240p a 4:3 one, so "auto" follows those modes rather
+            // than the console setting
+            if (configVideoMode == VIDEO_MODE_720P)
+                configWidescreen = true;
+            else
+                configWidescreen = configHires1280 ? false : configfile_console_is_widescreen();
             break;
     }
 #endif
@@ -536,6 +555,9 @@ void configfile_save(const char *filename) {
                         *option->uintValue == WIDESCREEN_AUTO ? "auto" :
                         *option->uintValue == WIDESCREEN_PILLARBOX ? "pillarbox" :
                         *option->uintValue == WIDESCREEN_ON ? "on" : "off");
+                break;
+            case CONFIG_TYPE_VIDEOMODE:
+                fprintf(file, "%s %s\n", option->name, *option->uintValue == VIDEO_MODE_720P ? "720p" : "default");
                 break;
             default:
                 assert(0); // unknown type

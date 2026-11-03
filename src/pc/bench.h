@@ -73,6 +73,9 @@ static inline void bench_pop(void) {
     gBenchSp--;
 }
 
+// True when the instrumentation is on: demo mode, or the overlay in normal play
+bool bench_wanted(void);
+
 // Called by pc_main around each produced frame
 void bench_init(void);
 void bench_frame_begin(void);

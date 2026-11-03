@@ -58,7 +58,13 @@ void gx_shutdown_request_exit(void) {
 // Stop everything that talks to hardware behind our back. The reset paths run with
 // interrupts disabled and tear the DSP and GX down themselves, so leaving a voice
 // playing or a frame in flight is enough to hang the console on the way out.
+void gfx_gx_wm_shutdown(void); // gfx/gfx_gx_wm.c: 720p back to the stock VI clock
+
 static void quiesce_hardware(void) {
+    // Before anything touches libogc's video state: the VI clock must be stock again before
+    // the loader or system menu takes over the display
+    gfx_gx_wm_shutdown();
+
     ASND_Pause(1);
     ASND_End();
 
