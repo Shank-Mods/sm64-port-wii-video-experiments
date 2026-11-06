@@ -275,7 +275,7 @@ static const char *video_desc(void) {
     if (r == NULL)
         return "?";
     if (gfx_gx_wm_hd())
-        return "1280x720p";
+        return gfx_gx_wm_hd_name();
     if (gfx_gx_wm_hires())
         return "1280x240p";
     char scan = (r->viTVMode & 3) == VI_INTERLACE ? 'i' : 'p';

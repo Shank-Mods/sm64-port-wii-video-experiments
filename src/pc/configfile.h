@@ -28,6 +28,7 @@ void configfile_switch_storage_device(unsigned int newDevice);
 // configVideoMode
 #define VIDEO_MODE_DEFAULT 0u // the console's own mode (480p/480i), or 240p / 1280x240p if enabled
 #define VIDEO_MODE_720P    1u // 1280x720p60, VI pixel clock reprogrammed to 148.5 MHz
+#define VIDEO_MODE_960X720P 2u // 960x720p60 (4:3), VI pixel clock reprogrammed to 108 MHz
 
 extern bool         configFullscreen;
 extern bool         config60Fps;

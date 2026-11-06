@@ -28,10 +28,14 @@ GXRModeObj *gfx_gx_wm_get_rmode(void);
 // True when the frame is rendered in EFB tiles (1280x240p or 1280x720p)
 bool gfx_gx_wm_hires(void);
 
-// True when the 1280x720p mode is in use
+// True when a 720p mode (1280x720p or 960x720p) is in use
 bool gfx_gx_wm_hd(void);
 
-// Tile grid of the tiled modes: 2x1 tiles of 640x240 in 1280x240p, 2x2 of 640x360 in 720p
+// Name of the 720p mode in use ("1280x720p" / "960x720p"), or NULL
+const char *gfx_gx_wm_hd_name(void);
+
+// Tile grid of the tiled modes: 2x1 tiles of 640x240 in 1280x240p, 2x2 of 640x360 in
+// 1280x720p, 2x2 of 480x360 in 960x720p
 void gfx_gx_wm_get_tiles(int *tiles_x, int *tiles_y, int *tile_w, int *tile_h);
 
 // Height of the whole rendered frame in pixels (720 in 720p, otherwise the EFB height)

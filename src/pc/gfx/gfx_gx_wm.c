@@ -18,7 +18,7 @@ static GXRModeObj *rmode;
 static void *framebuffer[3];
 static bool fb;
 static bool tiled_active; // 1280x240p or 720p: the frame is rendered in EFB tiles
-static bool hd_active;    // 1280x720p: VI programmed directly, libogc kept on the safe mode
+static bool hd_active;    // 720p modes: VI programmed directly, libogc kept on the safe mode
 
 // Three XFBs when presenting without waiting for vsync (and always in 720p): the one the VI is
 // scanning, at most one queued for the next retrace, and one to render into. A newer frame
@@ -34,7 +34,7 @@ static volatile int pending_idx = -1;
 #define HWREG(o) (*(volatile u32 *)(0xCD800000 + (o)))
 
 // ---------------------------------------------------------------------------------------------
-// 1280x720p
+// 720p modes (1280x720p and 960x720p)
 //
 // libogc has no notion of this mode. It stays configured for the console's safe mode (the
 // preferred 480p/480i) the whole time; the VI is programmed with a complete register image
@@ -43,27 +43,33 @@ static volatile int pending_idx = -1;
 // never rewrites the registers. Leaving puts the boot clock and the safe mode's own register
 // image back, then has libogc re-assert the safe mode so its shadow state matches.
 //
-// Timing is SMPTE 296M (1650 x 750 at 74.25 Mpx/s) from tools/vimodetest in Wii-VI-Experiments,
-// with the VI PLL law F = 54 MHz x Nfb / V from docs/VI_PLL.md there: Nfb 22, V 8 gives
-// F = 148.5 MHz, and the bus moves one pixel every two clocks (P = F/2 = 74.25 MHz).
+// Both timings are the ones in tools/vimodetest in Wii-VI-Experiments, with the VI PLL law
+// F = 54 MHz x Nfb / V from docs/VI_PLL.md there; the bus moves one pixel every two clocks
+// (P = F/2). Both have 750 lines per frame (SMPTE 296M vertical) and a 45.00 kHz line rate,
+// so both run at exactly 60.000 Hz:
+//   1280x720p: SMPTE 296M, 1650-pixel lines, Nfb 22 V 8 -> F 148.5 MHz, P 74.25 MHz
+//   960x720p:  the same line time with 1200-pixel lines (4:3, square pixels),
+//              Nfb 14 V 7 -> F 108 MHz, P 54 MHz
 
-#define HD_W 1280
 #define HD_H 720
 #define HD_TILE_H 360
 
-// Horizontal, in pixel clocks: total, active, hsync width, back porch
-#define HD_HT 1650
-#define HD_HA 1280
-#define HD_HS 40
-#define HD_HBP 220
+struct HdTiming {
+    const char *name;
+    u16 w;           // active width = XFB width
+    u16 ht, hs, hbp; // horizontal, in pixel clocks: total, hsync width, back porch
+    u8 nfb, v;       // PLL
+    u32 p_hz;        // pixel rate (F/2)
+};
+static const struct HdTiming hd_1280 = { "1280x720p", 1280, 1650, 40, 220, 22, 8, 74250000 };
+static const struct HdTiming hd_960  = { "960x720p",   960, 1200, 30, 160, 14, 7, 54000000 };
+static const struct HdTiming *hd = &hd_1280;
+
 // Vertical, in half-lines per (progressive) field: total, active lines, EQU, PSB
 #define HD_VN 1500
 #define HD_VACV 720
 #define HD_VEQU 10
 #define HD_VPSB 2
-// PLL: Nfb and V, see above
-#define HD_NFB 22
-#define HD_V 8
 
 static const u8 img_regs[] = {
     0x00, 0x04, 0x06, 0x08, 0x0A, 0x0C, 0x0E, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1A,
@@ -123,14 +129,14 @@ static void hd_set_fbb(void *xfb) {
 }
 
 static void hd_build_image(void *xfb) {
-    const u16 hlw = HD_HT / 2;
-    const u16 hsy = HD_HS;
-    const u16 hbe = HD_HS + HD_HBP;
-    const u16 hbs = hbe + HD_HA - hlw;
+    const u16 hlw = hd->ht / 2;
+    const u16 hsy = hd->hs;
+    const u16 hbe = hd->hs + hd->hbp;
+    const u16 hbs = hbe + hd->w - hlw;
     // colour-burst window (analog encoder only), at the same point in time as libogc's 71..105
     // of an 858-clock line, kept inside the blanking
-    u16 hcs = (u16)((71u * HD_HT + 429) / 858);
-    u16 hce = (u16)((105u * HD_HT + 429) / 858);
+    u16 hcs = (u16)((71u * hd->ht + 429) / 858);
+    u16 hce = (u16)((105u * hd->ht + 429) / 858);
     if (hce >= hbe)
         hce = hbe - 1;
     if (hcs >= hce)
@@ -139,7 +145,7 @@ static void hd_build_image(void *xfb) {
     const u16 prb = HD_VN - 3 * HD_VEQU - 2 * HD_VACV - HD_VPSB;
     const u16 bs = 2 * HD_VEQU;
     const u16 be = HD_VN - HD_VEQU;
-    const u16 wpl = HD_HA / 16;
+    const u16 wpl = hd->w / 16;
 
     hd_img = safe_img; // filters, DI2/DI3, scaler width etc.
     img_set(&hd_img, 0x6C, 1); // VICLK: F passed through
@@ -166,7 +172,7 @@ static void hd_build_image(void *xfb) {
     img_set(&hd_img, 0x32, 1);
     img_set(&hd_img, 0x34, 0x1001);
     img_set(&hd_img, 0x36, 0x0001);
-    img_set(&hd_img, 0x48, (u16)((wpl << 8) | wpl)); // fetch width and stride: 80 x 16 pixels
+    img_set(&hd_img, 0x48, (u16)((wpl << 8) | wpl)); // fetch width and stride, in 16-pixel units
     img_set(&hd_img, 0x4A, 0x0100);                  // horizontal scaler off
     hd_img.dcr = (safe_img.dcr & 0x0300) | 0x0001 | 0x0004; // keep FMT; enable, non-interlaced
 }
@@ -178,11 +184,11 @@ static void delay_ms(u32 ms) {
 }
 
 static u32 hd_pll_1c4(void) {
-    return (boot1c4 & ~0x0000FF00u) | ((u32)(HD_NFB - 1) << 8); // byte 2 is never touched
+    return (boot1c4 & ~0x0000FF00u) | ((u32)(hd->nfb - 1) << 8); // byte 2 is never touched
 }
 
 static u32 hd_pll_1c8(void) {
-    return (boot1c8 & ~0x00F00000u) | ((u32)HD_V << 20);
+    return (boot1c8 & ~0x00F00000u) | ((u32)hd->v << 20);
 }
 
 // VI off -> reset -> clock -> settle -> complete register image -> VI on
@@ -235,15 +241,16 @@ void gfx_gx_wm_shutdown(void) {
     VIDEO_SetBlack(true);
     VIDEO_Flush();
     VIDEO_WaitVSync();
-    dbglog("wm: 720p left, PLL restored (0x1C4=%08X 0x1C8=%08X)", (unsigned)HWREG(0x1C4), (unsigned)HWREG(0x1C8));
+    dbglog("wm: %s left, PLL restored (0x1C4=%08X 0x1C8=%08X)", hd->name, (unsigned)HWREG(0x1C4), (unsigned)HWREG(0x1C8));
 }
 
-// GX view of the 720p mode. Only the fields GX and the renderer use matter: libogc never
-// configures this object (VIDEO_Configure always gets the safe mode).
-static GXRModeObj TVHd1280x720 =
+// GX view of the 720p modes. Only the fields GX and the renderer use matter: libogc never
+// configures this object (VIDEO_Configure always gets the safe mode). fbWidth is set from the
+// selected timing.
+static GXRModeObj TVHd720 =
 {
     VI_TVMODE_NTSC_PROG,
-    HD_W,       // fbWidth (XFB stride)
+    1280,       // fbWidth (XFB stride)
     HD_TILE_H,  // efbHeight: one EFB tile
     HD_H,       // xfbHeight
     0, 0,
@@ -317,11 +324,17 @@ bool gfx_gx_wm_hd(void)
     return hd_active;
 }
 
+const char *gfx_gx_wm_hd_name(void)
+{
+    return hd_active ? hd->name : NULL;
+}
+
 void gfx_gx_wm_get_tiles(int *tiles_x, int *tiles_y, int *tile_w, int *tile_h)
 {
+    // 1280x720p: 2x2 tiles of 640x360. 960x720p: 2x2 of 480x360. 1280x240p: 2x1 of 640x240
     *tiles_x = 2;
     *tiles_y = hd_active ? 2 : 1;
-    *tile_w = HIRES_TILE_WIDTH;
+    *tile_w = hd_active ? hd->w / 2 : HIRES_TILE_WIDTH;
     *tile_h = hd_active ? HD_TILE_H : (rmode != NULL ? rmode->efbHeight : 240);
 }
 
@@ -378,10 +391,12 @@ static void gfx_gx_wm_apply_hires_timing(void)
 static GXRModeObj *gfx_gx_wm_select_mode(void)
 {
 #ifdef __wii__
-    if (configVideoMode == VIDEO_MODE_720P) {
+    if (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_960X720P) {
+        hd = configVideoMode == VIDEO_MODE_960X720P ? &hd_960 : &hd_1280;
+        TVHd720.fbWidth = hd->w;
         hd_active = true;
         tiled_active = true;
-        return &TVHd1280x720;
+        return &TVHd720;
     }
 #endif
 
@@ -510,7 +525,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         VIDEO_WaitVSync();
         VIDEO_WaitVSync();
         dbg_vi_regs("720p");
-        dbglog("wm_init: 720p up, PLL 0x1C4=%08X 0x1C8=%08X", (unsigned)HWREG(0x1C4), (unsigned)HWREG(0x1C8));
+        dbglog("wm_init: %s up, PLL 0x1C4=%08X 0x1C8=%08X", hd->name, (unsigned)HWREG(0x1C4), (unsigned)HWREG(0x1C8));
     } else {
         // Also needed when presenting at vsync: the benchmark calibrates its clock on retraces
         shown_idx = fb;
@@ -553,7 +568,7 @@ int gfx_gx_wm_get_field_rate(void)
 double gfx_gx_wm_get_field_hz(void)
 {
     if (hd_active)
-        return 74250000.0 / ((double)HD_HT * (HD_VN / 2)); // exactly 60
+        return (double)hd->p_hz / ((double)hd->ht * (HD_VN / 2)); // exactly 60
     return gfx_gx_wm_get_field_rate() == 50 ? 50.0 : 60000.0 / 1001.0;
 }
 

@@ -463,8 +463,10 @@ void configfile_load(const char *filename) {
                                 *option->uintValue = WIDESCREEN_OFF;
                             break;
                         case CONFIG_TYPE_VIDEOMODE:
-                            if (strcmp(tokens[1], "720p") == 0)
+                            if (strcmp(tokens[1], "720p") == 0 || strcmp(tokens[1], "1280x720p") == 0)
                                 *option->uintValue = VIDEO_MODE_720P;
+                            else if (strcmp(tokens[1], "960x720p") == 0)
+                                *option->uintValue = VIDEO_MODE_960X720P;
                             else if (strcmp(tokens[1], "default") == 0 || strcmp(tokens[1], "480p") == 0
                                      || strcmp(tokens[1], "480i") == 0 || strcmp(tokens[1], "auto") == 0)
                                 *option->uintValue = VIDEO_MODE_DEFAULT;
@@ -507,10 +509,12 @@ void configfile_resolve_widescreen(void) {
             break;
         case WIDESCREEN_AUTO:
         default:
-            // 720p is a 16:9 mode and 1280x240p a 4:3 one, so "auto" follows those modes rather
-            // than the console setting
+            // 1280x720p is a 16:9 mode, 960x720p and 1280x240p are 4:3 ones, so "auto" follows
+            // those modes rather than the console setting
             if (configVideoMode == VIDEO_MODE_720P)
                 configWidescreen = true;
+            else if (configVideoMode == VIDEO_MODE_960X720P)
+                configWidescreen = false;
             else
                 configWidescreen = configHires1280 ? false : configfile_console_is_widescreen();
             break;
@@ -557,7 +561,9 @@ void configfile_save(const char *filename) {
                         *option->uintValue == WIDESCREEN_ON ? "on" : "off");
                 break;
             case CONFIG_TYPE_VIDEOMODE:
-                fprintf(file, "%s %s\n", option->name, *option->uintValue == VIDEO_MODE_720P ? "720p" : "default");
+                fprintf(file, "%s %s\n", option->name,
+                        *option->uintValue == VIDEO_MODE_720P ? "720p" :
+                        *option->uintValue == VIDEO_MODE_960X720P ? "960x720p" : "default");
                 break;
             default:
                 assert(0); // unknown type
