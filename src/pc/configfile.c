@@ -98,6 +98,7 @@ bool configPillarbox             = false; // render 4:3 into the centre 3/4 so a
 bool config240p                  = false; // Output a true 240p signal instead of 480i/480p
 bool configHires1280             = false; // 1280x240p (4:3) output, rendered as two 640x240 tiles
 unsigned int configVideoMode     = VIDEO_MODE_720P; // 1280x720p output (takes priority over 240p/1280x240p)
+bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
 bool configInvertCamera          = false; // Invert camera controls
 bool configRumble                = true;  // Shindou controller rumble
@@ -174,6 +175,7 @@ static const struct ConfigOption options[] = {
     {.name = "240p",           .type = CONFIG_TYPE_BOOL, .boolValue = &config240p},
     {.name = "hires_1280x240p", .type = CONFIG_TYPE_BOOL, .boolValue = &configHires1280},
     {.name = "video_mode",     .type = CONFIG_TYPE_VIDEOMODE, .uintValue = &configVideoMode},
+    {.name = "crop_480p",      .type = CONFIG_TYPE_BOOL, .boolValue = &configCrop480},
     {.name = "antialias",      .type = CONFIG_TYPE_BOOL, .boolValue = &configAntialias},
     {.name = "invert_camera",  .type = CONFIG_TYPE_BOOL, .boolValue = &configInvertCamera},
     {.name = "rumble",         .type = CONFIG_TYPE_BOOL, .boolValue = &configRumble},

@@ -62,6 +62,7 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 | option | default | |
 |---|---|---|
 | `video_mode` | `720p` | `720p` (1280x720p), `960x720p`, `1280x960crop`, or `default` for the console's own mode (480p/480i, or 240p / 1280x240p if those are enabled) |
+| `crop_480p` | `false` | render at `video_mode`'s full size (1280x720 or 960x720) but leave the video signal on the console's normal 480p, showing the **top left 640x480** of the frame (the same method as `1280x960crop`). Measures the full-resolution render on any display |
 | `bench_demo` | `true` | timedemo: plays the attract demos in a loop, input ignored, results logged. `false` = normal play with your controller |
 | `bench_uncapped` | `true` | one game tick per rendered frame and no vsync wait, so game logic runs as fast as the hardware allows (fast motion, audio silent). `false` = normal 30 Hz logic presented at vsync, with the `60fps` option's interpolation |
 | `bench_overlay` | `true` | the frame-time overlay, in demo mode and in normal play |

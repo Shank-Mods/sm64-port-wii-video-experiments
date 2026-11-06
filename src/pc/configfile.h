@@ -40,6 +40,7 @@ extern bool         config240p;
 extern bool         configAntialias;
 extern bool         configHires1280;
 extern unsigned int configVideoMode;
+extern bool         configCrop480;
 
 void dbglog(const char *fmt, ...);
 extern bool         configInvertCamera;

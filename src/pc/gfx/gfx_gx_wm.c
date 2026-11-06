@@ -73,6 +73,10 @@ static const struct HdTiming hd_1280 = { "1280x720p", 1280, 720, 360, false, 165
 static const struct HdTiming hd_960  = { "960x720p",   960, 720, 360, false, 1200, 30, 160, 14, 7, 54000000 };
 static const struct HdTiming hd_crop = { "1280x960>480", 1280, 960, 480, true, 0, 0, 0, 0, 0, 0 };
 static const struct HdTiming *hd = &hd_1280;
+// crop_480p: any of the above rendered at full size, shown as a top left 640x480 crop on the
+// console's own 480p (the timing fields are then unused)
+static struct HdTiming hd_cropped;
+static char hd_cropped_name[24];
 static bool crop_il;  // crop mode on an interlaced safe mode (480i/576i)
 
 // Vertical, in half-lines per (progressive) field: total, active lines, EQU, PSB
@@ -470,6 +474,13 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
         || configVideoMode == VIDEO_MODE_960P_CROP) {
         hd = configVideoMode == VIDEO_MODE_960X720P ? &hd_960
            : configVideoMode == VIDEO_MODE_960P_CROP ? &hd_crop : &hd_1280;
+        if (configCrop480 && !hd->crop) {
+            hd_cropped = *hd;
+            hd_cropped.crop = true;
+            snprintf(hd_cropped_name, sizeof(hd_cropped_name), "%ux%u>480", hd->w, hd->h);
+            hd_cropped.name = hd_cropped_name;
+            hd = &hd_cropped;
+        }
         TVHd720.fbWidth = hd->w;
         TVHd720.efbHeight = hd->tile_h;
         TVHd720.xfbHeight = hd->h;
