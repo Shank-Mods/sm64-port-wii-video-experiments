@@ -50,20 +50,29 @@ static volatile int pending_idx = -1;
 //   1280x720p: SMPTE 296M, 1650-pixel lines, Nfb 22 V 8 -> F 148.5 MHz, P 74.25 MHz
 //   960x720p:  the same line time with 1200-pixel lines (4:3, square pixels),
 //              Nfb 14 V 7 -> F 108 MHz, P 54 MHz
-
-#define HD_H 720
-#define HD_TILE_H 360
+//
+// A third entry uses the same machinery without changing the video signal at all:
+//   1280x960 crop: the frame is rendered at 1280x960 (2x2 tiles of 640x480, every tile copied
+//              into a full 1280x960 XFB), and the VI stays on the console's own 480p (or 480i)
+//              timing and clock. Only the picture configuration changes: the VI fetches 640
+//              pixels per line with a 1280-pixel stride, so it scans out the top left 640x480
+//              quadrant. The GPU and CPU do the full 1280x960 work; only the VI's memory reads
+//              are those of 640x480.
 
 struct HdTiming {
     const char *name;
-    u16 w;           // active width = XFB width
+    u16 w, h;        // frame (= XFB) size
+    u16 tile_h;      // EFB tile height (tiles are w/2 wide, 2x2)
+    bool crop;       // VI keeps the safe mode, shows the top left 640 x (safe height)
     u16 ht, hs, hbp; // horizontal, in pixel clocks: total, hsync width, back porch
     u8 nfb, v;       // PLL
     u32 p_hz;        // pixel rate (F/2)
 };
-static const struct HdTiming hd_1280 = { "1280x720p", 1280, 1650, 40, 220, 22, 8, 74250000 };
-static const struct HdTiming hd_960  = { "960x720p",   960, 1200, 30, 160, 14, 7, 54000000 };
+static const struct HdTiming hd_1280 = { "1280x720p", 1280, 720, 360, false, 1650, 40, 220, 22, 8, 74250000 };
+static const struct HdTiming hd_960  = { "960x720p",   960, 720, 360, false, 1200, 30, 160, 14, 7, 54000000 };
+static const struct HdTiming hd_crop = { "1280x960>480", 1280, 960, 480, true, 0, 0, 0, 0, 0, 0 };
 static const struct HdTiming *hd = &hd_1280;
+static bool crop_il;  // crop mode on an interlaced safe mode (480i/576i)
 
 // Vertical, in half-lines per (progressive) field: total, active lines, EQU, PSB
 #define HD_VN 1500
@@ -119,16 +128,39 @@ static void fbb_values(void *xfb, u16 *tfbl_hi, u16 *tfbl_lo) {
     *tfbl_lo = (u16)(t & 0xFFFF);
 }
 
+// Top and bottom field bases. Interlaced crop: the bottom field starts one XFB line down.
 static void hd_set_fbb(void *xfb) {
-    u16 hi, lo;
+    u16 hi, lo, bhi, blo;
     fbb_values(xfb, &hi, &lo);
+    fbb_values((u8 *)xfb + (crop_il ? hd->w * 2 : 0), &bhi, &blo);
     VI[0x1C / 2] = hi;
     VI[0x1E / 2] = lo;
-    VI[0x24 / 2] = hi;
-    VI[0x26 / 2] = lo;
+    VI[0x24 / 2] = bhi;
+    VI[0x26 / 2] = blo;
+}
+
+static void crop_build_image(void *xfb) {
+    // Everything as the safe mode has it, except what the VI reads: 640 pixels per line from
+    // lines hd->w pixels apart (two lines apart when interlaced: each field reads every other line)
+    hd_img = safe_img;
+    crop_il = (safe_img.dcr & 0x0004) == 0;
+    const u16 wpl = 640 / 16;
+    const u16 std = (hd->w / 16) * (crop_il ? 2 : 1);
+    img_set(&hd_img, 0x48, (u16)((wpl << 8) | std));
+    u16 hi, lo, bhi, blo;
+    fbb_values(xfb, &hi, &lo);
+    fbb_values((u8 *)xfb + (crop_il ? hd->w * 2 : 0), &bhi, &blo);
+    img_set(&hd_img, 0x1C, hi);
+    img_set(&hd_img, 0x1E, lo);
+    img_set(&hd_img, 0x24, bhi);
+    img_set(&hd_img, 0x26, blo);
 }
 
 static void hd_build_image(void *xfb) {
+    if (hd->crop) {
+        crop_build_image(xfb);
+        return;
+    }
     const u16 hlw = hd->ht / 2;
     const u16 hsy = hd->hs;
     const u16 hbe = hd->hs + hd->hbp;
@@ -184,10 +216,14 @@ static void delay_ms(u32 ms) {
 }
 
 static u32 hd_pll_1c4(void) {
+    if (hd->crop)
+        return boot1c4; // clock untouched
     return (boot1c4 & ~0x0000FF00u) | ((u32)(hd->nfb - 1) << 8); // byte 2 is never touched
 }
 
 static u32 hd_pll_1c8(void) {
+    if (hd->crop)
+        return boot1c8;
     return (boot1c8 & ~0x00F00000u) | ((u32)hd->v << 20);
 }
 
@@ -251,8 +287,8 @@ static GXRModeObj TVHd720 =
 {
     VI_TVMODE_NTSC_PROG,
     1280,       // fbWidth (XFB stride)
-    HD_TILE_H,  // efbHeight: one EFB tile
-    HD_H,       // xfbHeight
+    360,        // efbHeight: one EFB tile
+    720,        // xfbHeight
     0, 0,
     640, 480,   // viWidth/viHeight: unused
     VI_XFBMODE_SF,
@@ -331,18 +367,19 @@ const char *gfx_gx_wm_hd_name(void)
 
 void gfx_gx_wm_get_tiles(int *tiles_x, int *tiles_y, int *tile_w, int *tile_h)
 {
-    // 1280x720p: 2x2 tiles of 640x360. 960x720p: 2x2 of 480x360. 1280x240p: 2x1 of 640x240
+    // 1280x720p: 2x2 tiles of 640x360. 960x720p: 2x2 of 480x360. 1280x960 crop: 2x2 of 640x480.
+    // 1280x240p: 2x1 of 640x240
     *tiles_x = 2;
     *tiles_y = hd_active ? 2 : 1;
     *tile_w = hd_active ? hd->w / 2 : HIRES_TILE_WIDTH;
-    *tile_h = hd_active ? HD_TILE_H : (rmode != NULL ? rmode->efbHeight : 240);
+    *tile_h = hd_active ? hd->tile_h : (rmode != NULL ? rmode->efbHeight : 240);
 }
 
 int gfx_gx_wm_get_frame_height(void)
 {
     if (rmode == NULL)
         return DESIRED_SCREEN_HEIGHT;
-    return hd_active ? HD_H : rmode->efbHeight;
+    return hd_active ? hd->h : rmode->efbHeight;
 }
 
 void *gfx_gx_wm_get_back_buffer(void)
@@ -391,9 +428,13 @@ static void gfx_gx_wm_apply_hires_timing(void)
 static GXRModeObj *gfx_gx_wm_select_mode(void)
 {
 #ifdef __wii__
-    if (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_960X720P) {
-        hd = configVideoMode == VIDEO_MODE_960X720P ? &hd_960 : &hd_1280;
+    if (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_960X720P
+        || configVideoMode == VIDEO_MODE_960P_CROP) {
+        hd = configVideoMode == VIDEO_MODE_960X720P ? &hd_960
+           : configVideoMode == VIDEO_MODE_960P_CROP ? &hd_crop : &hd_1280;
         TVHd720.fbWidth = hd->w;
+        TVHd720.efbHeight = hd->tile_h;
+        TVHd720.xfbHeight = hd->h;
         hd_active = true;
         tiled_active = true;
         return &TVHd720;
@@ -514,7 +555,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         boot1c8 = HWREG(0x1C8);
         hd_build_image(framebuffer[0]);
         log_image("safe", &safe_img);
-        log_image("720p", &hd_img);
+        log_image(hd->name, &hd_img);
         dbglog("wm_init: boot PLL 0x1C4=%08X 0x1C8=%08X -> 720p 0x1C4=%08X 0x1C8=%08X",
                (unsigned)boot1c4, (unsigned)boot1c8, (unsigned)hd_pll_1c4(), (unsigned)hd_pll_1c8());
         shown_idx = 0;
@@ -567,7 +608,7 @@ int gfx_gx_wm_get_field_rate(void)
 
 double gfx_gx_wm_get_field_hz(void)
 {
-    if (hd_active)
+    if (hd_active && !hd->crop)
         return (double)hd->p_hz / ((double)hd->ht * (HD_VN / 2)); // exactly 60
     return gfx_gx_wm_get_field_rate() == 50 ? 50.0 : 60000.0 / 1001.0;
 }

@@ -40,7 +40,14 @@ outputs and GCVideo-based boards (rated to 54 MHz) will not show it.
   45.00 kHz line rate as 1280x720p (so also exactly 60.000 Hz), with 1200-pixel lines (960
   active, sync 30, back porch 160) at a 108 MHz VI clock (Nfb 14, V 7; 54 Mpx/s on the bus).
   Rendered as 2x2 tiles of 480x360, about 56% of the pixels of 1280x720.
-- Widescreen AUTO resolves to 16:9 in 1280x720p and 4:3 in 960x720p (square pixels in both).
+- **1280x960 crop** (`video_mode 1280x960crop`): a benchmark of rendering at 1280x960 that
+  needs no special video hardware. The frame is rendered at 1280x960 as 2x2 tiles of 640x480,
+  and every tile is copied into a full 1280x960 XFB, so the CPU and GPU do all the work of that
+  resolution. The VI stays on the console's normal 480p (or 480i) timing and clock; only its
+  picture configuration changes, to fetch 640 pixels per line with a 1280-pixel stride, so the
+  TV shows the **top left quarter** of the frame. The only part not representative of a real
+  1280x960 output is the VI's own memory reads (those of 640x480).
+- Widescreen AUTO resolves to 16:9 in 1280x720p and 4:3 in 960x720p and the crop mode.
   Antialiasing is not used in the 720p modes.
 - The app needs `<ahb_access/>` (in `meta.xml`) to reach the PLL registers.
 - The startup log (`sm64_debug.txt` in the root of the SD card / USB drive) records every VI register and PLL
@@ -54,7 +61,7 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 
 | option | default | |
 |---|---|---|
-| `video_mode` | `720p` | `720p` (1280x720p), `960x720p`, or `default` for the console's own mode (480p/480i, or 240p / 1280x240p if those are enabled) |
+| `video_mode` | `720p` | `720p` (1280x720p), `960x720p`, `1280x960crop`, or `default` for the console's own mode (480p/480i, or 240p / 1280x240p if those are enabled) |
 | `bench_demo` | `true` | timedemo: plays the attract demos in a loop, input ignored, results logged. `false` = normal play with your controller |
 | `bench_uncapped` | `true` | one game tick per rendered frame and no vsync wait, so game logic runs as fast as the hardware allows (fast motion, audio silent). `false` = normal 30 Hz logic presented at vsync, with the `60fps` option's interpolation |
 | `bench_overlay` | `true` | the frame-time overlay, in demo mode and in normal play |

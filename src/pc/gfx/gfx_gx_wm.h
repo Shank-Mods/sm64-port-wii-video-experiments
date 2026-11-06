@@ -35,7 +35,7 @@ bool gfx_gx_wm_hd(void);
 const char *gfx_gx_wm_hd_name(void);
 
 // Tile grid of the tiled modes: 2x1 tiles of 640x240 in 1280x240p, 2x2 of 640x360 in
-// 1280x720p, 2x2 of 480x360 in 960x720p
+// 1280x720p, 2x2 of 480x360 in 960x720p, 2x2 of 640x480 in the 1280x960 crop mode
 void gfx_gx_wm_get_tiles(int *tiles_x, int *tiles_y, int *tile_w, int *tile_h);
 
 // Height of the whole rendered frame in pixels (720 in 720p, otherwise the EFB height)

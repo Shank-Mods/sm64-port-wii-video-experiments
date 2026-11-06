@@ -467,6 +467,8 @@ void configfile_load(const char *filename) {
                                 *option->uintValue = VIDEO_MODE_720P;
                             else if (strcmp(tokens[1], "960x720p") == 0)
                                 *option->uintValue = VIDEO_MODE_960X720P;
+                            else if (strcmp(tokens[1], "1280x960crop") == 0)
+                                *option->uintValue = VIDEO_MODE_960P_CROP;
                             else if (strcmp(tokens[1], "default") == 0 || strcmp(tokens[1], "480p") == 0
                                      || strcmp(tokens[1], "480i") == 0 || strcmp(tokens[1], "auto") == 0)
                                 *option->uintValue = VIDEO_MODE_DEFAULT;
@@ -513,7 +515,7 @@ void configfile_resolve_widescreen(void) {
             // those modes rather than the console setting
             if (configVideoMode == VIDEO_MODE_720P)
                 configWidescreen = true;
-            else if (configVideoMode == VIDEO_MODE_960X720P)
+            else if (configVideoMode == VIDEO_MODE_960X720P || configVideoMode == VIDEO_MODE_960P_CROP)
                 configWidescreen = false;
             else
                 configWidescreen = configHires1280 ? false : configfile_console_is_widescreen();
@@ -563,7 +565,8 @@ void configfile_save(const char *filename) {
             case CONFIG_TYPE_VIDEOMODE:
                 fprintf(file, "%s %s\n", option->name,
                         *option->uintValue == VIDEO_MODE_720P ? "720p" :
-                        *option->uintValue == VIDEO_MODE_960X720P ? "960x720p" : "default");
+                        *option->uintValue == VIDEO_MODE_960X720P ? "960x720p" :
+                        *option->uintValue == VIDEO_MODE_960P_CROP ? "1280x960crop" : "default");
                 break;
             default:
                 assert(0); // unknown type
