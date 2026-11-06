@@ -266,6 +266,9 @@ static void log_image(const char *what, const struct VIImage *im) {
 
 // Put the console back on its stock clock and the safe mode (also called on the way out)
 void gfx_gx_wm_shutdown(void) {
+#ifdef __wii__
+    *(volatile u32 *)0xCD0000C0 &= ~0x20u; // heartbeat LED off
+#endif
     if (!hd_programmed)
         return;
     hd_programmed = false;
@@ -540,7 +543,9 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     dbglog("wm_init: configured");
 
     VIDEO_SetNextFramebuffer(framebuffer[fb]);
-    VIDEO_SetBlack(hd_active); // stay black until 720p is up
+    // Never blanked here: the XFBs are already cleared to black, and libogc blanks the screen by
+    // programming zero active lines, which the 720p/crop modes would copy from the safe image
+    VIDEO_SetBlack(false);
     VIDEO_Flush();
     VIDEO_WaitVSync();
     if (vi_mode->viTVMode & VI_NON_INTERLACE)
@@ -660,10 +665,26 @@ static void wait_pending_shown(void)
     }
 }
 
+// Sign of life: the disc-slot LED blinks about twice a second while frames are being produced.
+// Picture missing but LED blinking = the game runs and the display chain isn't showing the
+// signal; LED stopped = the game is stuck. (Wii only; needs ahb_access.)
+static void heartbeat(void)
+{
+#ifdef __wii__
+    static u64 last;
+    u64 now = gettime();
+    if (now - last >= millisecs_to_ticks(250)) {
+        *(volatile u32 *)0xCD0000C0 ^= 0x20; // HW_GPIOB_OUT: slot LED
+        last = now;
+    }
+#endif
+}
+
 static void gfx_gx_wm_swap_buffers_begin(void)
 {
     static unsigned int frames;
     frames++;
+    heartbeat();
     if (frames <= 3 || frames % 600 == 0)
         dbglog("swap: frame %u", frames);
     if (frames == 120 && tiled_active)
