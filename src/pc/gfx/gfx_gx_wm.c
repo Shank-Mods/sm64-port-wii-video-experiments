@@ -29,6 +29,7 @@ static bool triple;
 static int draw_idx = -1;
 static volatile int shown_idx;
 static volatile int pending_idx = -1;
+static volatile u32 retrace_count; // counted by retrace_callback (debug log and bounded waits)
 
 #define VI ((volatile u16 *)0xCC002000)
 #define HWREG(o) (*(volatile u32 *)(0xCD800000 + (o)))
@@ -215,6 +216,39 @@ static void delay_ms(u32 ms) {
     }
 }
 
+// VIDEO_WaitVSync with a timeout: returns false (and logs) if no retrace interrupt arrives,
+// instead of hanging the game when the VI isn't interrupting in a custom mode
+static bool wait_vsync_ms(u32 ms, const char *what) {
+    u32 r = retrace_count;
+    u64 to = gettime() + millisecs_to_ticks(ms);
+    while (retrace_count == r) {
+        if (gettime() > to) {
+            dbglog("TIMEOUT: no retrace in %u ms (%s); DCR=%04X beam V=%u H=%u", (unsigned)ms, what,
+                   VI[0x02 / 2], VI[0x2C / 2] & 0x7FF, VI[0x2E / 2] & 0x7FF);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Retrace rate and beam counter range over ~0.5 s: tells whether the VI is running and at
+// what field rate, with no display needed
+static void log_vi_activity(const char *what) {
+    u32 r0 = retrace_count;
+    u64 t0 = gettime(), to = t0 + millisecs_to_ticks(500);
+    u32 vmax = 0, hmax = 0;
+    while (gettime() < to) {
+        u32 v = VI[0x2C / 2] & 0x7FF, h = VI[0x2E / 2] & 0x7FF;
+        if (v > vmax) vmax = v;
+        if (h > hmax) hmax = h;
+    }
+    u32 n = retrace_count - r0;
+    u32 us = ticks_to_microsecs(gettime() - t0);
+    dbglog("VI activity (%s): %u retraces in %u us = %u.%02u Hz, beam V max %u, H max %u, DCR=%04X",
+           what, (unsigned)n, (unsigned)us, us ? (unsigned)(n * 1000000ull / us) : 0,
+           us ? (unsigned)((n * 100000000ull / us) % 100) : 0, (unsigned)vmax, (unsigned)hmax, VI[0x02 / 2]);
+}
+
 static u32 hd_pll_1c4(void) {
     if (hd->crop)
         return boot1c4; // clock untouched
@@ -311,6 +345,7 @@ static GXRModeObj TVHd720 =
 static void retrace_callback(UNUSED u32 count)
 {
     bool new_frame = false;
+    retrace_count++;
     if (hd_active) {
         // The retrace interrupt comes at the end of the field's active picture, so the queued
         // buffer is read from the next field on and the one that was showing is free again
@@ -497,6 +532,8 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     // Double buffering when presenting at vsync, triple when uncapped; 720p always uses the
     // retrace-driven queue, so always three there
     const u32 fb_bytes = VIDEO_GetFrameBufferSize(rmode);
+    dbglog("wm_init: before XFBs: MEM1 arena %p-%p, MEM2 arena %p-%p", SYS_GetArenaLo(), SYS_GetArenaHi(),
+           SYS_GetArena2Lo(), SYS_GetArena2Hi());
     framebuffer[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
     framebuffer[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
     if (configBenchUncapped || hd_active) {
@@ -509,6 +546,8 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     }
     dbglog("wm_init: fb0=%p fb1=%p fb2=%p (%u bytes each) triple=%d uncapped=%d", framebuffer[0],
            framebuffer[1], framebuffer[2], (unsigned)fb_bytes, triple, uncapped);
+    dbglog("wm_init: after XFBs: MEM1 arena %p-%p, MEM2 arena %p-%p", SYS_GetArenaLo(), SYS_GetArenaHi(),
+           SYS_GetArena2Lo(), SYS_GetArena2Hi());
 
     if (hd_active && (!triple || framebuffer[0] == MEM_K0_TO_K1(NULL) || framebuffer[1] == MEM_K0_TO_K1(NULL))) {
         // Not enough memory for 720p XFBs: fall back to the console's own mode
@@ -540,13 +579,15 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     }
 
     VIDEO_Configure(vi_mode);
-    dbglog("wm_init: configured");
+    dbglog("wm_init: configured (libogc mode %ux%u viTVMode %u)", vi_mode->fbWidth, vi_mode->xfbHeight, vi_mode->viTVMode);
 
     VIDEO_SetNextFramebuffer(framebuffer[fb]);
     // Never blanked here: the XFBs are already cleared to black, and libogc blanks the screen by
     // programming zero active lines, which the 720p/crop modes would copy from the safe image
     VIDEO_SetBlack(false);
     VIDEO_Flush();
+    shown_idx = fb;
+    VIDEO_SetPostRetraceCallback(retrace_callback); // counts retraces from here on
     VIDEO_WaitVSync();
     if (vi_mode->viTVMode & VI_NON_INTERLACE)
         VIDEO_WaitVSync();
@@ -566,11 +607,15 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         shown_idx = 0;
         hd_programmed = true;
         atexit(gfx_gx_wm_shutdown);
+        log_vi_activity("safe mode, before switch");
+        dbglog("wm_init: applying %s image", hd->name);
         apply_image(&hd_img, hd_pll_1c4(), hd_pll_1c8());
+        dbglog("wm_init: image applied, PLL now 0x1C4=%08X 0x1C8=%08X", (unsigned)HWREG(0x1C4), (unsigned)HWREG(0x1C8));
         VIDEO_SetPostRetraceCallback(retrace_callback);
-        VIDEO_WaitVSync();
-        VIDEO_WaitVSync();
-        dbg_vi_regs("720p");
+        wait_vsync_ms(200, "first field after switch");
+        wait_vsync_ms(200, "second field after switch");
+        dbg_vi_regs(hd->name);
+        log_vi_activity(hd->name);
         dbglog("wm_init: %s up, PLL 0x1C4=%08X 0x1C8=%08X", hd->name, (unsigned)HWREG(0x1C4), (unsigned)HWREG(0x1C8));
     } else {
         // Also needed when presenting at vsync: the benchmark calibrates its clock on retraces
@@ -588,6 +633,8 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         VIDEO_WaitVSync();
         dbg_vi_regs("hires");
     }
+    if (!hd_active)
+        log_vi_activity("running mode");
     dbglog("wm_init: done");
 }
 
@@ -685,8 +732,10 @@ static void gfx_gx_wm_swap_buffers_begin(void)
     static unsigned int frames;
     frames++;
     heartbeat();
-    if (frames <= 3 || frames % 600 == 0)
-        dbglog("swap: frame %u", frames);
+    if (frames <= 10 || frames % 300 == 0)
+        dbglog("swap: frame %u retraces %u beam V=%u H=%u draw=%d shown=%d pending=%d DCR=%04X FBB=%04X%04X",
+               frames, (unsigned)retrace_count, VI[0x2C / 2] & 0x7FF, VI[0x2E / 2] & 0x7FF,
+               draw_idx, shown_idx, pending_idx, VI[0x02 / 2], VI[0x1C / 2], VI[0x1E / 2]);
     if (frames == 120 && tiled_active)
         dbg_vi_regs("frame120");
 
@@ -709,7 +758,7 @@ static void gfx_gx_wm_swap_buffers_begin(void)
         // and hold it for a second field at 30 fps
         wait_pending_shown();
         if (!config60Fps)
-            VIDEO_WaitVSync();
+            wait_vsync_ms(100, "30 fps hold");
         return;
     }
 

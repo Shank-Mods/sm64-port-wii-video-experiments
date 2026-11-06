@@ -142,6 +142,9 @@ static void bench_audio(void) {
 
 void produce_one_frame(void) {
 #ifdef TARGET_GX
+    static unsigned int pf;
+    if (++pf <= 5)
+        dbglog("produce_one_frame %u (%s)", pf, configBenchUncapped ? "uncapped" : "capped");
     if (configBenchUncapped) {
         // One game tick and one rendered frame, no vsync wait (bench_* are no-ops when the
         // instrumentation is off)
@@ -332,6 +335,7 @@ void main_func(void) {
     bench_init();
 #endif
 
+    dbglog("entering game loop");
     thread5_game_loop(NULL);
 #ifdef TARGET_WEB
     /*for (int i = 0; i < atoi(argv[1]); i++) {

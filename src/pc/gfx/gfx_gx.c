@@ -1469,11 +1469,15 @@ static void gfx_gx_end_frame(void)
         dbglog("end_frame %u: segs=%d bytes=%u overflow=%d", ef, hr_nseg, (unsigned)hr_pos, hr_overflow);
     bool uncapped = gfx_gx_wm_uncapped();
 
+    const bool trace = ef <= 5;
     if (hr_recording)
     {
         if (!hr_overflow)
             hr_end_seg();
         hr_recording = false;
+        if (trace)
+            dbglog("end_frame %u: replaying %d segs (%u bytes) into %p", ef, hr_nseg, (unsigned)hr_pos,
+                   gfx_gx_wm_get_back_buffer());
         if (!hr_overflow)
             hr_replay();
     }
@@ -1499,7 +1503,11 @@ static void gfx_gx_end_frame(void)
     if (gBenchOn)
         bench_release_gpu(false);
     bench_push(BENCH_GPUWAIT);
+    if (trace)
+        dbglog("end_frame %u: waiting for GPU", ef);
     GX_DrawDone();
+    if (trace)
+        dbglog("end_frame %u: GPU done", ef);
     bench_pop();
     if (gBenchOn)
         bench_frame_end_gpu(bench_tb());
