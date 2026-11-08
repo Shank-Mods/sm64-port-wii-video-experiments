@@ -1733,6 +1733,13 @@ void gfx_start_frame(void) {
     gfx_current_dimensions.aspect_ratio = (float)gfx_current_dimensions.width / (float)gfx_current_dimensions.height;
 #ifdef TARGET_GX
     gfx_current_dimensions.aspect_ratio = configWidescreen ? (16.0f / 9.0f) : (4.0f / 3.0f);
+    {
+        // Square-pixel widescreen frames that aren't 16:9 (1920x1020p) use their real shape
+        extern float gfx_gx_wm_frame_aspect(void);
+        float fa = gfx_gx_wm_frame_aspect();
+        if (configWidescreen && fa > 0.0f)
+            gfx_current_dimensions.aspect_ratio = fa;
+    }
 #endif
 }
 

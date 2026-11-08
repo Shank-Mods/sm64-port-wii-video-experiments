@@ -47,7 +47,20 @@ outputs and GCVideo-based boards (rated to 54 MHz) will not show it.
   picture configuration changes, to fetch 640 pixels per line with a 1280-pixel stride, so the
   TV shows the **top left quarter** of the frame. The only part not representative of a real
   1280x960 output is the VI's own memory reads (those of 640x480).
-- Widescreen AUTO resolves to 16:9 in 1280x720p and 4:3 in 960x720p and the crop mode.
+- **Higher modes** (same direct-VI method; timing checked against the VI limits found by
+  vilinetest: lines <= 2046 pixels, fields <= ~2047 half-lines, PRB >= 1, EQU >= 1):
+
+  | `video_mode` | total | pixel rate (Nfb/V) | field rate | tiles | notes |
+  |---|---|---|---|---|---|
+  | `1280x960p` | 1800 x 1000 | 108 MHz (16/4) | 60.000 Hz | 2x2 of 640x480 | VESA 1280x960@60, 4:3 |
+  | `1920x1020p` | 2026 x 1022 | 124.2 MHz (23/5) | 59.98 Hz | 3x2 of 640x510 | square pixels (1.88:1); only 2 lines of vertical blanking, the most active lines the VI's field counter allows |
+  | `1920x1440i` | 2038 x 1501 | 91.8 MHz (17/5) | 60.02 Hz | 3x3 of 640x480 | 4:3 square pixels, 720 lines per field; rendered progressive, each field reads every other line |
+
+  Their XFBs (2.5 / 3.9 / 5.5 MB each, three of them) don't fit in MEM1 next to the game, so
+  some or all land in MEM2; the debug log records where. `crop_480p true` works with all of
+  them.
+- Widescreen AUTO resolves to 16:9 in 1280x720p and 1920x1020p (which uses its real 1.88:1
+  shape) and to 4:3 in the other modes.
   Antialiasing is not used in the 720p modes.
 - The app needs `<ahb_access/>` (in `meta.xml`) to reach the PLL registers.
 - The startup log (`sm64_debug.txt` in the root of the SD card / USB drive) records every VI register and PLL
@@ -61,7 +74,7 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 
 | option | default | |
 |---|---|---|
-| `video_mode` | `720p` | `720p` (1280x720p), `960x720p`, `1280x960crop`, or `default` for the console's own mode (480p/480i, or 240p / 1280x240p if those are enabled) |
+| `video_mode` | `720p` | `720p` (1280x720p), `960x720p`, `1280x960p`, `1920x1020p`, `1920x1440i`, `1280x960crop` (= `1280x960p` with `crop_480p`), or `default` for the console's own mode (480p/480i, or 240p / 1280x240p if those are enabled) |
 | `crop_480p` | `false` | render at `video_mode`'s full size (1280x720 or 960x720) but leave the video signal on the console's normal 480p, showing the **top left 640x480** of the frame (the same method as `1280x960crop`). Measures the full-resolution render on any display |
 | `bench_demo` | `true` | timedemo: plays the attract demos in a loop, input ignored, results logged. `false` = normal play with your controller |
 | `bench_uncapped` | `true` | one game tick per rendered frame and no vsync wait, so game logic runs as fast as the hardware allows (fast motion, audio silent). `false` = normal 30 Hz logic presented at vsync, with the `60fps` option's interpolation |

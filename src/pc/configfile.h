@@ -30,6 +30,9 @@ void configfile_switch_storage_device(unsigned int newDevice);
 #define VIDEO_MODE_720P    1u // 1280x720p60, VI pixel clock reprogrammed to 148.5 MHz
 #define VIDEO_MODE_960X720P 2u // 960x720p60 (4:3), VI pixel clock reprogrammed to 108 MHz
 #define VIDEO_MODE_960P_CROP 3u // rendered at 1280x960, top left 640x480 shown in the normal 480p
+#define VIDEO_MODE_1280X960P  4u // 1280x960p60 (4:3), VESA timing, 108 MHz pixels
+#define VIDEO_MODE_1920X1020P 5u // 1920x1020p60 (square pixels), minimal vertical blanking
+#define VIDEO_MODE_1920X1440I 6u // 1920x1440i60 (4:3), 720 lines per field
 
 extern bool         configFullscreen;
 extern bool         config60Fps;
