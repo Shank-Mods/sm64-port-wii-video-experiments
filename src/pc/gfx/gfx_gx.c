@@ -69,7 +69,11 @@ static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 // fills it (horizontally, and in 720p vertically too). Geometry outside the tile is then clipped by the transform unit, so no screen
 // coordinate ever lands far outside the EFB (the rasterizer mangles triangles that do).
 // Frames record well under 100 KB on hardware; keep headroom without costing GameCube memory
+#ifdef __wii__
 #define HIRES_DL_SIZE (1024 * 1024)
+#else
+#define HIRES_DL_SIZE (512 * 1024)
+#endif
 #define HIRES_MAX_SEGS 2048
 
 struct HiresSeg {
@@ -84,6 +88,7 @@ struct HiresSeg {
 static bool cur_is_2d; // projection the current draws use (orthographic for 2D)
 
 static bool hr_enabled;
+static uint8_t *hr_crop_scratch; // crop modes: destination of every tile but the top left one
 static int hr_tiles_x = 2, hr_tiles_y = 1;      // tile grid
 static int hr_tile_w = HIRES_TILE_WIDTH, hr_tile_h = 240;
 static uint8_t *hr_dl;
@@ -937,10 +942,10 @@ static int gx_frame_h(void)
 
 static void gfx_gx_set_viewport(int x, int y, int width, int height)
 {
-    GXRModeObj *rmode = gfx_gx_wm_get_rmode();
     const int fh = gx_frame_h();
-    vp_x = gx_map_x(x, rmode->fbWidth);
-    vp_w = gx_map_w(width, rmode->fbWidth);
+    const int fw = gfx_gx_wm_get_frame_width();
+    vp_x = gx_map_x(x, fw);
+    vp_w = gx_map_w(width, fw);
     vp_y = y * fh / DESIRED_SCREEN_HEIGHT;
     vp_h = height * fh / DESIRED_SCREEN_HEIGHT;
     gx_issue_viewport(1.0f);
@@ -950,9 +955,9 @@ static void gfx_gx_set_scissor(int x, int y, int width, int height)
 {
     // OpenGL has a bottom left origin, GX has top right
     // This took me hours to find out
-    GXRModeObj *rmode = gfx_gx_wm_get_rmode();
-    int sx = gx_map_x(x, rmode->fbWidth);
-    int sw = gx_map_w(width, rmode->fbWidth);
+    const int fw = gfx_gx_wm_get_frame_width();
+    int sx = gx_map_x(x, fw);
+    int sw = gx_map_w(width, fw);
     const int fh = gx_frame_h();
     int sy = y * fh / DESIRED_SCREEN_HEIGHT;
     int sh = height * fh / DESIRED_SCREEN_HEIGHT;
@@ -1163,7 +1168,7 @@ static void gx_bench_draw_overlay(void)
     const f32 efb_w = hr_enabled ? hr_tile_w : rmode->fbWidth;
     const f32 efb_h = hr_enabled ? hr_tile_h : rmode->efbHeight;
     const bool short_efb = gx_frame_h() < 400;   // 240-line modes: squeeze rows to fit
-    const f32 sx = (hr_enabled && !gfx_gx_wm_hd()) ? 2.0f : 1.0f; // 1280x240p pixels are half as wide
+    const f32 sx = (hr_enabled && gx_frame_h() < 400) ? 2.0f : 1.0f; // 1280x240p pixels are half as wide
     const f32 sy = short_efb ? 0.5f : 1.0f;
     GX_InitTexObjFilterMode(&ov_texobj, short_efb ? GX_LINEAR : GX_NEAR, short_efb ? GX_LINEAR : GX_NEAR);
 
@@ -1229,7 +1234,7 @@ static void gx_apply_copy_filter(void)
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
     // Not in 720p: the filter blends neighbouring lines, which would mark the seam between the
     // two rows of tiles (each copy only sees its own tile), and progressive 720p has no flicker
-    const bool deflicker = configViDeflicker && !gfx_gx_wm_hd();
+    const bool deflicker = configViDeflicker && !gfx_gx_wm_hd() && !gfx_gx_wm_crop();
     GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, deflicker ? GX_TRUE : GX_FALSE, rmode->vfilter);
 }
 
@@ -1242,12 +1247,12 @@ static void gx_setup_efb(void)
 
     vp_x = 0;
     vp_y = 0;
-    vp_w = rmode->fbWidth;
+    vp_w = gfx_gx_wm_get_frame_width();
     vp_h = gx_frame_h();
     gx_issue_viewport(1.0f); // plain (0, 1) range
     sc_x = 0;
     sc_y = 0;
-    sc_w = rmode->fbWidth;
+    sc_w = gfx_gx_wm_get_frame_width();
     sc_h = gx_frame_h();
     if (hr_enabled)
     {
@@ -1313,6 +1318,13 @@ static void gx_init()
             hr_enabled = true;
             gfx_gx_wm_get_tiles(&hr_tiles_x, &hr_tiles_y, &hr_tile_w, &hr_tile_h);
             dbglog("gx_init: tiles %dx%d of %dx%d", hr_tiles_x, hr_tiles_y, hr_tile_w, hr_tile_h);
+            if (gfx_gx_wm_crop()) {
+                const u32 bytes = (u32)gfx_gx_wm_get_rmode()->fbWidth * hr_tile_h * 2;
+                hr_crop_scratch = memalign(32, bytes);
+                if (hr_crop_scratch != NULL)
+                    DCInvalidateRange(hr_crop_scratch, bytes); // GPU-written only
+                dbglog("gx_init: crop scratch %p (%u bytes)", hr_crop_scratch, (unsigned)bytes);
+            }
             // Keep libogc's register shadows as recorded, rather than rolling them back at the
             // end of every display list segment
             GX_SetMisc(GX_MT_DL_SAVE_CTX, 0);
@@ -1454,8 +1466,14 @@ static void hr_replay(void)
         GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
         GX_SetColorUpdate(GX_TRUE);
         GX_SetAlphaUpdate(GX_TRUE);
-        const uint32_t offset = ((uint32_t)tile_y0 * rmode->fbWidth + (uint32_t)tile_x0) * 2;
-        GX_CopyDisp((uint8_t *)xfb + offset, GX_TRUE);
+        if (gfx_gx_wm_crop()) {
+            // Only the top left tile is shown; the rest are copied out all the same
+            const bool shown = tx == 0 && ty == 0;
+            GX_CopyDisp(shown || hr_crop_scratch == NULL ? xfb : hr_crop_scratch, GX_TRUE);
+        } else {
+            const uint32_t offset = ((uint32_t)tile_y0 * rmode->fbWidth + (uint32_t)tile_x0) * 2;
+            GX_CopyDisp((uint8_t *)xfb + offset, GX_TRUE);
+        }
     }
 
     GX_Flush();

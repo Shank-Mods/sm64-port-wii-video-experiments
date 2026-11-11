@@ -43,7 +43,12 @@ void dbglog(const char *fmt, ...)
 #ifndef DBGLOG_NAME
 #define DBGLOG_NAME "sm64_debug.txt"
 #endif
+#ifdef __wii__
     static const char *const paths[] = { "sd:/" DBGLOG_NAME, "usb:/" DBGLOG_NAME };
+#else
+    // GameCube: SD2SP2 ("sd") or an SD Gecko in either memory card slot
+    static const char *const paths[] = { "sd:/" DBGLOG_NAME, "carda:/" DBGLOG_NAME, "cardb:/" DBGLOG_NAME };
+#endif
     char line[256];
     va_list ap;
 
@@ -53,7 +58,7 @@ void dbglog(const char *fmt, ...)
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
 
-    for (unsigned int i = 0; i < 2; i++) {
+    for (unsigned int i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         FILE *f = fopen(paths[i], header_done ? "a" : "w");
         if (f != NULL) {
             fputs(line, f);
@@ -97,7 +102,11 @@ unsigned int configWidescreenMode = WIDESCREEN_AUTO; // anamorphic 16:9
 bool configPillarbox             = false; // render 4:3 into the centre 3/4 so a 16:9 display's stretch restores correct 4:3
 bool config240p                  = false; // Output a true 240p signal instead of 480i/480p
 bool configHires1280             = false; // 1280x240p (4:3) output, rendered as two 640x240 tiles
+#ifdef __wii__
 unsigned int configVideoMode     = VIDEO_MODE_720P; // 1280x720p output (takes priority over 240p/1280x240p)
+#else
+unsigned int configVideoMode     = VIDEO_MODE_1920X1020P; // GameCube: rendered at 1920x1020, top left shown as 480p
+#endif
 bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
 bool configInvertCamera          = false; // Invert camera controls

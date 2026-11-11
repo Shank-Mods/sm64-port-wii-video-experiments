@@ -1,5 +1,6 @@
 #ifdef TARGET_GX
 
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,17 +60,19 @@ static volatile u32 retrace_count; // counted by retrace_callback (debug log and
 //               fields, 4:3 square pixels. The frame is rendered progressive; each field
 //               reads every other line of the XFB
 //
-// crop_480p (and the 1280x960crop mode): the frame is rendered at full size into a full-size
-// XFB, but the VI stays on the console's own 480p/480i timing and clock. Only the picture
-// configuration changes: the VI fetches 640 pixels per line with the frame's stride, so it
-// scans out the top left 640x480. The GPU and CPU do the full work; only the VI's memory reads
-// are those of 640x480.
+// crop_480p (and 1280x960crop; always on GameCube, which has no programmable VI clock): the
+// frame is rendered at full size, every tile drawn and copied out to RAM, but the video signal
+// is the console's ordinary libogc 480p/480i. The top left tile is copied into the displayed
+// XFB (640 wide, at least one tile tall, so the TV shows the top left 640x480 of the frame);
+// every other tile is copied into one tile-sized scratch buffer. The GPU draws the same pixels
+// and writes the same number of bytes to RAM as a full-size XFB would get, without needing the
+// memory for one (a 1920x1020 XFB is 3.9 MB; the GameCube has 24 MB in all). Identical on Wii
+// and GameCube, so the two can be compared.
 
 struct HdTiming {
     const char *name;
     u16 w, h;           // frame (= XFB) size
     u8 tx, ty;          // EFB tile grid (tiles are w/tx x h/ty, at most 640x528)
-    bool crop;          // VI keeps the safe mode, shows the top left 640 x (safe height)
     bool il;            // interlaced output
     u16 ht, hs, hbp;    // horizontal, in pixel clocks: total, hsync width, back porch
     u16 vn, acv;        // half-lines per field, active lines per field
@@ -77,17 +80,16 @@ struct HdTiming {
     u8 nfb, v;          // PLL
     u32 p_hz;           // pixel rate (F/2)
 };
-static const struct HdTiming hd_1280  = { "1280x720p",  1280,  720, 2, 2, false, false, 1650,  40, 220, 1500,  720, 10, 2, 22, 8,  74250000 };
-static const struct HdTiming hd_960   = { "960x720p",    960,  720, 2, 2, false, false, 1200,  30, 160, 1500,  720, 10, 2, 14, 7,  54000000 };
-static const struct HdTiming hd_1280x960 = { "1280x960p", 1280, 960, 2, 2, false, false, 1800, 112, 312, 2000,  960,  6, 2, 16, 4, 108000000 };
-static const struct HdTiming hd_1920x1020 = { "1920x1020p", 1920, 1020, 3, 2, false, false, 2026, 44, 54, 2044, 1020, 1, 0, 23, 5, 124200000 };
-static const struct HdTiming hd_1920x1440 = { "1920x1440i", 1920, 1440, 3, 3, false, true, 2038, 44, 66, 1501, 720, 6, 3, 17, 5, 91800000 };
+static const struct HdTiming hd_1280  = { "1280x720p",  1280,  720, 2, 2, false, 1650,  40, 220, 1500,  720, 10, 2, 22, 8,  74250000 };
+static const struct HdTiming hd_960   = { "960x720p",    960,  720, 2, 2, false, 1200,  30, 160, 1500,  720, 10, 2, 14, 7,  54000000 };
+static const struct HdTiming hd_1280x960 = { "1280x960p", 1280, 960, 2, 2, false, 1800, 112, 312, 2000,  960,  6, 2, 16, 4, 108000000 };
+static const struct HdTiming hd_1920x1020 = { "1920x1020p", 1920, 1020, 3, 2, false, 2026, 44, 54, 2044, 1020, 1, 0, 23, 5, 124200000 };
+static const struct HdTiming hd_1920x1440 = { "1920x1440i", 1920, 1440, 3, 3, true, 2038, 44, 66, 1501, 720, 6, 3, 17, 5, 91800000 };
 static const struct HdTiming *hd = &hd_1280;
-// crop_480p: any of the above rendered at full size, shown as a top left 640x480 crop on the
-// console's own 480p (the timing fields are then unused)
-static struct HdTiming hd_cropped;
-static char hd_cropped_name[24];
-static bool crop_il;  // crop mode on an interlaced safe mode (480i/576i)
+// crop: the mode whose frame size and tile grid are rendered (its timing is unused)
+static const struct HdTiming *crop_t;
+static char crop_name[24];
+static bool crop_active;
 
 static const u8 img_regs[] = {
     0x00, 0x04, 0x06, 0x08, 0x0A, 0x0C, 0x0E, 0x10, 0x12, 0x14, 0x16, 0x18, 0x1A,
@@ -137,10 +139,10 @@ static void fbb_values(void *xfb, u16 *tfbl_hi, u16 *tfbl_lo) {
     *tfbl_lo = (u16)(t & 0xFFFF);
 }
 
-// Interlaced scanout (an interlaced mode, or a crop on a 480i safe mode): the bottom field
-// starts one XFB line down, and each field reads every other line
+// Interlaced scanout: the bottom field starts one XFB line down, and each field reads every
+// other line
 static bool scan_il(void) {
-    return hd->crop ? crop_il : hd->il;
+    return hd->il;
 }
 
 static void fbb_pair(void *xfb, u16 *hi, u16 *lo, u16 *bhi, u16 *blo) {
@@ -166,23 +168,8 @@ static void img_set_fbb(void *xfb) {
     img_set(&hd_img, 0x26, blo);
 }
 
-static void crop_build_image(void *xfb) {
-    // Everything as the safe mode has it, except what the VI reads: 640 pixels per line from
-    // lines hd->w pixels apart (two lines apart when interlaced)
-    hd_img = safe_img;
-    crop_il = (safe_img.dcr & 0x0004) == 0;
-    const u16 wpl = 640 / 16;
-    const u16 std = (hd->w / 16) * (crop_il ? 2 : 1);
-    img_set(&hd_img, 0x48, (u16)((wpl << 8) | std));
-    img_set_fbb(xfb);
-}
-
 // Complete register image for the mode (the formulas of vimodetest's calc_mode/build_image)
 static void hd_build_image(void *xfb) {
-    if (hd->crop) {
-        crop_build_image(xfb);
-        return;
-    }
     const u16 il = hd->il ? 1 : 0;
     const u16 hlw = hd->ht / 2;
     const u16 hsy = hd->hs;
@@ -270,14 +257,10 @@ static void log_vi_activity(const char *what) {
 }
 
 static u32 hd_pll_1c4(void) {
-    if (hd->crop)
-        return boot1c4; // clock untouched
     return (boot1c4 & ~0x0000FF00u) | ((u32)(hd->nfb - 1) << 8); // byte 2 is never touched
 }
 
 static u32 hd_pll_1c8(void) {
-    if (hd->crop)
-        return boot1c8;
     return (boot1c8 & ~0x00F00000u) | ((u32)hd->v << 20);
 }
 
@@ -418,31 +401,53 @@ bool gfx_gx_wm_hd(void)
     return hd_active;
 }
 
+bool gfx_gx_wm_crop(void)
+{
+    return crop_active;
+}
+
+// The high resolution mode being rendered (a direct-VI mode or a crop), or NULL
+static const struct HdTiming *frame_mode(void)
+{
+    return hd_active ? hd : (crop_active ? crop_t : NULL);
+}
+
 // Shape of the rendered frame in the high resolution modes (square pixels), else 0
 float gfx_gx_wm_frame_aspect(void)
 {
-    return hd_active ? (float)hd->w / (float)hd->h : 0.0f;
+    const struct HdTiming *t = frame_mode();
+    return t != NULL ? (float)t->w / (float)t->h : 0.0f;
 }
 
 const char *gfx_gx_wm_hd_name(void)
 {
-    return hd_active ? hd->name : NULL;
+    return hd_active ? hd->name : (crop_active ? crop_name : NULL);
 }
 
 void gfx_gx_wm_get_tiles(int *tiles_x, int *tiles_y, int *tile_w, int *tile_h)
 {
     // From the mode table (e.g. 1920x1440: 3x3 tiles of 640x480); 1280x240p: 2x1 of 640x240
-    *tiles_x = hd_active ? hd->tx : 2;
-    *tiles_y = hd_active ? hd->ty : 1;
-    *tile_w = hd_active ? hd->w / hd->tx : HIRES_TILE_WIDTH;
-    *tile_h = hd_active ? hd->h / hd->ty : (rmode != NULL ? rmode->efbHeight : 240);
+    const struct HdTiming *t = frame_mode();
+    *tiles_x = t != NULL ? t->tx : 2;
+    *tiles_y = t != NULL ? t->ty : 1;
+    *tile_w = t != NULL ? t->w / t->tx : HIRES_TILE_WIDTH;
+    *tile_h = t != NULL ? t->h / t->ty : (rmode != NULL ? rmode->efbHeight : 240);
+}
+
+int gfx_gx_wm_get_frame_width(void)
+{
+    const struct HdTiming *t = frame_mode();
+    if (t != NULL)
+        return t->w;
+    return rmode != NULL ? rmode->fbWidth : DESIRED_SCREEN_WIDTH;
 }
 
 int gfx_gx_wm_get_frame_height(void)
 {
     if (rmode == NULL)
         return DESIRED_SCREEN_HEIGHT;
-    return hd_active ? hd->h : rmode->efbHeight;
+    const struct HdTiming *t = frame_mode();
+    return t != NULL ? t->h : rmode->efbHeight;
 }
 
 void *gfx_gx_wm_get_back_buffer(void)
@@ -490,7 +495,6 @@ static void gfx_gx_wm_apply_hires_timing(void)
 // Options are 720p, 1280x240p, 240p or the console's own 480p/480i (576i for PAL)
 static GXRModeObj *gfx_gx_wm_select_mode(void)
 {
-#ifdef __wii__
     const struct HdTiming *sel = NULL;
     bool force_crop = false;
     switch (configVideoMode) {
@@ -502,15 +506,20 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
         case VIDEO_MODE_960P_CROP:  sel = &hd_1280x960; force_crop = true; break;
         default: break;
     }
+#ifndef __wii__
+    force_crop = true; // the GameCube's VI clock can't be raised: only the crops exist there
+#endif
+    if (sel != NULL && (configCrop480 || force_crop)) {
+        // Normal 480p/480i signal; the frame is rendered at sel's size
+        crop_t = sel;
+        snprintf(crop_name, sizeof(crop_name), "%ux%u>480", sel->w, sel->h);
+        crop_active = true;
+        tiled_active = true;
+        return VIDEO_GetPreferredMode(NULL);
+    }
+#ifdef __wii__
     if (sel != NULL) {
         hd = sel;
-        if (configCrop480 || force_crop) {
-            hd_cropped = *hd;
-            hd_cropped.crop = true;
-            snprintf(hd_cropped_name, sizeof(hd_cropped_name), "%ux%u>480", hd->w, hd->h);
-            hd_cropped.name = hd_cropped_name;
-            hd = &hd_cropped;
-        }
         TVHd720.fbWidth = hd->w;
         TVHd720.efbHeight = hd->h / hd->ty;
         TVHd720.xfbHeight = hd->h;
@@ -550,6 +559,17 @@ static void dbg_vi_regs(const char *tag)
                VI[r / 2 + 4], VI[r / 2 + 5], VI[r / 2 + 6], VI[r / 2 + 7]);
 }
 
+static void log_arenas(const char *what)
+{
+#ifdef __wii__
+    dbglog("wm_init: %s: MEM1 arena %p-%p, MEM2 arena %p-%p", what, SYS_GetArenaLo(), SYS_GetArenaHi(),
+           SYS_GetArena2Lo(), SYS_GetArena2Hi());
+#else
+    dbglog("wm_init: %s: arena %p-%p (%u KB free)", what, SYS_GetArenaLo(), SYS_GetArenaHi(),
+           (unsigned)(((u8 *)SYS_GetArenaHi() - (u8 *)SYS_GetArenaLo()) / 1024));
+#endif
+}
+
 static void clear_xfb(void *xfb, u32 bytes)
 {
     u32 *p = (u32 *)xfb; // uncached
@@ -566,19 +586,25 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     dbg_vi_regs("boot");
 
     rmode = gfx_gx_wm_select_mode();
-    dbglog("wm_init: mode viTVMode=%u fb=%ux%u efb=%u vi=%ux%u tiled=%d hd=%d", rmode->viTVMode,
+    dbglog("wm_init: mode viTVMode=%u fb=%ux%u efb=%u vi=%ux%u tiled=%d hd=%d crop=%s", rmode->viTVMode,
            rmode->fbWidth, rmode->xfbHeight, rmode->efbHeight, rmode->viWidth, rmode->viHeight,
-           tiled_active, hd_active);
+           tiled_active, hd_active, crop_active ? crop_name : "no");
 
     // Double buffering when presenting at vsync, triple when uncapped; 720p always uses the
     // retrace-driven queue, so always three there
-    const u32 fb_bytes = VIDEO_GetFrameBufferSize(rmode);
-    dbglog("wm_init: before XFBs: MEM1 arena %p-%p, MEM2 arena %p-%p", SYS_GetArenaLo(), SYS_GetArenaHi(),
-           SYS_GetArena2Lo(), SYS_GetArena2Hi());
-    framebuffer[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
-    framebuffer[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+    u32 fb_bytes = VIDEO_GetFrameBufferSize(rmode);
+    if (crop_active) {
+        // The top left tile is copied in whole, so the XFB must be at least a tile tall
+        int tx, ty, tw, th;
+        gfx_gx_wm_get_tiles(&tx, &ty, &tw, &th);
+        u32 lines = rmode->xfbHeight > (u32)th ? rmode->xfbHeight : (u32)th;
+        fb_bytes = (u32)rmode->fbWidth * lines * 2;
+    }
+    log_arenas("before XFBs");
+    framebuffer[0] = MEM_K0_TO_K1(memalign(32, fb_bytes));
+    framebuffer[1] = MEM_K0_TO_K1(memalign(32, fb_bytes));
     if (configBenchUncapped || hd_active) {
-        void *third = SYS_AllocateFramebuffer(rmode);
+        void *third = memalign(32, fb_bytes);
         if (third != NULL) {
             framebuffer[2] = MEM_K0_TO_K1(third);
             triple = true;
@@ -587,20 +613,22 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     }
     dbglog("wm_init: fb0=%p fb1=%p fb2=%p (%u bytes each) triple=%d uncapped=%d", framebuffer[0],
            framebuffer[1], framebuffer[2], (unsigned)fb_bytes, triple, uncapped);
-    dbglog("wm_init: after XFBs: MEM1 arena %p-%p, MEM2 arena %p-%p", SYS_GetArenaLo(), SYS_GetArenaHi(),
-           SYS_GetArena2Lo(), SYS_GetArena2Hi());
+    log_arenas("after XFBs");
 
-    if (hd_active && (!triple || framebuffer[0] == MEM_K0_TO_K1(NULL) || framebuffer[1] == MEM_K0_TO_K1(NULL))) {
-        // Not enough memory for 720p XFBs: fall back to the console's own mode
-        dbglog("wm_init: not enough memory for 720p, falling back");
+    const bool fb_missing = framebuffer[0] == MEM_K0_TO_K1(NULL) || framebuffer[1] == MEM_K0_TO_K1(NULL);
+    if ((hd_active && (!triple || fb_missing)) || (crop_active && fb_missing)) {
+        // Not enough memory for the XFBs: fall back to the console's own mode
+        dbglog("wm_init: not enough memory for the %s XFBs, falling back", hd_active ? hd->name : crop_name);
         hd_active = false;
+        crop_active = false;
         tiled_active = false;
         rmode = VIDEO_GetPreferredMode(NULL);
         triple = uncapped = false;
-        framebuffer[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
-        framebuffer[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+        fb_bytes = VIDEO_GetFrameBufferSize(rmode);
+        framebuffer[0] = MEM_K0_TO_K1(memalign(32, fb_bytes));
+        framebuffer[1] = MEM_K0_TO_K1(memalign(32, fb_bytes));
         if (configBenchUncapped) {
-            void *third = SYS_AllocateFramebuffer(rmode);
+            void *third = memalign(32, fb_bytes);
             if (third != NULL) {
                 framebuffer[2] = MEM_K0_TO_K1(third);
                 triple = uncapped = true;
@@ -610,7 +638,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
 
     for (int i = 0; i < 3; i++)
         if (framebuffer[i] != MEM_K0_TO_K1(NULL) && framebuffer[i] != NULL)
-            clear_xfb(framebuffer[i], VIDEO_GetFrameBufferSize(rmode));
+            clear_xfb(framebuffer[i], fb_bytes);
 
     GXRModeObj *vi_mode = rmode;
     if (hd_active) {
@@ -664,7 +692,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         VIDEO_SetPostRetraceCallback(retrace_callback);
     }
 
-    if (tiled_active && !hd_active) {
+    if (tiled_active && !hd_active && !crop_active) {
 #ifndef HIRES_NO_VI_POKE
         gfx_gx_wm_apply_hires_timing();
         dbglog("wm_init: hires timing applied");
@@ -701,7 +729,7 @@ int gfx_gx_wm_get_field_rate(void)
 
 double gfx_gx_wm_get_field_hz(void)
 {
-    if (hd_active && !hd->crop)
+    if (hd_active)
         return 2.0 * ((double)hd->p_hz / hd->ht) / hd->vn; // field rate: 2 x line rate / half-lines
     return gfx_gx_wm_get_field_rate() == 50 ? 50.0 : 60000.0 / 1001.0;
 }

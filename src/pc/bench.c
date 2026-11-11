@@ -49,8 +49,15 @@ uint64_t bench_tb64(void) {
 // CPU/GPU/bus PLL doesn't touch. Counting timebase ticks between retraces gives the real
 // timebase rate, so every time below is in real milliseconds whatever the overclock.
 
+#ifdef __wii__
 #define STOCK_TB_HZ 60750000.0 // 243 MHz bus / 4
 #define STOCK_CPU_MHZ 729.0
+#define CONSOLE_NAME "Wii"
+#else
+#define STOCK_TB_HZ 40500000.0 // GameCube: 162 MHz bus / 4
+#define STOCK_CPU_MHZ 486.0
+#define CONSOLE_NAME "GameCube"
+#endif
 
 static volatile uint32_t vi_count;
 static volatile uint64_t vi_tb_first, vi_tb_last;
@@ -274,8 +281,8 @@ static const char *video_desc(void) {
     GXRModeObj *r = gfx_gx_wm_get_rmode();
     if (r == NULL)
         return "?";
-    if (gfx_gx_wm_hd())
-        return gfx_gx_wm_hd_name();
+    if (gfx_gx_wm_hd_name() != NULL)
+        return gfx_gx_wm_hd_name(); // 720p etc., or "1920x1020>480" for a crop
     if (gfx_gx_wm_hires())
         return "1280x240p";
     char scan = (r->viTVMode & 3) == VI_INTERLACE ? 'i' : 'p';
@@ -348,7 +355,11 @@ static void finish_pass(void) {
     }
     history[nhistory++] = (struct History){ pass_no, pass_split, fps, low };
 
+#ifdef __wii__
     const char *path = get_storage_path("sm64_bench.txt");
+#else
+    const char *path = "sm64_bench.txt"; // next to the config, as the GameCube port keeps it
+#endif
     FILE *f = fopen(path, "a");
     if (f == NULL) {
         snprintf(result_note, sizeof(result_note), "could not write results file");
@@ -357,7 +368,7 @@ static void finish_pass(void) {
 
     fprintf(f, "\n=== SM64 Wii benchmark, pass %d (%s) ===\n", pass_no,
             pass_split ? "split: GPU runs after CPU" : "overlapped: normal pipelining");
-    fprintf(f, "build:  %s %s\n", __DATE__, __TIME__);
+    fprintf(f, "build:  %s %s (%s)\n", __DATE__, __TIME__, CONSOLE_NAME);
     fprintf(f, "video:  %s, %.3f Hz field rate\n", video_desc(), field_hz);
     fprintf(f, "mode:   %s\n", configBenchUncapped ? "uncapped (one game tick per frame, no vsync)"
                                                   : "capped (presented at vsync)");

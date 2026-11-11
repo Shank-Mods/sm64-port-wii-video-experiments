@@ -31,6 +31,12 @@ bool gfx_gx_wm_hires(void);
 // True when a 720p mode (1280x720p or 960x720p) is in use
 bool gfx_gx_wm_hd(void);
 
+// True when a high resolution frame is rendered and its top left shown as normal 480p/480i
+bool gfx_gx_wm_crop(void);
+
+// Width of the whole rendered frame in pixels
+int gfx_gx_wm_get_frame_width(void);
+
 // Name of the 720p mode in use ("1280x720p" / "960x720p"), or NULL
 const char *gfx_gx_wm_hd_name(void);
 

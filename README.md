@@ -86,7 +86,26 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 In capped mode the overlay's FPS is the presented rate; the **busy** line shows the time per
 frame excluding the vsync wait, and the frame rate that alone would allow.
 
-## Uncapped benchmark (Wii, `wii-benchmark` branch)
+## GameCube build (`wii-720p` branch)
+
+`make TARGET_WII=0 TARGET_GAMECUBE=1` builds the same benchmark for the GameCube. The GameCube's
+VI clock can't be raised, so every high resolution `video_mode` runs as its **480p crop**: the
+frame is rendered at full size, and the top left 640x480 is shown on the console's normal
+480p/480i. The default there is `video_mode 1920x1020p` (6 tiles of 640x510).
+
+**How crop mode works (Wii and GameCube alike):** every tile is drawn and copied out to RAM.
+The top left tile goes into the displayed XFB (640 wide, one tile tall); every other tile goes
+into a single tile-sized scratch buffer. The GPU draws the same pixels and writes the same
+number of bytes as it would into a full-size XFB, without the memory for one (a 1920x1020 XFB
+is 3.9 MB, and the GameCube has 24 MB in all). The video signal is plain libogc 480p, so no VI
+registers are touched. Results files record the console.
+
+- Clock calibration uses the GameCube's stock clocks (162 MHz bus, 486 MHz CPU).
+- Config, saves, `sm64_bench.txt` and (debug builds) `sm64_debug.txt` go to the root of the
+  first SD card found: SD2SP2 (`sd:`) or an SD Gecko (`carda:`/`cardb:`).
+- No disc-slot LED heartbeat (Wii only).
+
+
 
 This branch turns the port into a repeatable **timedemo benchmark**, meant for comparing a stock
 Wii against an overclocked one. With `benchmark true` (the default on this branch):
