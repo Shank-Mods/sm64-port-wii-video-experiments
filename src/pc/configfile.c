@@ -18,6 +18,8 @@
 #endif
 
 #include "configfile.h"
+#include "early_console.h"
+#include <unistd.h>
 #include <stdarg.h>
 
 static bool dbg_fat_ready;
@@ -27,8 +29,17 @@ static void fat_init_once(void)
 {
 #ifdef TARGET_GX
     if (!dbg_fat_ready) {
-        fatInitDefault();
+        early_console_line("mounting SD (fatInitDefault)...");
+        bool ok = fatInitDefault();
         dbg_fat_ready = true;
+#ifdef EARLYCON
+        char msg[96];
+        snprintf(msg, sizeof(msg), "fatInitDefault %s; cwd device: %s", ok ? "ok" : "FAILED (no card found)",
+                 ok ? (getcwd(msg + 64, 32) != NULL ? msg + 64 : "?") : "none");
+        early_console_line(msg);
+#else
+        (void)ok;
+#endif
     }
 #endif
 }
@@ -57,6 +68,7 @@ void dbglog(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
+    early_console_line(line);
 
     for (unsigned int i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         FILE *f = fopen(paths[i], header_done ? "a" : "w");

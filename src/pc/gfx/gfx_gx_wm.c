@@ -14,6 +14,7 @@
 #include "gfx_screen_config.h"
 #include "../configfile.h" // for config60Fps, config240p, configAntialias, configHires1280, configVideoMode
 #include "../bench.h"
+#include "../early_console.h"
 
 static GXRModeObj *rmode;
 static void *framebuffer[3];
@@ -580,7 +581,8 @@ static void clear_xfb(void *xfb, u32 bytes)
 static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fullscreen)
 {
     dbglog("wm_init: VIDEO_Init");
-    VIDEO_Init();
+    if (!gEarlyVideoUp) // the diagnostic console already did it
+        VIDEO_Init();
     VIDEO_SetBlack(true);
     dbglog("wm_init: tvmode=%d component=%d", VIDEO_GetCurrentTvMode(), VIDEO_HaveComponentCable());
     dbg_vi_regs("boot");
@@ -647,6 +649,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         vi_mode = safe_mode;
     }
 
+    early_console_handover(); // diagnostic builds: hold the startup text on screen a moment
     VIDEO_Configure(vi_mode);
     dbglog("wm_init: configured (libogc mode %ux%u viTVMode %u)", vi_mode->fbWidth, vi_mode->xfbHeight, vi_mode->viTVMode);
 
@@ -661,6 +664,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     if (vi_mode->viTVMode & VI_NON_INTERLACE)
         VIDEO_WaitVSync();
     dbg_vi_regs("libogc");
+    early_console_free();
 
     if (hd_active) {
         VIDEO_WaitVSync();

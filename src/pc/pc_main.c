@@ -38,6 +38,7 @@
 
 #include "configfile.h"
 #include "bench.h"
+#include "early_console.h"
 
 #include "compat.h"
 
@@ -364,6 +365,10 @@ int WINAPI WinMain(UNUSED HINSTANCE hInstance, UNUSED HINSTANCE hPrevInstance, U
 }
 #else
 int main(UNUSED int argc, UNUSED char *argv[]) {
+#ifdef TARGET_GX
+    early_console_init(); // diagnostic builds only
+    early_console_line("main() reached");
+#endif
     main_func();
     return 0;
 }
