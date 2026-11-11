@@ -1,3 +1,18 @@
+#if defined(TARGET_GX) && !defined(EARLYCON)
+
+#include <stdbool.h>
+#include <gccore.h>
+#include "early_console.h"
+
+bool gEarlyVideoUp;
+
+void early_console_init(void) {
+    VIDEO_Init();
+    gEarlyVideoUp = true;
+}
+
+#endif
+
 #if defined(TARGET_GX) && defined(EARLYCON)
 
 // Diagnostic builds (-DEARLYCON): a text console on screen from the first instruction of main,
