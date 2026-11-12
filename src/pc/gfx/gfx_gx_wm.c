@@ -605,12 +605,12 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
     log_arenas("before XFBs");
     framebuffer[0] = MEM_K0_TO_K1(memalign(32, fb_bytes));
     framebuffer[1] = MEM_K0_TO_K1(memalign(32, fb_bytes));
-    if (configBenchUncapped || hd_active) {
+    if ((configBenchUncapped || configBenchRender) || hd_active) {
         void *third = memalign(32, fb_bytes);
         if (third != NULL) {
             framebuffer[2] = MEM_K0_TO_K1(third);
             triple = true;
-            uncapped = configBenchUncapped;
+            uncapped = (configBenchUncapped || configBenchRender);
         }
     }
     dbglog("wm_init: fb0=%p fb1=%p fb2=%p (%u bytes each) triple=%d uncapped=%d", framebuffer[0],
@@ -629,7 +629,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         fb_bytes = VIDEO_GetFrameBufferSize(rmode);
         framebuffer[0] = MEM_K0_TO_K1(memalign(32, fb_bytes));
         framebuffer[1] = MEM_K0_TO_K1(memalign(32, fb_bytes));
-        if (configBenchUncapped) {
+        if ((configBenchUncapped || configBenchRender)) {
             void *third = memalign(32, fb_bytes);
             if (third != NULL) {
                 framebuffer[2] = MEM_K0_TO_K1(third);

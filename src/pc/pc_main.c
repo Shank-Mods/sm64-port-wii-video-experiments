@@ -70,6 +70,24 @@ static uint8_t inited = 0;
 
 #include "game/game_init.h" // for gGlobalTimer
 
+// Everything the 60fps patch switches from halfway to real values, except the matrices
+static void patch_interpolations_rest(void) {
+    extern void patch_screen_transition_interpolated(void);
+    extern void patch_title_screen_scales(void);
+    extern void patch_interpolated_dialog(void);
+    extern void patch_interpolated_hud(void);
+    extern void patch_interpolated_paintings(void);
+    extern void patch_interpolated_bubble_particles(void);
+    extern void patch_interpolated_snow_particles(void);
+    patch_screen_transition_interpolated();
+    patch_title_screen_scales();
+    patch_interpolated_dialog();
+    patch_interpolated_hud();
+    patch_interpolated_paintings();
+    patch_interpolated_bubble_particles();
+    patch_interpolated_snow_particles();
+}
+
 // Run once between two frames at 60fps or once before a frame at 30fps.
 static void patch_interpolations(void) {
     extern void mtx_patch_interpolated(void);
@@ -93,16 +111,47 @@ static void patch_interpolations(void) {
 // 60fps interpolation draws a second frame per game tick; uncapped draws one per tick
 static bool interpolate_60fps(void) {
 #ifdef TARGET_GX
-    if (configBenchUncapped)
+    if (configBenchUncapped || configBenchRender)
         return false;
 #endif
     return config60Fps;
 }
 
+#ifdef TARGET_GX
+// Render-uncapped mode (bench_uncapped render): game ticks at 30 Hz of real time, and between
+// them the last tick's display list is drawn again and again, each time at the fraction of the
+// tick that has passed (rendering_graph_node.c rt_render_at)
+#define RT_TICK_HZ 30.0
+static bool rt_started;
+static bool rt_late;          // this tick's one-way patches (HUD, paintings, ...) are done
+static uint64_t rt_tick_time; // when this tick's state is fully reached (t = 1 a tick later)
+static uint64_t rt_next;      // when the next tick is due
+
+static void rt_draw(Gfx *dl) {
+    extern void rt_render_at(float t, s32 lateHalf);
+    const double period = bench_tb_hz() / RT_TICK_HZ;
+    double t = (double)(int64_t)(bench_tb64() - rt_tick_time) / period;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    if (t >= 0.75 && !rt_late) {
+        patch_interpolations_rest();
+        rt_late = true;
+    }
+    rt_render_at((float)t, rt_late);
+    gfx_run(dl);
+}
+#endif
+
 void send_display_list(struct SPTask *spTask) {
     if (!inited) {
         return;
     }
+#ifdef TARGET_GX
+    if (configBenchRender) {
+        rt_draw((Gfx *)spTask->task.t.data_ptr);
+        return;
+    }
+#endif
     if (!interpolate_60fps()) {
         // At 30fps only real frames are shown
         patch_interpolations();
@@ -146,6 +195,50 @@ void produce_one_frame(void) {
     static unsigned int pf;
     if (++pf <= 5)
         dbglog("produce_one_frame %u (%s)", pf, configBenchUncapped ? "uncapped" : "capped");
+    if (configBenchRender) {
+        extern void rt_tick_reset(void);
+        const double period = bench_tb_hz() / RT_TICK_HZ;
+        const uint64_t now = bench_tb64();
+        bench_frame_begin();
+        if (!rt_started || now >= rt_next) {
+            // Game tick (which draws its first frame too), with audio played in real time
+            if (!rt_started) {
+                rt_started = true;
+                rt_next = now;
+            }
+            rt_tick_time = rt_next;
+            rt_next += (uint64_t)period;
+            if (now > rt_next) {
+                // Can't keep up: the game slows down rather than running ticks back to back
+                rt_tick_time = now;
+                rt_next = now + (uint64_t)period;
+            }
+            if (!rt_late)
+                patch_interpolations_rest(); // empties their lists for the new tick
+            rt_late = false;
+            rt_tick_reset();
+            gfx_start_frame();
+            game_loop_one_iteration();
+            bench_tick_done();
+            bench_push(BENCH_AUDIO);
+            int samples_left = audio_api->buffered();
+            u32 num_audio_samples = samples_left < audio_api->get_desired_buffered() ? samples_high : samples_low;
+            s16 audio_buffer[SAMPLES_HIGH * 2 * 2];
+            for (int i = 0; i < 2; i++) {
+                create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
+            }
+            audio_api->play((u8 *)audio_buffer, 2 * num_audio_samples * 4);
+            bench_pop();
+            gfx_end_frame();
+            return;
+        }
+        // A frame between ticks
+        bench_frame_continue();
+        gfx_start_frame();
+        rt_draw((Gfx *)gGfxSPTask->task.t.data_ptr);
+        gfx_end_frame();
+        return;
+    }
     if (configBenchUncapped) {
         // One game tick and one rendered frame, no vsync wait (bench_* are no-ops when the
         // instrumentation is off)

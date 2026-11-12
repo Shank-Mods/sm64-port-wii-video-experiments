@@ -11,6 +11,9 @@
 #include "shadow.h"
 #include "sm64.h"
 #include "pc/configfile.h"
+#include "level_geo.h"
+#include "skybox.h"
+#include <stdlib.h>
 
 // When fog is disabled have the renderer go out further than it would normally
 #define DRAW_DIST_FAR_PLANE 65000.0f
@@ -159,11 +162,103 @@ struct {
     Gfx *pos;
     void *mtx;
     void *displayList;
+    void *mtxMid, *displayListMid; // the halfway versions the display list starts out with
 } gMtxTbl[6400];
 s32 gMtxTblSize;
 
 static Gfx *sViewportPos;
 static Vp sPrevViewport;
+
+// Render-uncapped mode (bench_uncapped render): game logic at its normal 30 Hz while frames are
+// drawn as fast as possible, each at a fraction t (0..1] of the way from the previous tick to
+// this one. The display list is built once per tick with the 60fps patch's halfway ("mid")
+// values; every matrix it records is set per frame to prev + t (cur - prev), which given
+// mid = (prev + cur) / 2 is cur + (2 - 2t)(mid - cur). The skybox is rebuilt per frame from the
+// camera at t so it stays locked to the world.
+static Mtx *sPerspectiveMid;
+static Mtx sRtPersp;
+static Mtx *sRtMtx;       // per-entry blended matrices
+#define RT_MAX_MTX 2048
+static void *sRtSkyListMid; // the skybox's halfway list, to find its entry
+static s32 sRtSkyEntry = -1;
+static struct GraphNodeBackground *sRtSkyNode;
+static f32 sRtSkyFov;
+static Vec3f sRtSkyPos[2], sRtSkyFocus[2]; // camera at the previous and this tick
+static bool sRtViewportDone;
+
+static void rt_blend(Mtx *dst, const Mtx *cur, const Mtx *mid, f32 a) {
+    const f32 *c = &cur->m[0][0], *m = &mid->m[0][0];
+    f32 *d = &dst->m[0][0];
+    for (s32 k = 0; k < 16; k++) {
+        d[k] = c[k] + a * (m[k] - c[k]);
+    }
+}
+
+// Start of a tick: forget the last tick's display list
+void rt_tick_reset(void) {
+    gMtxTblSize = 0;
+    sPerspectivePos = NULL;
+    sPerspectiveRestorePos = NULL;
+    sViewportPos = NULL;
+    sRtSkyListMid = NULL;
+    sRtSkyEntry = -1;
+    sRtSkyNode = NULL;
+    sRtViewportDone = false;
+}
+
+// Sets this tick's display list to the game state at fraction t between the last two ticks.
+// lateHalf: the rest of the interpolated things (one-way patched to their real values) have
+// been switched over, so lists with a real and a halfway version use the real one.
+void rt_render_at(f32 t, s32 lateHalf) {
+    const f32 a = 2.0f - 2.0f * t;
+    if (sRtMtx == NULL) {
+        sRtMtx = malloc(RT_MAX_MTX * sizeof(Mtx));
+    }
+    if (sPerspectivePos != NULL) {
+        rt_blend(&sRtPersp, sPerspectiveMtx, sPerspectiveMid, a);
+        gSPMatrix(sPerspectivePos, VIRTUAL_TO_PHYSICAL(&sRtPersp), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+        if (sPerspectiveRestorePos != NULL) {
+            gSPMatrix(sPerspectiveRestorePos, VIRTUAL_TO_PHYSICAL(&sRtPersp), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+        }
+    }
+    Gfx *sky = NULL;
+    if (sRtSkyEntry >= 0 && sRtSkyNode != NULL) {
+        Vec3f pos, focus;
+        for (s32 k = 0; k < 3; k++) {
+            pos[k] = sRtSkyPos[0][k] + t * (sRtSkyPos[1][k] - sRtSkyPos[0][k]);
+            focus[k] = sRtSkyFocus[0][k] + t * (sRtSkyFocus[1][k] - sRtSkyFocus[0][k]);
+        }
+        sky = create_skybox_facing_camera(0, sRtSkyNode->background, sRtSkyFov, pos[0], pos[1], pos[2],
+                                          focus[0], focus[1], focus[2]);
+#ifdef SKYDBG
+        { extern void dbglog(const char *fmt, ...); static unsigned n; if (n++ % 500 == 0) dbglog("rt sky rebuilt %u (t %.2f, entry %d of %d)", n, t, sRtSkyEntry, gMtxTblSize); }
+#endif
+    }
+    for (s32 i = 0; i < gMtxTblSize; i++) {
+        Gfx *pos = gMtxTbl[i].pos;
+        void *m = gMtxTbl[i].mtx;
+        if (sRtMtx != NULL && i < RT_MAX_MTX && gMtxTbl[i].mtxMid != gMtxTbl[i].mtx) {
+            rt_blend(&sRtMtx[i], gMtxTbl[i].mtx, gMtxTbl[i].mtxMid, a);
+            m = &sRtMtx[i];
+        } else if (!lateHalf) {
+            m = gMtxTbl[i].mtxMid;
+        }
+        gSPMatrix(pos++, VIRTUAL_TO_PHYSICAL(m), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+        void *dl = lateHalf ? gMtxTbl[i].displayList : gMtxTbl[i].displayListMid;
+        if (i == sRtSkyEntry && sky != NULL) {
+            dl = sky;
+        }
+        gSPDisplayList(pos++, dl);
+    }
+    if (lateHalf && !sRtViewportDone && sViewportPos != NULL) {
+        Gfx *saved = gDisplayListHead;
+        gDisplayListHead = sViewportPos;
+        make_viewport_clip_rect(&sPrevViewport);
+        gSPViewport(gDisplayListHead, VIRTUAL_TO_PHYSICAL(&sPrevViewport));
+        gDisplayListHead = saved;
+        sRtViewportDone = true;
+    }
+}
 
 void mtx_patch_interpolated(void) {
     s32 i;
@@ -216,6 +311,10 @@ static void sky_emit(s32 restoreProj) {
     if ((u32) gMtxTblSize < sizeof(gMtxTbl) / sizeof(gMtxTbl[0])) {
         gMtxTbl[gMtxTblSize].pos = gDisplayListHead;
         gMtxTbl[gMtxTblSize].mtx = sSkyPending.transform;
+        gMtxTbl[gMtxTblSize].mtxMid = sSkyPending.transformInterpolated;
+        gMtxTbl[gMtxTblSize].displayListMid = sSkyPending.listInterpolated;
+        if (sSkyPending.listInterpolated == sRtSkyListMid)
+            sRtSkyEntry = gMtxTblSize;
         gMtxTbl[gMtxTblSize++].displayList = sSkyPending.list;
     }
     gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(sSkyPending.transformInterpolated),
@@ -260,6 +359,10 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
                 if ((u32) gMtxTblSize < sizeof(gMtxTbl) / sizeof(gMtxTbl[0])) {
                     gMtxTbl[gMtxTblSize].pos = gDisplayListHead;
                     gMtxTbl[gMtxTblSize].mtx = currList->transform;
+                    gMtxTbl[gMtxTblSize].mtxMid = currList->transformInterpolated;
+                    gMtxTbl[gMtxTblSize].displayListMid = currList->displayListInterpolated;
+                    if (currList->displayListInterpolated == sRtSkyListMid)
+                        sRtSkyEntry = gMtxTblSize;
                     gMtxTbl[gMtxTblSize++].displayList = currList->displayList;
                 }
                 gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(currList->transformInterpolated),
@@ -383,6 +486,7 @@ static void geo_process_perspective(struct GraphNodePerspective *node) {
 
             sPerspectivePos = gDisplayListHead;
             sPerspectiveMtx = mtx;
+            sPerspectiveMid = mtxInterpolated;
             sPerspectiveEmitted = mtxInterpolated;
             sPerspNorm = perspNorm;
             gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(mtxInterpolated),
@@ -758,10 +862,16 @@ static void geo_process_background(struct GraphNodeBackground *node) {
             gGlobalTimer != gLakituState.skipCameraInterpolationTimestamp) {
             interpolate_vectors(posInterpolated, node->prevCameraPos, gLakituState.pos);
             interpolate_vectors(focusInterpolated, node->prevCameraFocus, gLakituState.focus);
+            vec3f_copy(sRtSkyPos[0], node->prevCameraPos);
+            vec3f_copy(sRtSkyFocus[0], node->prevCameraFocus);
         } else {
             vec3f_copy(posInterpolated, gLakituState.pos);
             vec3f_copy(focusInterpolated, gLakituState.focus);
+            vec3f_copy(sRtSkyPos[0], gLakituState.pos);
+            vec3f_copy(sRtSkyFocus[0], gLakituState.focus);
         }
+        vec3f_copy(sRtSkyPos[1], gLakituState.pos);
+        vec3f_copy(sRtSkyFocus[1], gLakituState.focus);
         vec3f_copy(node->prevCameraPos, gLakituState.pos);
         vec3f_copy(node->prevCameraFocus, gLakituState.focus);
         node->prevCameraTimestamp = gGlobalTimer;
@@ -775,6 +885,13 @@ static void geo_process_background(struct GraphNodeBackground *node) {
         listInterpolated = node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node, NULL);
         vec3f_copy(gLakituState.pos, posCopy);
         vec3f_copy(gLakituState.focus, focusCopy);
+        if (configBenchRender && node->fnNode.func == (GraphNodeFunc) geo_skybox_main && listInterpolated != NULL) {
+            // Render-uncapped mode rebuilds it per frame (rt_render_at)
+            struct GraphNodeCamera *camNode = (struct GraphNodeCamera *) gCurGraphNodeRoot->views[0];
+            sRtSkyFov = ((struct GraphNodePerspective *) camNode->fnNode.node.parent)->fov;
+            sRtSkyNode = node;
+            sRtSkyListMid = (void *) VIRTUAL_TO_PHYSICAL(listInterpolated);
+        }
     }
 
     if (list != NULL && configOptSkyLast && gCurGraphNodeMasterList != NULL

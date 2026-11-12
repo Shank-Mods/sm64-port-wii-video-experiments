@@ -80,6 +80,8 @@ bool bench_wanted(void);
 void bench_init(void);
 void bench_frame_begin(void);
 void bench_tick_done(void);
+void bench_frame_continue(void); // render-uncapped: a frame without a game tick
+double bench_tb_hz(void);         // calibrated timebase rate
 
 // Called from the GX renderer
 bool bench_split_this_frame(void);     // run the GPU after the CPU has finished the frame

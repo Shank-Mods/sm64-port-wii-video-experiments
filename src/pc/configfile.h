@@ -52,6 +52,7 @@ extern bool         configOptNativeTex;  // N64 textures converted straight to n
 extern bool         configOptTexHash;    // texture hashes computed once per frame, not per switch
 extern bool         configOptStateCache; // skip reloading textures that are already loaded
 extern bool         configOptTileCull;   // tiled modes: skip draws that miss a tile
+extern bool         configBenchRender;   // bench_uncapped render: 30 Hz logic, frames uncapped and interpolated
 extern bool         configOptSkyLast;    // skybox drawn after the opaque level, only where it shows
 extern bool         configOptHwFog;      // CPU-path fog in GX's fog unit (no extra TEV stage)
 extern bool         configOptTriBin;     // tiled modes: split draws into per-tile runs of triangles

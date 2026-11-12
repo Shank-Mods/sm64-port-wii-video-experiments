@@ -136,6 +136,7 @@ static bool frame_split;
 static bool frame_demo;
 static bool frame_gpu_valid;
 static bool frame_spilled;
+static bool frame_ticked; // a game logic tick ran in this frame
 static uint32_t frame_gpu_total;
 static uint32_t frame_gpu[BENCH_GPU_COUNT];
 
@@ -149,6 +150,7 @@ static uint32_t win_gpu_frames;
 static uint64_t win_gpu_total;
 static uint64_t win_gpu[BENCH_GPU_COUNT];
 static uint32_t win_vi_start, win_shown_start;
+static uint32_t win_ticks;
 
 struct Shown {
     bool valid;
@@ -156,6 +158,7 @@ struct Shown {
     double cat_ms[BENCH_CPU_COUNT];
     bool gpu_valid;      // from split frames in this window
     double gpu_ms, gpu_task_ms[BENCH_GPU_COUNT];
+    double tick_hz;      // game logic ticks per second
 };
 static struct Shown shown;
 static struct Shown last_split; // last window that had split frames
@@ -177,6 +180,7 @@ struct DemoStat {
     uint64_t gpu[BENCH_GPU_COUNT];
     uint32_t spilled;
     uint32_t ft_first; // index into pass_ft
+    uint32_t ticks;    // game logic ticks run during these frames
 };
 
 static bool demo_active;
@@ -336,6 +340,7 @@ static void finish_pass(void) {
         all.gpu_frames += s->gpu_frames;
         all.gpu_total += s->gpu_total;
         all.spilled += s->spilled;
+        all.ticks += s->ticks;
         if (s->worst > all.worst)
             all.worst = s->worst;
         for (int i = 0; i < BENCH_CPU_COUNT; i++)
@@ -371,11 +376,14 @@ static void finish_pass(void) {
     fprintf(f, "build:  %s %s (%s)\n", __DATE__, __TIME__, CONSOLE_NAME);
     fprintf(f, "video:  %s, %.3f Hz field rate\n", video_desc(), field_hz);
     fprintf(f, "mode:   %s\n", configBenchUncapped ? "uncapped (one game tick per frame, no vsync)"
-                                                  : "capped (presented at vsync)");
+                                : configBenchRender ? "render uncapped (30 Hz game logic, frames interpolated, no vsync)"
+                                                    : "capped (presented at vsync)");
     fprintf(f, "clock:  timebase %.3f MHz -> bus %.1f MHz (x%.3f of stock)%s; CPU est. %.0f MHz\n",
             tb_hz / 1e6, tb_hz * 4.0 / 1e6, tb_hz / STOCK_TB_HZ,
             tb_calibrated ? "" : " [not yet calibrated]", cpu_mhz);
     fprintf(f, "\n%-9s %7s %9s %8s %9s %9s", "demo", "frames", "avg fps", "1% low", "ms/frame", "worst ms");
+    if (configBenchRender)
+        fprintf(f, " %8s %8s", "logic Hz", "fr/tick");
     if (pass_split)
         fprintf(f, " %8s %8s", "cpu ms", "gpu ms");
     fprintf(f, "\n");
@@ -395,6 +403,9 @@ static void finish_pass(void) {
         double dlow = d < pass_ndemo ? low_fps(pass_ft + s->ft_first, s->frames) : low;
         fprintf(f, "%-9s %7u %9.2f %8.2f %9.3f %9.2f", name, (unsigned)s->frames, dfps, dlow,
                 ms(s->sum) / s->frames, ms(s->worst));
+        if (configBenchRender)
+            fprintf(f, " %8.2f %8.2f", s->ticks / (ms(s->sum) / 1000.0),
+                    s->ticks > 0 ? (double)s->frames / s->ticks : 0.0);
         if (pass_split && s->gpu_frames > 0) {
             double cpu = (ms(s->sum) - ms(s->cat[BENCH_GPUWAIT])) / s->frames;
             fprintf(f, " %8.3f %8.3f", cpu, ms(s->gpu_total) / s->gpu_frames);
@@ -463,9 +474,21 @@ void bench_tick_done(void) {
     else if (!active && demo_active)
         demo_end();
     demo_active = active;
+    frame_ticked = true;
     frame_demo = active && pass_running && cur_demo != NULL;
     if (frame_demo && gCurrCourseNum != COURSE_NONE)
         cur_demo->level = gCurrLevelNum;
+}
+
+// Render-uncapped mode: a frame drawn between game ticks still belongs to the running demo
+void bench_frame_continue(void) {
+    if (!gBenchOn)
+        return;
+    frame_demo = demo_active && pass_running && cur_demo != NULL;
+}
+
+double bench_tb_hz(void) {
+    return tb_hz;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -523,7 +546,8 @@ static void build_overlay_text(void) {
 
     char head[64];
     if (!configBenchmark) {
-        snprintf(head, sizeof(head), "PLAY %s%s", configBenchUncapped ? "UNCAPPED" : (config60Fps ? "60FPS" : "30FPS"),
+        snprintf(head, sizeof(head), "PLAY %s%s", configBenchUncapped ? "UNCAPPED" : configBenchRender ? "RENDER"
+                                                  : (config60Fps ? "60FPS" : "30FPS"),
                  frame_split ? " \4SPLIT" : "");
     } else if (pass_running) {
         const char *name = cur_demo != NULL ? level_name(cur_demo->level) : NULL;
@@ -541,7 +565,10 @@ static void build_overlay_text(void) {
     }
 
     ov_line("FPS \2%6.1f\1  frame %5.2fms  max %5.1f", s->fps, s->frame_ms, s->max_ms);
-    if (!configBenchUncapped) {
+    if (configBenchRender)
+        ov_line("\4logic %5.2f Hz  %5.2f frames/tick", s->tick_hz,
+                s->tick_hz > 0 ? s->fps / s->tick_hz : 0.0);
+    else if (!configBenchUncapped) {
         // At vsync most of the frame can be waiting; what's left is the real load
         double busy = s->frame_ms - s->cat_ms[BENCH_PRESENT];
         ov_line("\4busy %5.2fms  %3.0f%% of frame  (~%.0f fps)", busy,
@@ -659,6 +686,7 @@ static void close_window(uint32_t now) {
         for (int i = 0; i < BENCH_CPU_COUNT; i++)
             s->cat_ms[i] = ms(win_cat[i]) / win_frames;
         s->vi_hz = dt > 0 ? (vi_n - win_vi_start) / dt : 0;
+        s->tick_hz = dt > 0 ? win_ticks / dt : 0;
         s->shown_fps = dt > 0 ? (sh_n - win_shown_start) / dt : 0;
         s->gpu_valid = win_gpu_frames > win_frames / 2;
         if (s->gpu_valid) {
@@ -672,6 +700,7 @@ static void close_window(uint32_t now) {
     win_no++;
     win_start = now;
     win_frames = 0;
+    win_ticks = 0;
     win_sum = 0;
     win_max = 0;
     memset(win_cat, 0, sizeof(win_cat));
@@ -685,6 +714,8 @@ static void close_window(uint32_t now) {
 
 static void record_frame(uint32_t ft, uint32_t now) {
     win_frames++;
+    if (frame_ticked)
+        win_ticks++;
     win_sum += ft;
     if (ft > win_max)
         win_max = ft;
@@ -700,6 +731,8 @@ static void record_frame(uint32_t ft, uint32_t now) {
     if (frame_demo && cur_demo != NULL) {
         struct DemoStat *d = cur_demo;
         d->frames++;
+        if (frame_ticked)
+            d->ticks++;
         d->sum += ft;
         if (ft > d->worst)
             d->worst = ft;
@@ -747,6 +780,7 @@ void bench_frame_begin(void) {
     frame_gpu_valid = false;
     frame_spilled = false;
     frame_demo = false;
+    frame_ticked = false;
     if (configBenchmark)
         frame_split = split_for_pass(pass_running ? pass_no : pass_no + 1);
     else

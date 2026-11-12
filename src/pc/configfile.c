@@ -125,6 +125,7 @@ bool configOptNativeTex          = true;
 bool configOptTexHash            = true;
 bool configOptStateCache         = true;
 bool configOptTileCull           = true;
+bool configBenchRender           = false; // bench_uncapped render: 30 Hz logic, frames drawn as fast as possible
 bool configOptSkyLast            = true;
 bool configOptHwFog              = true;
 bool configOptTriBin             = true;
@@ -486,6 +487,14 @@ void configfile_load(const char *filename) {
                 else {
                     switch (option->type) {
                         case CONFIG_TYPE_BOOL:
+                            if (option->boolValue == &configBenchUncapped) {
+                                // bench_uncapped takes a third value, "render"
+                                configBenchRender = strcmp(tokens[1], "render") == 0;
+                                if (configBenchRender) {
+                                    configBenchUncapped = false;
+                                    break;
+                                }
+                            }
                             if (strcmp(tokens[1], "true") == 0)
                                 *option->boolValue = true;
                             else if (strcmp(tokens[1], "false") == 0)
@@ -600,7 +609,10 @@ void configfile_save(const char *filename) {
 
         switch (option->type) {
             case CONFIG_TYPE_BOOL:
-                fprintf(file, "%s %s\n", option->name, *option->boolValue ? "true" : "false");
+                if (option->boolValue == &configBenchUncapped && configBenchRender)
+                    fprintf(file, "%s render\n", option->name);
+                else
+                    fprintf(file, "%s %s\n", option->name, *option->boolValue ? "true" : "false");
                 break;
             case CONFIG_TYPE_UINT:
                 fprintf(file, "%s %u\n", option->name, *option->uintValue);
