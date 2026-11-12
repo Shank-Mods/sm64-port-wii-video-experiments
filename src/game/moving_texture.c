@@ -1,3 +1,4 @@
+#include "pc/configfile.h"
 #include <ultra64.h>
 
 #include "sm64.h"
@@ -645,6 +646,9 @@ Gfx *geo_movtex_draw_water_regions(s32 callContext, struct GraphNode *node, UNUS
         }
         asGenerated = (struct GraphNodeGenerated *) node;
         if (asGenerated->parameter == JRB_MOVTEX_INTIAL_MIST) {
+            if (!configJrbMist) { // config: skip the mist layer (one less translucent layer)
+                return NULL;
+            }
             if (gLakituState.goalPos[1] < 1024.0) { // if camera under water
                 return NULL;
             }

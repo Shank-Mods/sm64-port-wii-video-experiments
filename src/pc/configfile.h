@@ -53,6 +53,9 @@ extern bool         configOptTexHash;    // texture hashes computed once per fra
 extern bool         configOptStateCache; // skip reloading textures that are already loaded
 extern bool         configOptTileCull;   // tiled modes: skip draws that miss a tile
 extern bool         configOptSkyLast;    // skybox drawn after the opaque level, only where it shows
+extern bool         configOptHwFog;      // CPU-path fog in GX's fog unit (no extra TEV stage)
+extern bool         configOptTriBin;     // tiled modes: split draws into per-tile runs of triangles
+extern bool         configJrbMist;       // Jolly Roger Bay's mist layer (visual; false skips it)
 extern bool         configOptMem2Gpu;    // Wii: GPU-only buffers (textures, display lists) in MEM2
 extern bool         configOptGpuTnl;     // GPU vertex transform, lighting and fog
 

@@ -101,7 +101,10 @@ differences are sub-pixel rounding only.
 | `opt_tile_cull` | tiled modes: draws that miss a tile are skipped on that tile |
 | `opt_mem2_gpu` | textures and the tiled display list in MEM2 (16 MB heap) |
 | `opt_sky_last` | skybox drawn after the opaque level (before cut-outs and translucent layers), depth tested at the far plane, so the GPU only fills the sky where it shows instead of painting the whole screen first |
-| `opt_gpu_tnl` | GPU transform, lighting, texgen and fog: N64 vertices go to GX by index with hardware matrices; the CPU path remains for draws GX can't express |
+| `opt_hw_fog` | CPU-path fog done by GX's fog unit from screen depth, instead of an extra colour channel and TEV stage per fogged pixel |
+| `opt_tri_bin` | tiled modes: a draw spanning several tiles is cut into runs of triangles by the tiles they touch, so each tile only processes its own geometry (order kept) |
+| `jrb_mist` | `false` skips Jolly Roger Bay's mist layer (a visual change; default `true`) |
+| `opt_gpu_tnl` | GPU transform, lighting, texgen and fog: N64 vertices go to GX by index with hardware matrices; the CPU path remains for draws GX can't express. Default `false`: slower on hardware in the tiled modes |
 
 Also built in (no switch): `-O3 -ffast-math` for the renderer, `-O3 -funroll-loops` and hoisted
 branches for the audio mixer.

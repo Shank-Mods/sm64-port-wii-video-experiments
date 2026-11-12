@@ -126,8 +126,11 @@ bool configOptTexHash            = true;
 bool configOptStateCache         = true;
 bool configOptTileCull           = true;
 bool configOptSkyLast            = true;
+bool configOptHwFog              = true;
+bool configOptTriBin             = true;
+bool configJrbMist               = true;
 bool configOptMem2Gpu            = true;
-bool configOptGpuTnl             = true;
+bool configOptGpuTnl             = false; // slower on hardware in the tiled modes (user benchmarks)
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
 bool configInvertCamera          = false; // Invert camera controls
 bool configRumble                = true;  // Shindou controller rumble
@@ -211,6 +214,9 @@ static const struct ConfigOption options[] = {
     {.name = "opt_state_cache", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptStateCache},
     {.name = "opt_tile_cull",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTileCull},
     {.name = "opt_sky_last",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptSkyLast},
+    {.name = "opt_hw_fog",     .type = CONFIG_TYPE_BOOL, .boolValue = &configOptHwFog},
+    {.name = "opt_tri_bin",    .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTriBin},
+    {.name = "jrb_mist",       .type = CONFIG_TYPE_BOOL, .boolValue = &configJrbMist},
     {.name = "opt_mem2_gpu",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptMem2Gpu},
     {.name = "opt_gpu_tnl",    .type = CONFIG_TYPE_BOOL, .boolValue = &configOptGpuTnl},
     {.name = "antialias",      .type = CONFIG_TYPE_BOOL, .boolValue = &configAntialias},

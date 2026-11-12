@@ -24,6 +24,8 @@ bool gfx_gx_upload_texture_n64(uint8_t fmt, uint8_t siz, const uint8_t *addr, ui
                                uint32_t line_size_bytes, const uint8_t *palette);
 // gfx_gx.c: skybox drawn last (opt_sky_last): pinned to the far plane, depth tested
 void gfx_gx_set_sky(bool on);
+// gfx_gx.c: CPU-path fog in GX's fog unit (opt_hw_fog): N64 fog factor = f0 + f1 / w
+void gfx_gx_set_cpu_fog(bool on, float f0, float f1, const uint8_t rgb[3]);
 #endif
 
 // Tagged G_NOOP around the held-back skybox (rendering_graph_node.c, opt_sky_last)
@@ -1462,6 +1464,30 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
     if (tnl_buf_n > 0)
         tnl_flush(); // keep the draw order
     tnl_stat_sw++;
+
+#ifdef TARGET_GX
+    if (configOptHwFog) {
+        // N64 fog factor per vertex: z/w * mul + offset, with z/w = -p22/sc + p32/w under a
+        // perspective projection, so it's f0 + f1/w (fog in GX's fog unit, see gfx_gx.c)
+        static struct { bool on; float f0, f1; uint8_t col[3]; } sent;
+        bool on = use_fog && configFog && (rsp.geometry_mode & G_FOG)
+                  && rsp.P_matrix[2][3] != 0.0f && rsp.P_matrix[3][3] == 0.0f;
+        float f0 = 0.0f, f1 = 0.0f;
+        if (on) {
+            const float sc = -rsp.P_matrix[2][3];
+            f0 = rsp.fog_mul * (-rsp.P_matrix[2][2] / sc) + rsp.fog_offset;
+            f1 = rsp.fog_mul * rsp.P_matrix[3][2];
+        }
+        if (sent.on != on || (on && (sent.f0 != f0 || sent.f1 != f1 || memcmp(sent.col, &rdp.fog_color, 3) != 0))) {
+            gfx_flush();
+            sent.on = on;
+            sent.f0 = f0;
+            sent.f1 = f1;
+            memcpy(sent.col, &rdp.fog_color, 3);
+            gfx_gx_set_cpu_fog(on, f0, f1, sent.col);
+        }
+    }
+#endif
 
     // GX layout: x y z w, [u v], [fog: packed RGBA8 = fog rgb + factor], one packed RGBA8 per
     // combiner input. Colours stay bytes the whole way (they used to go byte -> float/255 ->

@@ -121,6 +121,13 @@ static Mtx44 gx_ortho_mtx;       // 2D/HUD: pass-through of already-NDC coords
 static Mtx44 gx_sky_mtx;         // held-back skybox (opt_sky_last): pass-through x/y, depth just short of the far plane
 static bool sky_on;
 
+// opt_hw_fog: CPU-path fog in GX's fog unit instead of an extra colour channel and TEV stage.
+// gfx_pc gives the N64 fog factor as f0 + f1 / w; the draw turns it into a range in screen depth.
+static struct { bool on; float f0, f1; uint8_t col[3]; } cpu_fog;
+static bool fog_cache_valid;      // fog_cache is what GX has (cleared by anything else setting fog)
+static struct { bool on; float start, end; uint8_t col[3]; } fog_cache;
+static void gx_apply_cpu_fog(bool want);
+
 static bool gfx_gx_z_is_from_0_to_1(void)
 {
     return true;
@@ -416,7 +423,7 @@ static int update_tev_combiner(struct ShaderProgram *prg)
 static void update_tev(struct ShaderProgram *prg)
 {
     int num_chans = prg->cc_features.num_inputs > 2 ? 2 : prg->cc_features.num_inputs;
-    bool fog = prg->cc_features.opt_fog && num_chans < 2;
+    bool fog = prg->cc_features.opt_fog && num_chans < 2 && !configOptHwFog;
 
     int stages = update_tev_combiner(prg);
 
@@ -480,7 +487,7 @@ static void update_vtx_desc(struct ShaderProgram *prg)
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0 + i, GX_CLR_RGBA, GX_RGBA8, 0);
     }
     // extra colour channel carrying the fog colour (rgb) + fog factor (a)
-    if (prg->cc_features.opt_fog && num_chans < 2)
+    if (prg->cc_features.opt_fog && num_chans < 2 && !configOptHwFog)
     {
         GX_SetVtxDesc(GX_VA_CLR0 + num_chans, GX_DIRECT);
         GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0 + num_chans, GX_CLR_RGBA, GX_RGBA8, 0);
@@ -1129,11 +1136,9 @@ static void hr_state_changed(void)
     hr_begin_seg();
 }
 
-// Bounds of a batch in frame pixels (false = can't be bounded, or it covers every tile anyway)
-static bool hr_draw_bounds(const float *v, int stride, size_t n, bool is_2d, int16_t bb[4])
+// Bounds of a batch in frame pixels (false = can't be bounded: a vertex behind the eye)
+static bool hr_draw_bounds_raw(const float *v, int stride, size_t n, bool is_2d, int16_t bb[4])
 {
-    if (hr_tiles_x * hr_tiles_y < 2 || hr_nseg >= HIRES_MAX_SEGS - 4 || hr_pos + 64 * 1024 > HIRES_DL_SIZE)
-        return false;
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
     for (size_t i = 0; i < n; i++, v += stride)
     {
@@ -1175,6 +1180,16 @@ static bool hr_draw_bounds(const float *v, int stride, size_t n, bool is_2d, int
     bb[1] = (int16_t)py0;
     bb[2] = (int16_t)(px1 + 0.999f);
     bb[3] = (int16_t)(py1 + 0.999f);
+    return true;
+}
+
+// Bounds of a batch in frame pixels (false = can't be bounded, or it covers every tile anyway)
+static bool hr_draw_bounds(const float *v, int stride, size_t n, bool is_2d, int16_t bb[4])
+{
+    if (hr_tiles_x * hr_tiles_y < 2 || hr_nseg >= HIRES_MAX_SEGS - 4 || hr_pos + 64 * 1024 > HIRES_DL_SIZE)
+        return false;
+    if (!hr_draw_bounds_raw(v, stride, n, is_2d, bb))
+        return false;
     // Worth a segment only if it misses at least one tile
     const int tx0 = bb[0] / hr_tile_w, tx1 = (bb[2] - 1) / hr_tile_w;
     const int ty0 = bb[1] / hr_tile_h, ty1 = (bb[3] - 1) / hr_tile_h;
@@ -1309,6 +1324,160 @@ static uint8_t float_to_u8(float x)
     return MAX(0, MIN(255, x * 255));
 }
 
+struct GxVtxEmit {
+    uint8_t num_floats, num_inputs;
+    bool is_2d, has_tex, has_fog, emit_fog, fixed;
+};
+
+// One GX_TRIANGLES batch from gfx_pc's vertex buffer
+static void gx_emit_tris(const float *p, size_t ntris, const struct GxVtxEmit *e)
+{
+    GX_Begin(GX_TRIANGLES, GX_VTXFMT0, 3 * ntris);
+    for (size_t i = 0; i < 3 * ntris; i++, p += e->num_floats)
+    {
+        if (e->is_2d)
+            GX_Position3f32(p[0], p[1], p[2]);
+        else
+            GX_Position3f32(p[0], p[1], -p[3]);
+
+        int vo = 4;
+        float s = 0.0f, t = 0.0f;
+        if (e->has_tex)
+        {
+            s = p[4];
+            t = p[5];
+            vo = 6;
+        }
+        uint32_t fogc = 0;
+        if (e->has_fog)
+        {
+            memcpy(&fogc, &p[vo], 4); // packed fog rgb + factor
+            vo++;
+        }
+        if (e->fixed)
+        {
+            // Fixed format: always two colours and a texcoord
+            uint32_t col[2] = { 0x000000FF, 0x000000FF };
+            int ci = 0;
+            for (int j = 0; j < e->num_inputs && ci < 2; j++)
+                memcpy(&col[ci++], &p[vo + j], 4);
+            if (e->emit_fog && ci < 2)
+                col[ci] = fogc;
+            GX_Color1u32(col[0]);
+            GX_Color1u32(col[1]);
+            GX_TexCoord2f32(s, t);
+            continue;
+        }
+        for (int j = 0; j < e->num_inputs && j < 2; j++)
+        {
+            uint32_t c;
+            memcpy(&c, &p[vo + j], 4);
+            GX_Color1u32(c);
+        }
+        if (e->emit_fog)
+            GX_Color1u32(fogc);
+        if (e->has_tex)
+            GX_TexCoord2f32(s, t);
+    }
+    GX_End();
+}
+
+// Tile range one triangle touches (tx0, tx1, ty0, ty1 packed 4 bits each) and its bounds
+#define BIN_MAX_RUNS 16
+#define BIN_MIN_RUN 4 // shorter runs are merged into their neighbour
+static uint16_t hr_tri_tiles(const float *v, int stride, bool is_2d, int16_t bb[4])
+{
+    const uint16_t all = (uint16_t)((hr_tiles_x - 1) << 4 | (hr_tiles_y - 1) << 12);
+    if (!hr_draw_bounds_raw(v, stride, 3, is_2d, bb))
+    {
+        bb[0] = 0;
+        bb[1] = 0;
+        bb[2] = (int16_t)(hr_tiles_x * hr_tile_w);
+        bb[3] = (int16_t)(hr_tiles_y * hr_tile_h);
+        return all;
+    }
+    if (bb[2] <= bb[0])
+        return 0xFFFF; // off screen
+    const int tx0 = bb[0] / hr_tile_w, tx1 = (bb[2] - 1) / hr_tile_w;
+    const int ty0 = bb[1] / hr_tile_h, ty1 = (bb[3] - 1) / hr_tile_h;
+    return (uint16_t)(tx0 | tx1 << 4 | ty0 << 8 | ty1 << 12);
+}
+
+static uint16_t bin_union(uint16_t a, uint16_t b)
+{
+    if (a == 0xFFFF) return b;
+    if (b == 0xFFFF) return a;
+    const int tx0 = MIN(a & 15, b & 15), tx1 = MAX(a >> 4 & 15, b >> 4 & 15);
+    const int ty0 = MIN(a >> 8 & 15, b >> 8 & 15), ty1 = MAX(a >> 12 & 15, b >> 12 & 15);
+    return (uint16_t)(tx0 | tx1 << 4 | ty0 << 8 | ty1 << 12);
+}
+
+static void bb_union(int16_t d[4], const int16_t s[4])
+{
+    if (s[2] <= s[0]) return;
+    if (d[2] <= d[0]) { memcpy(d, s, 4 * sizeof(int16_t)); return; }
+    d[0] = MIN(d[0], s[0]); d[1] = MIN(d[1], s[1]);
+    d[2] = MAX(d[2], s[2]); d[3] = MAX(d[3], s[3]);
+}
+
+// Emits a draw as runs of triangles by the tiles they touch. false: not worth it (one run) and
+// nothing was emitted
+static bool hr_bin_draw(const float *buf, size_t ntris, const struct GxVtxEmit *e)
+{
+    struct { uint16_t key; uint16_t first, n; int16_t bb[4]; } run[BIN_MAX_RUNS];
+    int nrun = 0;
+    const int stride = e->num_floats;
+    for (size_t t = 0; t < ntris; t++)
+    {
+        int16_t bb[4];
+        const uint16_t k = hr_tri_tiles(buf + t * 3 * stride, stride, e->is_2d, bb);
+        if (nrun > 0 && (run[nrun - 1].key == k || k == 0xFFFF))
+        {
+            run[nrun - 1].n++;
+            bb_union(run[nrun - 1].bb, bb);
+            continue;
+        }
+        if (nrun > 0 && run[nrun - 1].n < BIN_MIN_RUN)
+        {
+            // Too short to be worth a segment: widen the previous run instead
+            run[nrun - 1].key = bin_union(run[nrun - 1].key, k);
+            run[nrun - 1].n++;
+            bb_union(run[nrun - 1].bb, bb);
+            if (nrun > 1 && run[nrun - 2].key == run[nrun - 1].key)
+            {
+                run[nrun - 2].n += run[nrun - 1].n;
+                bb_union(run[nrun - 2].bb, run[nrun - 1].bb);
+                nrun--;
+            }
+            continue;
+        }
+        if (nrun == BIN_MAX_RUNS)
+            return false; // too fragmented
+        run[nrun].key = k;
+        run[nrun].first = (uint16_t)t;
+        run[nrun].n = 1;
+        memcpy(run[nrun].bb, bb, sizeof(bb));
+        if (k == 0xFFFF)
+            run[nrun].bb[0] = run[nrun].bb[2] = 0;
+        nrun++;
+    }
+    if (nrun < 2 || hr_nseg + 2 * nrun >= HIRES_MAX_SEGS - 4 || hr_pos + 64 * 1024 > HIRES_DL_SIZE)
+        return false;
+#ifdef SKYDBG
+    { static unsigned nd, nr; nd++; nr += nrun; if (nd % 2000 == 0) dbglog("tri bin: %u draws split, %u runs", nd, nr); }
+#endif
+    for (int r = 0; r < nrun; r++)
+    {
+        if (!hr_split_before_draw())
+            return true; // overflowed: the rest of the frame is discarded anyway
+        gx_emit_tris(buf + (size_t)run[r].first * 3 * stride, run[r].n, e);
+        if (run[r].bb[2] <= run[r].bb[0])
+            run[r].bb[0] = run[r].bb[1] = run[r].bb[2] = run[r].bb[3] = 0; // off screen
+        hr_split_after_draw(run[r].bb);
+    }
+    return true;
+}
+
 static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, size_t buf_vbo_num_tris)
 {
     if (tnl_active)
@@ -1357,6 +1526,20 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     if (hr_recording)
         hr_seg_drawn = true;
 
+    if (configOptHwFog)
+        gx_apply_cpu_fog(hasFog && !is_2d);
+
+    struct GxVtxEmit e = {
+        .num_floats = num_floats, .num_inputs = num_inputs, .is_2d = is_2d, .has_tex = hasTex,
+        .has_fog = hasFog, .emit_fog = hasFog && num_inputs < 2 && !configOptHwFog, .fixed = hr_enabled,
+    };
+
+    // opt_tri_bin: a draw spanning several tiles is cut into runs of triangles by the tiles they
+    // touch, each run a segment the replay skips on the tiles it misses (order kept)
+    if (hr_recording && configOptTriBin && configOptTileCull && !hr_overflow && buf_vbo_num_tris >= 4
+        && hr_tiles_x * hr_tiles_y > 1 && hr_bin_draw(buf_vbo, buf_vbo_num_tris, &e))
+        return;
+
     // opt_tile_cull: a draw that misses some of the tiles gets a segment of its own, which the
     // replay skips on the tiles it misses
     int16_t bb[4];
@@ -1364,58 +1547,7 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
                        && hr_draw_bounds(buf_vbo, num_floats, 3 * buf_vbo_num_tris, is_2d, bb)
                        && hr_split_before_draw();
 
-    GX_Begin(GX_TRIANGLES, GX_VTXFMT0, 3 * buf_vbo_num_tris);
-    {
-        const bool emit_fog = hasFog && num_inputs < 2;
-        const float *p = buf_vbo;
-        for (size_t i = 0; i < 3 * buf_vbo_num_tris; i++, p += num_floats)
-        {
-            if (is_2d)
-                GX_Position3f32(p[0], p[1], p[2]);
-            else
-                GX_Position3f32(p[0], p[1], -p[3]);
-
-            int vo = 4;
-            float s = 0.0f, t = 0.0f;
-            if (hasTex)
-            {
-                s = p[4];
-                t = p[5];
-                vo = 6;
-            }
-            uint32_t fogc = 0;
-            if (hasFog)
-            {
-                memcpy(&fogc, &p[vo], 4); // packed fog rgb + factor
-                vo++;
-            }
-            if (hr_enabled)
-            {
-                // Fixed format: always two colours and a texcoord
-                uint32_t col[2] = { 0x000000FF, 0x000000FF };
-                int ci = 0;
-                for (int j = 0; j < num_inputs && ci < 2; j++)
-                    memcpy(&col[ci++], &p[vo + j], 4);
-                if (emit_fog && ci < 2)
-                    col[ci] = fogc;
-                GX_Color1u32(col[0]);
-                GX_Color1u32(col[1]);
-                GX_TexCoord2f32(s, t);
-                continue;
-            }
-            for (int j = 0; j < num_inputs && j < 2; j++)
-            {
-                uint32_t c;
-                memcpy(&c, &p[vo + j], 4);
-                GX_Color1u32(c);
-            }
-            if (emit_fog)
-                GX_Color1u32(fogc);
-            if (hasTex)
-                GX_TexCoord2f32(s, t);
-        }
-    }
-    GX_End();
+    gx_emit_tris(buf_vbo, buf_vbo_num_tris, &e);
     (void)hasAlpha;
 
     if (split)
@@ -1436,6 +1568,52 @@ float gfx_gx_tnl_near(void) { return tnl_near; }
 float gfx_gx_tnl_far(void) { return tnl_far; }
 
 // Index of a projection in this frame's table (tiled modes), adding it if new
+void gfx_gx_set_cpu_fog(bool on, float f0, float f1, const uint8_t rgb[3])
+{
+    cpu_fog.on = on;
+    cpu_fog.f0 = f0;
+    cpu_fog.f1 = f1;
+    memcpy(cpu_fog.col, rgb, 3);
+}
+
+// CPU-path draws: GX fog matching the N64's per-vertex fog (opt_hw_fog)
+static void gx_apply_cpu_fog(bool want)
+{
+    bool on = false;
+    float start = 0.0f, end = 1.0f;
+    if (want && cpu_fog.on)
+    {
+        // CPU-path depth: d = 1 + (m22 * -w + m23) / w = D0 + D1 / w; fog = f0 + f1 / w = A + B d
+        const float D0 = 1.0f - gx_perspective_mtx[2][2], D1 = gx_perspective_mtx[2][3];
+        if (fabsf(D1) > 1e-12f)
+        {
+            const float B = cpu_fog.f1 / D1, A = cpu_fog.f0 - cpu_fog.f1 * D0 / D1;
+            if (fabsf(B) > 1e-9f)
+            {
+                on = true;
+                start = -A / B;
+                end = start + 255.0f / B;
+            }
+        }
+    }
+#ifdef SKYDBG
+    { static unsigned nf, nall; nall++; if (on && nf++ % 2000 == 0) dbglog("hw fog: %u fogged of %u CPU draws (start %.4f end %.4f)", nf, nall, start, end); }
+#endif
+    if (fog_cache_valid && fog_cache.on == on
+        && (!on || (fog_cache.start == start && fog_cache.end == end && memcmp(fog_cache.col, cpu_fog.col, 3) == 0)))
+        return;
+    GXColor c = { cpu_fog.col[0], cpu_fog.col[1], cpu_fog.col[2], 255 };
+    if (on)
+        GX_SetFog(GX_FOG_ORTHO_LIN, start, end, 0.0f, 1.0f, c);
+    else
+        GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, c);
+    fog_cache_valid = true;
+    fog_cache.on = on;
+    fog_cache.start = start;
+    fog_cache.end = end;
+    memcpy(fog_cache.col, cpu_fog.col, 3);
+}
+
 void gfx_gx_set_sky(bool on)
 {
 #ifdef SKYDBG
@@ -1655,6 +1833,7 @@ static void tnl_apply_texmtx(const struct GxTnlState *st)
 
 static void tnl_apply_fog(const struct GxTnlState *st)
 {
+    fog_cache_valid = false;
     GXColor c = { st->fog_col[0], st->fog_col[1], st->fog_col[2], 255 };
     if (st->fog)
         GX_SetFog(GX_FOG_ORTHO_LIN, st->fog_start, st->fog_end, 0.0f, 1.0f, c);
@@ -1689,6 +1868,7 @@ static void gx_tnl_leave(void)
     tnl_valid = false;
     GX_SetCullMode(GX_CULL_NONE);
     GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, (GXColor){ 0, 0, 0, 255 });
+    fog_cache_valid = false;
     if (hr_enabled)
         gx_set_fixed_vtx_desc(); // vertex format and texgen the tiled replay expects
     if (shader_program_pool_size > 0)
@@ -1781,6 +1961,7 @@ static void gx_bench_draw_overlay(void)
         gx_tnl_leave();
     GX_SetCullMode(GX_CULL_NONE);
     GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, (GXColor){ 0, 0, 0, 255 });
+    fog_cache_valid = false;
     if (hr_enabled)
         gx_set_fixed_vtx_desc();
 
@@ -2040,6 +2221,7 @@ static void gfx_gx_start_frame(void)
         tnl_valid = false;
         GX_SetCullMode(GX_CULL_NONE);
         GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, (GXColor){ 0, 0, 0, 255 });
+    fog_cache_valid = false;
         gx_set_fixed_vtx_desc();
         if (shader_program_pool_size > 0)
             gfx_gx_load_shader(&shader_program_pool[current_shader]);
