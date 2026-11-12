@@ -120,6 +120,13 @@ unsigned int configVideoMode     = VIDEO_MODE_720P; // 1280x720p output (takes p
 unsigned int configVideoMode     = VIDEO_MODE_1920X1020P; // GameCube: rendered at 1920x1020, top left shown as 480p
 #endif
 bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
+bool configOptPsVertex           = true;
+bool configOptNativeTex          = true;
+bool configOptTexHash            = true;
+bool configOptStateCache         = true;
+bool configOptTileCull           = true;
+bool configOptMem2Gpu            = true;
+bool configOptGpuTnl             = true;
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
 bool configInvertCamera          = false; // Invert camera controls
 bool configRumble                = true;  // Shindou controller rumble
@@ -197,6 +204,13 @@ static const struct ConfigOption options[] = {
     {.name = "hires_1280x240p", .type = CONFIG_TYPE_BOOL, .boolValue = &configHires1280},
     {.name = "video_mode",     .type = CONFIG_TYPE_VIDEOMODE, .uintValue = &configVideoMode},
     {.name = "crop_480p",      .type = CONFIG_TYPE_BOOL, .boolValue = &configCrop480},
+    {.name = "opt_ps_vertex",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptPsVertex},
+    {.name = "opt_native_tex", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptNativeTex},
+    {.name = "opt_tex_hash",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTexHash},
+    {.name = "opt_state_cache", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptStateCache},
+    {.name = "opt_tile_cull",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTileCull},
+    {.name = "opt_mem2_gpu",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptMem2Gpu},
+    {.name = "opt_gpu_tnl",    .type = CONFIG_TYPE_BOOL, .boolValue = &configOptGpuTnl},
     {.name = "antialias",      .type = CONFIG_TYPE_BOOL, .boolValue = &configAntialias},
     {.name = "invert_camera",  .type = CONFIG_TYPE_BOOL, .boolValue = &configInvertCamera},
     {.name = "rumble",         .type = CONFIG_TYPE_BOOL, .boolValue = &configRumble},

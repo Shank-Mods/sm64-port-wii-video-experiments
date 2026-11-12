@@ -854,6 +854,15 @@ $(BUILD_DIR)/%.o: $(BUILD_DIR)/%.c
 $(BUILD_DIR)/%.o: %.s
 	$(AS) $(ASFLAGS) -MD $(BUILD_DIR)/$*.d -o $@ $<
 
+ifeq ($(TARGET_GX),1)
+# wii-optimize: the renderer and the audio mixer's hot loops at -O3 (fast-math for the
+# renderer's float code; the game logic itself stays at -O2), and the paired-single
+# instructions in gfx_pc.c need the Gekko assembler mode
+$(BUILD_DIR)/src/pc/gfx/gfx_pc.o $(BUILD_DIR)/src/pc/gfx/gfx_gx.o: CFLAGS += -O3 -ffast-math
+$(BUILD_DIR)/src/pc/gfx/gfx_pc.o: CFLAGS += -Wa,-mgekko
+$(BUILD_DIR)/src/pc/mixer.o: CFLAGS += -O3 -funroll-loops
+endif
+
 ifeq ($(TARGET_N64),1)
 $(BUILD_DIR)/$(LD_SCRIPT): $(LD_SCRIPT)
 	$(CPP) $(VERSION_CFLAGS) -MMD -MP -MT $@ -MF $@.d -I include/ -I . -DBUILD_DIR=$(BUILD_DIR) -o $@ $<

@@ -86,6 +86,25 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 In capped mode the overlay's FPS is the presented rate; the **busy** line shows the time per
 frame excluding the vsync wait, and the frame rate that alone would allow.
 
+### Optimizations (`wii-optimize` branch)
+
+All on by default; each can be switched off in `sm64config.txt` (`opt_x false`) to measure what it
+is worth. Checked frame by frame in Dolphin against the unoptimized build (all video modes):
+differences are sub-pixel rounding only.
+
+| Option | What it does |
+|---|---|
+| `opt_ps_vertex` | CPU vertex transform and lighting with Broadway paired-single math; packed vertex buffer |
+| `opt_native_tex` | N64 textures converted straight to GX formats (RGB5A3, IA4, IA8) instead of RGBA8: 2-4x less texture memory and conversion |
+| `opt_tex_hash` | cheaper texture cache hashing, memoised per frame |
+| `opt_state_cache` | skips redundant texture loads and projection/viewport/scissor reloads in tiled replay |
+| `opt_tile_cull` | tiled modes: draws that miss a tile are skipped on that tile |
+| `opt_mem2_gpu` | textures and the tiled display list in MEM2 (16 MB heap) |
+| `opt_gpu_tnl` | GPU transform, lighting, texgen and fog: N64 vertices go to GX by index with hardware matrices; the CPU path remains for draws GX can't express |
+
+Also built in (no switch): `-O3 -ffast-math` for the renderer, `-O3 -funroll-loops` and hoisted
+branches for the audio mixer.
+
 ## GameCube build (`wii-720p` branch)
 
 `make TARGET_WII=0 TARGET_GAMECUBE=1` builds the same benchmark for the GameCube. The GameCube's

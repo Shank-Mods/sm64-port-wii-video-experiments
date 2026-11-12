@@ -743,29 +743,31 @@ void aEnvMixerImpl(uint8_t flags, ENVMIX_STATE state) {
         vol_wet = state[39];
     }
 
+    // Same arithmetic as before; the direction test and the aux test, which only depend on the
+    // channel and the flags, are made once instead of per sample
+    const int aux = (flags & A_AUX) != 0;
     do {
         for (c = 0; c < 2; c++) {
+            const int increasing = (rate[c] >> 16) > 0;
+            const int32_t tgt = target[c];
+            const int32_t rt = rate[c];
+            int32_t *vc = vols[c];
+            int16_t *dc = dry[c];
             for (i = 0; i < 8; i++) {
-                if ((rate[c] >> 16) > 0) {
-                    // Increasing volume
-                    if ((vols[c][i] >> 16) > target[c]) {
-                        vols[c][i] = target[c] << 16;
-                    }
-                } else {
-                    // Decreasing volume
-                    if ((vols[c][i] >> 16) < target[c]) {
-                        vols[c][i] = target[c] << 16;
-                    }
+                int32_t v = vc[i];
+                if (increasing ? ((v >> 16) > tgt) : ((v >> 16) < tgt)) {
+                    v = tgt << 16;
                 }
-                dry[c][i] = clamp16((dry[c][i] * 0x7fff + in[i] * (((vols[c][i] >> 16) * vol_dry + 0x4000) >> 15) + 0x4000) >> 15);
-                if (flags & A_AUX) {
-                    wet[c][i] = clamp16((wet[c][i] * 0x7fff + in[i] * (((vols[c][i] >> 16) * vol_wet + 0x4000) >> 15) + 0x4000) >> 15);
+                const int32_t v16 = v >> 16;
+                dc[i] = clamp16((dc[i] * 0x7fff + in[i] * ((v16 * vol_dry + 0x4000) >> 15) + 0x4000) >> 15);
+                if (aux) {
+                    wet[c][i] = clamp16((wet[c][i] * 0x7fff + in[i] * ((v16 * vol_wet + 0x4000) >> 15) + 0x4000) >> 15);
                 }
-                vols[c][i] = clamp32((int64_t)vols[c][i] * rate[c] >> 16);
+                vc[i] = clamp32((int64_t)v * rt >> 16);
             }
 
             dry[c] += 8;
-            if (flags & A_AUX) {
+            if (aux) {
                 wet[c] += 8;
             }
         }

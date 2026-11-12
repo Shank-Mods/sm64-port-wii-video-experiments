@@ -44,6 +44,14 @@ extern bool         configAntialias;
 extern bool         configHires1280;
 extern unsigned int configVideoMode;
 extern bool         configCrop480;
+// Performance options (wii-optimize branch); each can be turned off to compare or work around
+extern bool         configOptPsVertex;   // paired-single vertex transform and lighting
+extern bool         configOptNativeTex;  // N64 textures converted straight to native GX formats
+extern bool         configOptTexHash;    // texture hashes computed once per frame, not per switch
+extern bool         configOptStateCache; // skip reloading textures that are already loaded
+extern bool         configOptTileCull;   // tiled modes: skip draws that miss a tile
+extern bool         configOptMem2Gpu;    // Wii: GPU-only buffers (textures, display lists) in MEM2
+extern bool         configOptGpuTnl;     // GPU vertex transform, lighting and fog
 
 void dbglog(const char *fmt, ...);
 extern bool         configInvertCamera;

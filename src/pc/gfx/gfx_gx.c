@@ -11,6 +11,7 @@
 #include "gfx_rendering_api.h"
 #include "gfx_gx_wm.h"
 #include "gfx_screen_config.h"
+#include "gfx_gx_tnl.h"
 
 #include "../configfile.h"
 #include "../bench.h"
@@ -43,11 +44,11 @@ static uint32_t current_texture;
 static GXTexObj texture_pool[TEXTURE_POOL_SIZE];
 
 struct TextureStorage {
-    uint16_t *data;
+    void *data;
 };
 
 static struct TextureStorage texture_storage[TEXTURE_POOL_SIZE];
-static uint16_t *deferred_texture_frees[TEXTURE_POOL_SIZE];
+static void *deferred_texture_frees[TEXTURE_POOL_SIZE];
 static size_t deferred_texture_free_count;
 
 static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
@@ -56,6 +57,9 @@ static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 #define GX_FAR_PLANE 24000.0f
 #define GX_FAR_PLANE_EXTENDED 60000.0f // Far plane used when fog is turned off
 #define GX_DECAL_BIAS 0.0001f
+// A depth offset b covers about b * w^2 / near of distance; when the depth planes follow the N64
+// projection (opt_gpu_tnl) the bias is scaled with the near plane, keeping the same tolerance
+static float decal_bias = GX_DECAL_BIAS;
 #define GX_TEXTURE_EDGE_ALPHA_THRESHOLD 76
 
 // Tiled rendering (1280x240p and 1280x720p)
@@ -71,10 +75,11 @@ static unsigned char gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 // Frames record well under 100 KB on hardware; keep headroom without costing GameCube memory
 #ifdef __wii__
 #define HIRES_DL_SIZE (1024 * 1024)
+#define HIRES_MAX_SEGS 8192 // room for per-draw segments (opt_tile_cull)
 #else
 #define HIRES_DL_SIZE (512 * 1024)
-#endif
 #define HIRES_MAX_SEGS 2048
+#endif
 
 struct HiresSeg {
     uint32_t offset;
@@ -82,10 +87,20 @@ struct HiresSeg {
     int vp[4];
     f32 far_z;
     int sc[4];
-    bool is_2d;
+    uint8_t proj;   // PROJ_* (and GPU-path projections from PROJ_HW on)
+    bool cullable;  // geometry only (one draw); skipped on tiles its bounds miss
+    int16_t bb[4];  // its bounds in frame pixels: x0, y0, x1, y1 (exclusive)
 };
 
-static bool cur_is_2d; // projection the current draws use (orthographic for 2D)
+// Projection the current draws use: the CPU path's perspective or orthographic (2D) pass-through,
+// or one of this frame's GPU-path projections (opt_gpu_tnl)
+enum { PROJ_PERSP, PROJ_ORTHO, PROJ_HW };
+#define HW_PROJ_MAX 16
+static uint8_t cur_proj;
+static Mtx44 hw_proj[HW_PROJ_MAX];
+static int hw_nproj;
+static uint8_t sw_persp_proj = PROJ_PERSP; // CPU-path perspective in use (a table entry when depth is the N64's)
+static int hw_proj_add(const Mtx44 m);
 
 static bool hr_enabled;
 static uint8_t *hr_crop_scratch; // crop modes: destination of every tile but the top left one
@@ -476,8 +491,13 @@ static void update_vtx_desc(struct ShaderProgram *prg)
     }
 }
 
+static bool tnl_active;     // GPU-path vertex format / TEV / channels are what's set up
+static void gx_tnl_leave(void);
+
 static void gfx_gx_load_shader(struct ShaderProgram *new_prg)
 {
+    if (tnl_active)
+        gx_tnl_leave();
     current_shader = new_prg->program_id;
 
     update_vtx_desc(new_prg);
@@ -520,9 +540,9 @@ static struct ShaderProgram *gfx_gx_create_and_load_new_shader(uint32_t shader_i
     }
     if (prg->cc_features.opt_fog)
     {
-        prg->num_floats += 4;
+        prg->num_floats += 1; // packed RGBA8 (see gfx_pc.c gfx_sp_tri1)
     }
-    prg->num_floats += prg->cc_features.num_inputs * (prg->cc_features.opt_alpha ? 4 : 3);
+    prg->num_floats += prg->cc_features.num_inputs; // one packed RGBA8 per input
 
     gfx_gx_load_shader(prg);
 
@@ -556,13 +576,31 @@ static uint32_t gfx_gx_new_texture(void)
     return texture_index++;
 }
 
+// opt_state_cache: which texture object each map holds, so an unchanged one isn't reloaded on
+// every draw. Invalidated whenever a texture object is (re)initialised, the frame starts (each
+// tile replay starts from whatever the previous one left) and after the overlay borrows a map.
+static int32_t loaded_tex[2] = { -1, -1 };
+
+static void gx_invalidate_loaded_tex(void)
+{
+    loaded_tex[0] = loaded_tex[1] = -1;
+}
+
+static void gx_load_tex(int map, uint32_t texture_id)
+{
+    if (configOptStateCache && loaded_tex[map] == (int32_t)texture_id)
+        return;
+    GX_LoadTexObj(&texture_pool[texture_id], map == 0 ? GX_TEXMAP0 : GX_TEXMAP1);
+    loaded_tex[map] = (int32_t)texture_id;
+}
+
 static void gfx_gx_select_texture(int tile, uint32_t texture_id)
 {
     current_texture = texture_id;
     texture_units[tile] = texture_id;
 
     if (texture_storage[texture_id].data != NULL)
-        GX_LoadTexObj(&texture_pool[texture_id], tile == 0 ? GX_TEXMAP0 : GX_TEXMAP1);
+        gx_load_tex(tile, texture_id);
 }
 
 // from https://github.com/camthesaxman/neverball-wii/blob/master/share/wiigl.c
@@ -693,17 +731,80 @@ static void gx_wait_gpu(void)
     GX_DrawDone();
 }
 
+// ---------------------------------------------------------------------------------------------
+// GPU-only memory (opt_mem2_gpu, Wii): texture data, the tile display lists and the crop scratch
+// buffer are only ever read or written by the GPU, so they go in a heap in MEM2. That leaves MEM1,
+// which the CPU reaches with less latency, to the game's own data.
+#ifdef __wii__
+#include <ogc/lwp_heap.h>
+static heap_cntrl gpu_heap;
+static uint8_t *gpu_heap_lo, *gpu_heap_hi;
+#define GPU_HEAP_SIZE (16 * 1024 * 1024)
+#endif
+
+static void gpu_heap_init(void)
+{
+#ifdef __wii__
+    if (!configOptMem2Gpu || gpu_heap_lo != NULL)
+        return;
+    uint8_t *lo = (uint8_t *)(((uintptr_t)SYS_GetArena2Lo() + 31) & ~31);
+    uint8_t *hi = (uint8_t *)SYS_GetArena2Hi();
+    if (hi - lo < GPU_HEAP_SIZE + 4 * 1024 * 1024)
+    {
+        dbglog("gpu heap: not enough MEM2 (%p-%p), using the normal heap", lo, hi);
+        return;
+    }
+    SYS_SetArena2Lo(lo + GPU_HEAP_SIZE);
+    __lwp_heap_init(&gpu_heap, lo, GPU_HEAP_SIZE, 32);
+    gpu_heap_lo = lo;
+    gpu_heap_hi = lo + GPU_HEAP_SIZE;
+    dbglog("gpu heap: %u KB in MEM2 at %p", (unsigned)(GPU_HEAP_SIZE / 1024), lo);
+#endif
+}
+
+// 32-byte aligned; the heap's own pointer is kept just below the returned block
+static void *gpu_alloc(size_t size)
+{
+#ifdef __wii__
+    if (gpu_heap_lo != NULL)
+    {
+        uint8_t *raw = __lwp_heap_allocate(&gpu_heap, size + 64);
+        if (raw != NULL)
+        {
+            uint8_t *p = (uint8_t *)(((uintptr_t)raw + 32 + 31) & ~31);
+            ((void **)p)[-1] = raw;
+            return p;
+        }
+    }
+#endif
+    return memalign(32, size);
+}
+
+static void gpu_free(void *p)
+{
+    if (p == NULL)
+        return;
+#ifdef __wii__
+    if ((uint8_t *)p >= gpu_heap_lo && (uint8_t *)p < gpu_heap_hi)
+    {
+        __lwp_heap_free(&gpu_heap, ((void **)p)[-1]);
+        return;
+    }
+#endif
+    free(p);
+}
+
 // GX can still be reading old texture memory after commands enter the FIFO
 static void gx_free_deferred_texture_data(void)
 {
     for (size_t i = 0; i < deferred_texture_free_count; i++)
     {
-        free(deferred_texture_frees[i]);
+        gpu_free(deferred_texture_frees[i]);
     }
     deferred_texture_free_count = 0;
 }
 
-static void gx_defer_texture_free(uint16_t *data)
+static void gx_defer_texture_free(void *data)
 {
     if (data == NULL)
         return;
@@ -718,6 +819,43 @@ static void gx_defer_texture_free(uint16_t *data)
     }
 
     deferred_texture_frees[deferred_texture_free_count++] = data;
+}
+
+// Memory for a texture, freeing textures the GPU has finished with if needed (NULL if none)
+static void *gx_alloc_texture(size_t size)
+{
+    void *dest = gpu_alloc(size);
+    if (dest == NULL)
+    {
+        if (hr_recording)
+            return NULL;
+        gx_wait_gpu();
+        gx_free_deferred_texture_data();
+        dest = gpu_alloc(size);
+    }
+    return dest;
+}
+
+// Point the current texture object at new data, keeping the sampler state gfx_pc configured
+static void gx_install_texture(void *dest, size_t size, int width, int height, uint8_t gxfmt)
+{
+    DCFlushRange(dest, size);
+
+    // GX_InitTexObj resets wrap/filter
+    // Please preserve the sampler state gfx_pc configured just before this
+    // It did hard work, okay.
+    GXTexObj *obj = &texture_pool[current_texture];
+    u8 wrap_s = GX_GetTexObjWrapS(obj);
+    u8 wrap_t = GX_GetTexObjWrapT(obj);
+    u8 min_filt, mag_filt;
+    GX_GetTexObjFilterMode(obj, &min_filt, &mag_filt);
+
+    gx_defer_texture_free(texture_storage[current_texture].data);
+    texture_storage[current_texture].data = dest;
+
+    GX_InitTexObj(obj, dest, width, height, gxfmt, wrap_s, wrap_t, GX_FALSE);
+    GX_InitTexObjFilterMode(obj, min_filt, mag_filt);
+    gx_invalidate_loaded_tex();
 }
 
 static void convert_to_rgb5a3(uint16_t *dest, const uint8_t *data, uint32_t width, uint32_t height,
@@ -766,36 +904,131 @@ static void gfx_gx_upload_texture(const uint8_t *rgba32_buf, int width, int heig
     uint32_t buffer_height = round_up(height, 4);
     size_t texture_size = (size_t)buffer_width * buffer_height * sizeof(uint16_t);
 
-    uint16_t *dest = memalign(32, texture_size);
+    uint16_t *dest = gx_alloc_texture(texture_size);
     if (dest == NULL)
-    {
-        if (hr_recording)
-            return;
-        gx_wait_gpu();
-        gx_free_deferred_texture_data();
-        dest = memalign(32, texture_size);
-        if (dest == NULL)
-            return;
-    }
+        return;
 
     convert_to_rgb5a3(dest, rgba32_buf, width, height, buffer_width, buffer_height);
+    gx_install_texture(dest, texture_size, width, height, GX_TF_RGB5A3);
+}
 
-    DCFlushRange(dest, texture_size);
+// ---------------------------------------------------------------------------------------------
+// opt_native_tex: N64 texture data converted in one pass into a GX format that holds it exactly
+// (formerly N64 -> RGBA32 -> RGB5A3, which also cut intensity and alpha to 4-5 / 3 bits):
+//   RGBA16, CI4, CI8 -> RGB5A3 (the same texels as before)
+//   IA4 -> IA8, IA8 -> IA4, IA16 -> IA8, I4 -> IA4 (alpha opaque), I8 -> IA8 (alpha opaque)
+// I4/I8 keep this port's opaque alpha, so they use the IA formats rather than GX's I formats
+// (which would repeat the intensity as alpha). RGBA32 (rare) still takes the old path.
 
-    // GX_InitTexObj resets wrap/filter
-    // Please preserve the sampler state gfx_pc configured just before this
-    // It did hard work, okay.
-    GXTexObj *obj = &texture_pool[current_texture];
-    u8 wrap_s = GX_GetTexObjWrapS(obj);
-    u8 wrap_t = GX_GetTexObjWrapT(obj);
-    u8 min_filt, mag_filt;
-    GX_GetTexObjFilterMode(obj, &min_filt, &mag_filt);
+// GX tiling: 16-bit texels in 4x4 blocks, 8-bit texels in 8x4 blocks, each block 32 bytes
+static inline uint32_t tex_index16(uint32_t x, uint32_t y, uint32_t bw)
+{
+    return 16 * ((x >> 2) + (y >> 2) * (bw >> 2)) + (y & 3) * 4 + (x & 3);
+}
 
-    gx_defer_texture_free(texture_storage[current_texture].data);
-    texture_storage[current_texture].data = dest;
+static inline uint32_t tex_index8(uint32_t x, uint32_t y, uint32_t bw)
+{
+    return 32 * ((x >> 3) + (y >> 2) * (bw >> 3)) + (y & 3) * 8 + (x & 7);
+}
 
-    GX_InitTexObj(obj, dest, width, height, GX_TF_RGB5A3, wrap_s, wrap_t, GX_FALSE);
-    GX_InitTexObjFilterMode(obj, min_filt, mag_filt);
+static inline uint16_t rgba16_to_rgb5a3(uint16_t col)
+{
+    uint32_t r = col >> 11, g = (col >> 6) & 0x1f, b = (col >> 1) & 0x1f;
+    if (col & 1)
+        return 0x8000 | (r << 10) | (g << 5) | b;
+    // transparent: same as the old RGBA32 path (4-bit colour, alpha 0)
+    r = ((r * 0xFF) / 0x1F) >> 4;
+    g = ((g * 0xFF) / 0x1F) >> 4;
+    b = ((b * 0xFF) / 0x1F) >> 4;
+    return (uint16_t)((r << 8) | (g << 4) | b);
+}
+
+bool gfx_gx_upload_texture_n64(uint8_t fmt, uint8_t siz, const uint8_t *addr, uint32_t size_bytes,
+                               uint32_t line_size_bytes, const uint8_t *palette)
+{
+    // N64 formats (gbi.h): RGBA 0, YUV 1, CI 2, IA 3, I 4; sizes 4b 0, 8b 1, 16b 2, 32b 3
+    enum { F_RGBA = 0, F_CI = 2, F_IA = 3, F_I = 4 };
+    enum { S_4 = 0, S_8 = 1, S_16 = 2 };
+    if (line_size_bytes == 0 || addr == NULL)
+        return false;
+    uint32_t bits;
+    uint8_t gxfmt;
+    if (fmt == F_RGBA && siz == S_16) { bits = 16; gxfmt = GX_TF_RGB5A3; }
+    else if (fmt == F_CI && (siz == S_4 || siz == S_8)) { bits = siz == S_4 ? 4 : 8; gxfmt = GX_TF_RGB5A3; }
+    else if (fmt == F_IA && siz == S_4) { bits = 4; gxfmt = GX_TF_IA8; }
+    else if (fmt == F_IA && siz == S_8) { bits = 8; gxfmt = GX_TF_IA4; }
+    else if (fmt == F_IA && siz == S_16) { bits = 16; gxfmt = GX_TF_IA8; }
+    else if (fmt == F_I && siz == S_4) { bits = 4; gxfmt = GX_TF_IA4; }
+    else if (fmt == F_I && siz == S_8) { bits = 8; gxfmt = GX_TF_IA8; }
+    else return false;
+    if (fmt == F_CI && palette == NULL)
+        return false;
+
+    // Same dimensions as gfx_pc's import_texture_* functions
+    const uint32_t width = line_size_bytes * 8 / bits;
+    const uint32_t height = size_bytes / line_size_bytes;
+    const uint32_t texels = size_bytes * 8 / bits;
+    if (width == 0 || height == 0)
+        return false;
+
+    const bool wide = (gxfmt == GX_TF_IA4); // 8-bit GX texels
+    const uint32_t bw = round_up(width, wide ? 8 : 4);
+    const uint32_t bh = round_up(height, 4);
+    const size_t bytes = (size_t)bw * bh * (wide ? 1 : 2);
+    void *dest = gx_alloc_texture(bytes);
+    if (dest == NULL)
+        return true; // out of memory: draw untextured rather than decode twice
+    uint16_t *d16 = dest;
+    uint8_t *d8 = dest;
+
+    uint16_t pal[256];
+    if (fmt == F_CI)
+    {
+        const uint32_t n = siz == S_4 ? 16 : 256;
+        for (uint32_t i = 0; i < n; i++)
+            pal[i] = rgba16_to_rgb5a3((uint16_t)((palette[2 * i] << 8) | palette[2 * i + 1]));
+    }
+
+    for (uint32_t y = 0; y < bh; y++)
+    {
+        const uint32_t sy = y < height ? y : height - 1;
+        for (uint32_t x = 0; x < bw; x++)
+        {
+            const uint32_t sx = x < width ? x : width - 1;
+            const uint32_t i = sy * width + sx;
+            uint32_t v = 0;
+            if (i < texels)
+            {
+                if (bits == 4)
+                    v = (addr[i >> 1] >> ((i & 1) ? 0 : 4)) & 0xF;
+                else if (bits == 8)
+                    v = addr[i];
+                else
+                    v = (addr[2 * i] << 8) | addr[2 * i + 1];
+            }
+            uint16_t out;
+            if (fmt == F_RGBA)
+                out = rgba16_to_rgb5a3((uint16_t)v);
+            else if (fmt == F_CI)
+                out = pal[v];
+            else if (fmt == F_IA && siz == S_4)
+                out = (uint16_t)(((v & 1) ? 0xFF00 : 0) | ((v >> 1) * 0x24)); // IA8: alpha, intensity
+            else if (fmt == F_IA && siz == S_8)
+                out = (uint16_t)(((v & 0xF) << 4) | (v >> 4));                // IA4: alpha nibble high
+            else if (fmt == F_IA)
+                out = (uint16_t)(((v & 0xFF) << 8) | (v >> 8));               // IA16 -> IA8
+            else if (siz == S_4)
+                out = (uint16_t)(0xF0 | v);                                    // I4 -> IA4, opaque
+            else
+                out = (uint16_t)(0xFF00 | v);                                  // I8 -> IA8, opaque
+            if (wide)
+                d8[tex_index8(x, y, bw)] = (uint8_t)out;
+            else
+                d16[tex_index16(x, y, bw)] = out;
+        }
+    }
+    gx_install_texture(dest, bytes, width, height, gxfmt);
+    return true;
 }
 
 static uint32_t gfx_cm_to_gx(uint32_t val)
@@ -807,6 +1040,7 @@ static void gfx_gx_set_sampler_parameters(int tile, bool linear_filter, uint32_t
 {
     GX_InitTexObjWrapMode(&texture_pool[texture_units[tile]], gfx_cm_to_gx(cms), gfx_cm_to_gx(cmt));
     GX_InitTexObjFilterMode(&texture_pool[texture_units[tile]], linear_filter ? GX_LINEAR : GX_NEAR, linear_filter ? GX_LINEAR : GX_NEAR);
+    gx_invalidate_loaded_tex();
 }
 
 static bool depth_test_on;
@@ -845,7 +1079,7 @@ static void hr_seg_capture(struct HiresSeg *seg)
     seg->sc[1] = sc_y;
     seg->sc[2] = sc_w;
     seg->sc[3] = sc_h;
-    seg->is_2d = cur_is_2d;
+    seg->proj = cur_proj;
 }
 
 static void hr_begin_seg(void)
@@ -853,9 +1087,13 @@ static void hr_begin_seg(void)
     struct HiresSeg *seg = &hr_segs[hr_nseg];
     seg->offset = hr_pos;
     seg->size = 0;
+    seg->cullable = false;
     hr_seg_capture(seg);
     hr_seg_drawn = false;
     GX_BeginDispList(hr_dl + hr_pos, HIRES_DL_SIZE - hr_pos);
+    // One CP NOP, so a segment with no other commands doesn't end with size 0 (which is how
+    // GX_EndDispList reports an overflow)
+    *(volatile uint8_t *)0xCC008000 = 0x00;
 }
 
 static void hr_end_seg(void)
@@ -883,6 +1121,82 @@ static void hr_state_changed(void)
         hr_seg_capture(&hr_segs[hr_nseg]);
         return;
     }
+    hr_end_seg();
+    if (hr_overflow)
+        return;
+    hr_begin_seg();
+}
+
+// Bounds of a batch in frame pixels (false = can't be bounded, or it covers every tile anyway)
+static bool hr_draw_bounds(const float *v, int stride, size_t n, bool is_2d, int16_t bb[4])
+{
+    if (hr_tiles_x * hr_tiles_y < 2 || hr_nseg >= HIRES_MAX_SEGS - 4 || hr_pos + 64 * 1024 > HIRES_DL_SIZE)
+        return false;
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (size_t i = 0; i < n; i++, v += stride)
+    {
+        float x = v[0], y = v[1];
+        if (!is_2d)
+        {
+            const float w = v[3];
+            if (w < 0.001f)
+                return false; // behind the eye: the clipped triangle can be anywhere
+            const float iw = 1.0f / w;
+            x *= iw;
+            y *= iw;
+        }
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+    }
+    // NDC -> frame pixels through the current viewport (y down), with a 2 pixel margin
+    float px0 = vp_x + (x0 + 1.0f) * 0.5f * vp_w - 2.0f;
+    float px1 = vp_x + (x1 + 1.0f) * 0.5f * vp_w + 2.0f;
+    float py0 = vp_y + (1.0f - y1) * 0.5f * vp_h - 2.0f;
+    float py1 = vp_y + (1.0f - y0) * 0.5f * vp_h + 2.0f;
+    // and inside the scissor
+    if (px0 < sc_x) px0 = sc_x;
+    if (py0 < sc_y) py0 = sc_y;
+    if (px1 > sc_x + sc_w) px1 = sc_x + sc_w;
+    if (py1 > sc_y + sc_h) py1 = sc_y + sc_h;
+    const float fw = hr_tiles_x * hr_tile_w, fh = hr_tiles_y * hr_tile_h;
+    if (px0 < 0) px0 = 0;
+    if (py0 < 0) py0 = 0;
+    if (px1 > fw) px1 = fw;
+    if (py1 > fh) py1 = fh;
+    if (px1 <= px0 || py1 <= py0)
+    {
+        px0 = py0 = px1 = py1 = 0; // off screen: culled on every tile
+    }
+    bb[0] = (int16_t)px0;
+    bb[1] = (int16_t)py0;
+    bb[2] = (int16_t)(px1 + 0.999f);
+    bb[3] = (int16_t)(py1 + 0.999f);
+    // Worth a segment only if it misses at least one tile
+    const int tx0 = bb[0] / hr_tile_w, tx1 = (bb[2] - 1) / hr_tile_w;
+    const int ty0 = bb[1] / hr_tile_h, ty1 = (bb[3] - 1) / hr_tile_h;
+    if (bb[2] <= bb[0])
+        return true;
+    return (tx1 - tx0 + 1) * (ty1 - ty0 + 1) < hr_tiles_x * hr_tiles_y;
+}
+
+// Close the segment holding the state commands before this draw and open one for the draw alone
+static bool hr_split_before_draw(void)
+{
+    hr_end_seg();
+    if (hr_overflow)
+        return false;
+    hr_begin_seg();
+    hr_segs[hr_nseg].cullable = true;
+    return true;
+}
+
+static void hr_split_after_draw(const int16_t bb[4])
+{
+    if (hr_overflow)
+        return;
+    memcpy(hr_segs[hr_nseg].bb, bb, sizeof(hr_segs[hr_nseg].bb));
     hr_end_seg();
     if (hr_overflow)
         return;
@@ -995,6 +1309,8 @@ static uint8_t float_to_u8(float x)
 
 static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, size_t buf_vbo_num_tris)
 {
+    if (tnl_active)
+        gx_tnl_leave();
     bool hasAlpha = shader_program_pool[current_shader].cc_features.opt_alpha;
     bool hasFog = shader_program_pool[current_shader].cc_features.opt_fog;
     bool hasTex = shader_program_pool[current_shader].cc_features.used_textures[0]
@@ -1003,13 +1319,13 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     uint8_t num_floats =  shader_program_pool[current_shader].num_floats;
     uint8_t num_inputs = shader_program_pool[current_shader].cc_features.num_inputs;
 
-    // Reload here so every draw uses the fully-initialized texobj
+    // Make sure each map holds the fully-initialised texobj (skipped when it already does)
     if (shader_program_pool[current_shader].cc_features.used_textures[0]
         && texture_storage[texture_units[0]].data != NULL)
-        GX_LoadTexObj(&texture_pool[texture_units[0]], GX_TEXMAP0);
+        gx_load_tex(0, texture_units[0]);
     if (shader_program_pool[current_shader].cc_features.used_textures[1]
         && texture_storage[texture_units[1]].data != NULL)
-        GX_LoadTexObj(&texture_pool[texture_units[1]], GX_TEXMAP1);
+        gx_load_tex(1, texture_units[1]);
 
     // gfx_pc emits 2D rectangles with w == 1
     bool is_2d = (buf_vbo[3] == 1.0f);
@@ -1020,9 +1336,10 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     if (hr_recording)
     {
         // Projection is applied per tile at replay time
-        if (is_2d != cur_is_2d)
+        const uint8_t want = is_2d ? PROJ_ORTHO : sw_persp_proj;
+        if (want != cur_proj)
         {
-            cur_is_2d = is_2d;
+            cur_proj = want;
             hr_state_changed();
         }
     }
@@ -1031,102 +1348,403 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     else
         GX_LoadProjectionMtx(gx_perspective_mtx, GX_PERSPECTIVE);
 
-    const f32 want_far_z = (!is_2d && zmode_decal_on) ? (1.0f - GX_DECAL_BIAS) : 1.0f;
+    const f32 want_far_z = (!is_2d && zmode_decal_on) ? (1.0f - decal_bias) : 1.0f;
     if (want_far_z != applied_far_z)
         gx_issue_viewport(want_far_z);
 
     if (hr_recording)
         hr_seg_drawn = true;
 
+    // opt_tile_cull: a draw that misses some of the tiles gets a segment of its own, which the
+    // replay skips on the tiles it misses
+    int16_t bb[4];
+    const bool split = hr_recording && configOptTileCull && !hr_overflow
+                       && hr_draw_bounds(buf_vbo, num_floats, 3 * buf_vbo_num_tris, is_2d, bb)
+                       && hr_split_before_draw();
+
     GX_Begin(GX_TRIANGLES, GX_VTXFMT0, 3 * buf_vbo_num_tris);
     {
-        uint32_t offset = 0;
-        float s = 0.0f;
-        float t = 0.0f;
-        for (size_t i = 0; i < 3 * buf_vbo_num_tris; i++)
+        const bool emit_fog = hasFog && num_inputs < 2;
+        const float *p = buf_vbo;
+        for (size_t i = 0; i < 3 * buf_vbo_num_tris; i++, p += num_floats)
         {
             if (is_2d)
-            {
-                GX_Position3f32(buf_vbo[offset + 0],
-                                buf_vbo[offset + 1],
-                                buf_vbo[offset + 2]);
-            }
+                GX_Position3f32(p[0], p[1], p[2]);
             else
-            {
-                GX_Position3f32(buf_vbo[offset + 0],
-                                buf_vbo[offset + 1],
-                                -buf_vbo[offset + 3]);
-            }
-            int vtxOffs = 4;
-            bool emit_fog = hasFog && num_inputs < 2;
-            float fog_r = 0.0f, fog_g = 0.0f, fog_b = 0.0f, fog_a = 0.0f;
+                GX_Position3f32(p[0], p[1], -p[3]);
 
+            int vo = 4;
+            float s = 0.0f, t = 0.0f;
             if (hasTex)
             {
-                s = buf_vbo[offset + vtxOffs + 0];
-                t = buf_vbo[offset + vtxOffs + 1];
-                vtxOffs += 2;
+                s = p[4];
+                t = p[5];
+                vo = 6;
             }
+            uint32_t fogc = 0;
             if (hasFog)
             {
-                fog_r = buf_vbo[offset + vtxOffs + 0];
-                fog_g = buf_vbo[offset + vtxOffs + 1];
-                fog_b = buf_vbo[offset + vtxOffs + 2];
-                fog_a = buf_vbo[offset + vtxOffs + 3]; // fog factor
-                vtxOffs += 4;
+                memcpy(&fogc, &p[vo], 4); // packed fog rgb + factor
+                vo++;
             }
             if (hr_enabled)
             {
                 // Fixed format: always two colours and a texcoord
-                uint8_t col[2][4] = { { 0, 0, 0, 255 }, { 0, 0, 0, 255 } };
+                uint32_t col[2] = { 0x000000FF, 0x000000FF };
                 int ci = 0;
-                for (int j = 0; j < num_inputs; j++)
-                {
-                    if (ci < 2)
-                    {
-                        col[ci][0] = float_to_u8(buf_vbo[offset + vtxOffs + 0]);
-                        col[ci][1] = float_to_u8(buf_vbo[offset + vtxOffs + 1]);
-                        col[ci][2] = float_to_u8(buf_vbo[offset + vtxOffs + 2]);
-                        col[ci][3] = hasAlpha ? float_to_u8(buf_vbo[offset + vtxOffs + 3]) : 255;
-                        ci++;
-                    }
-                    vtxOffs += hasAlpha ? 4 : 3;
-                }
+                for (int j = 0; j < num_inputs && ci < 2; j++)
+                    memcpy(&col[ci++], &p[vo + j], 4);
                 if (emit_fog && ci < 2)
-                {
-                    col[ci][0] = float_to_u8(fog_r);
-                    col[ci][1] = float_to_u8(fog_g);
-                    col[ci][2] = float_to_u8(fog_b);
-                    col[ci][3] = float_to_u8(fog_a);
-                }
-                GX_Color4u8(col[0][0], col[0][1], col[0][2], col[0][3]);
-                GX_Color4u8(col[1][0], col[1][1], col[1][2], col[1][3]);
+                    col[ci] = fogc;
+                GX_Color1u32(col[0]);
+                GX_Color1u32(col[1]);
                 GX_TexCoord2f32(s, t);
-                offset += num_floats;
                 continue;
             }
-            for (int j = 0; j < num_inputs; j++)
+            for (int j = 0; j < num_inputs && j < 2; j++)
             {
-                if (j < 2)
-                {
-                    GX_Color4u8(float_to_u8(buf_vbo[offset + vtxOffs + 0]),
-                                float_to_u8(buf_vbo[offset + vtxOffs + 1]),
-                                float_to_u8(buf_vbo[offset + vtxOffs + 2]),
-                                hasAlpha ? float_to_u8(buf_vbo[offset + vtxOffs + 3]) : 255);
-                }
-                vtxOffs += hasAlpha ? 4 : 3;
+                uint32_t c;
+                memcpy(&c, &p[vo + j], 4);
+                GX_Color1u32(c);
             }
             if (emit_fog)
-            {
-                GX_Color4u8(float_to_u8(fog_r), float_to_u8(fog_g),
-                            float_to_u8(fog_b), float_to_u8(fog_a));
-            }
+                GX_Color1u32(fogc);
             if (hasTex)
-            {
                 GX_TexCoord2f32(s, t);
-            }
-            offset += num_floats;
         }
+    }
+    GX_End();
+    (void)hasAlpha;
+
+    if (split)
+        hr_split_after_draw(bb);
+}
+
+// ---------------------------------------------------------------------------------------------
+// GPU vertex path (opt_gpu_tnl, see gfx_gx_tnl.h)
+
+static struct GxTnlState tnl_cur;  // what's applied, valid while tnl_valid
+static bool tnl_valid;
+static Mtx44 tnl_proj;
+static bool tnl_proj_loaded;      // non-tiled: tnl_proj is the loaded projection
+static uint8_t tnl_hr_proj = PROJ_PERSP; // tiled: the GPU path's projection (CPU-path draws switch cur_proj away)
+
+static float tnl_near = GX_NEAR_PLANE, tnl_far = GX_FAR_PLANE;
+float gfx_gx_tnl_near(void) { return tnl_near; }
+float gfx_gx_tnl_far(void) { return tnl_far; }
+
+// Index of a projection in this frame's table (tiled modes), adding it if new
+static int hw_proj_add(const Mtx44 m)
+{
+    for (int i = hw_nproj - 1; i >= 0; i--)
+        if (memcmp(hw_proj[i], m, sizeof(Mtx44)) == 0)
+            return i;
+    if (hw_nproj == HW_PROJ_MAX)
+    {
+        static unsigned full;
+        if (full++ % 300 == 0)
+            dbglog("hw proj table full (%d)", HW_PROJ_MAX);
+        return HW_PROJ_MAX - 1;
+    }
+    memcpy(hw_proj[hw_nproj], m, sizeof(Mtx44));
+    return hw_nproj++;
+}
+
+void gfx_gx_tnl_set_depth(float n, float f)
+{
+    if (!configFog && f < GX_FAR_PLANE_EXTENDED)
+        f = GX_FAR_PLANE_EXTENDED; // fog off keeps its longer draw distance
+    tnl_near = n;
+    tnl_far = f;
+    decal_bias = GX_DECAL_BIAS * n / GX_NEAR_PLANE;
+    if (decal_bias > 0.01f)
+        decal_bias = 0.01f;
+    // The CPU path feeds clip w as z: same depth function as the GPU path's projection
+    gx_perspective_mtx[2][2] = -n / (f - n);
+    gx_perspective_mtx[2][3] = -(n * f) / (f - n);
+    if (hr_recording)
+        sw_persp_proj = PROJ_HW + hw_proj_add(gx_perspective_mtx);
+}
+
+void gfx_gx_tnl_begin_frame(void *pos, void *tc, void *col)
+{
+    // Vertex arrays (CP registers; the CPU path never touches arrays). Called after the frame
+    // started, so in the tiled modes this is recorded and replayed before every tile.
+    GX_SetArray(GX_VA_POS, pos, 12);
+    GX_SetArray(GX_VA_TEX0, tc, 4);
+    GX_SetArray(GX_VA_CLR0, col, 4);
+    GX_SetArray(GX_VA_NRM, col, 4);
+    GX_InvVtxCache(); // the arrays were rewritten since the last frame
+    GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_NRM, GX_NRM_XYZ, GX_S8, 0); // 6 fraction bits (fixed)
+    GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+    GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_S16, 0);
+    tnl_valid = false;
+    tnl_proj_loaded = false;
+}
+
+// N64 modelview (row vectors, v * M) -> GX position matrix (column vectors) in a slot, and the
+// same 3x3 scaled as the normal matrix
+void gfx_gx_tnl_load_mtx(int slot, const float mv[4][4], float normal_scale)
+{
+    __Mtx m, n;
+    for (int r = 0; r < 3; r++)
+    {
+        for (int c = 0; c < 3; c++)
+        {
+            m[r][c] = mv[c][r];
+            n[r][c] = mv[c][r] * normal_scale;
+        }
+        m[r][3] = mv[3][r];
+        n[r][3] = 0.0f;
+    }
+    GX_LoadPosMtxImm(m, GX_PNMTX0 + 3 * slot);
+    GX_LoadNrmMtxImm(n, GX_PNMTX0 + 3 * slot);
+}
+
+void gfx_gx_tnl_set_proj(const float p[4][4])
+{
+    if (hr_recording)
+    {
+        // The tiled replay rescales it per tile: keep it in this frame's table
+        const int id = hw_proj_add(p);
+        tnl_hr_proj = PROJ_HW + id;
+        if (cur_proj != PROJ_HW + id)
+        {
+            cur_proj = PROJ_HW + id;
+            hr_state_changed();
+        }
+        return;
+    }
+    memcpy(tnl_proj, p, sizeof(Mtx44));
+    tnl_proj_loaded = false;
+}
+
+static uint8_t tnl_csrc(uint8_t item, const struct GxTnlState *st)
+{
+    if (item >= SHADER_INPUT_1 && item <= SHADER_INPUT_4)
+    {
+        switch (st->map[0][item - SHADER_INPUT_1])
+        {
+            case CC_SHADE: return GX_CC_RASC;
+            case CC_PRIM: return GX_CC_C0;
+            case CC_ENV: return GX_CC_C1;
+            default: return GX_CC_ZERO;
+        }
+    }
+    switch (item)
+    {
+        case SHADER_TEXEL0:
+        case SHADER_TEXEL1: return GX_CC_TEXC;
+        case SHADER_TEXEL0A: return GX_CC_TEXA;
+        default: return GX_CC_ZERO;
+    }
+}
+
+static uint8_t tnl_asrc(uint8_t item, const struct GxTnlState *st)
+{
+    if (item >= SHADER_INPUT_1 && item <= SHADER_INPUT_4)
+    {
+        switch (st->map[1][item - SHADER_INPUT_1])
+        {
+            case CC_SHADE: return GX_CA_RASA;
+            case CC_PRIM: return GX_CA_A0;
+            case CC_ENV: return GX_CA_A1;
+            default: return GX_CA_ZERO;
+        }
+    }
+    switch (item)
+    {
+        case SHADER_TEXEL0:
+        case SHADER_TEXEL0A:
+        case SHADER_TEXEL1: return GX_CA_TEXA;
+        default: return GX_CA_ZERO;
+    }
+}
+
+// The combiner in one TEV stage: every input is a register or the rasterised shade colour, so
+// the two-stage arrangements the CPU path needs for two per-vertex inputs aren't needed. Same
+// formula shapes as the CPU path (single / multiply / mix / a*c + d).
+static void tnl_apply_tev(const struct GxTnlState *st)
+{
+    const struct CCFeatures *f = &st->prg->cc_features;
+    const uint8_t *c = f->c[0], *a = f->c[1];
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, st->textured ? GX_TEXCOORD0 : GX_TEXCOORDNULL,
+                   st->textured ? GX_TEXMAP0 : GX_TEXMAP_NULL, GX_COLOR0A0);
+    if (f->do_single[0])
+        GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, tnl_csrc(c[3], st));
+    else if (f->do_multiply[0])
+        GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, tnl_csrc(c[0], st), tnl_csrc(c[2], st), GX_CC_ZERO);
+    else if (f->do_mix[0])
+        GX_SetTevColorIn(GX_TEVSTAGE0, tnl_csrc(c[1], st), tnl_csrc(c[0], st), tnl_csrc(c[2], st), GX_CC_ZERO);
+    else
+        GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, tnl_csrc(c[0], st), tnl_csrc(c[2], st), tnl_csrc(c[3], st));
+    if (f->do_single[1])
+        GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, tnl_asrc(a[3], st));
+    else if (f->do_multiply[1])
+        GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, tnl_asrc(a[0], st), tnl_asrc(a[2], st), GX_CA_ZERO);
+    else if (f->do_mix[1])
+        GX_SetTevAlphaIn(GX_TEVSTAGE0, tnl_asrc(a[1], st), tnl_asrc(a[0], st), tnl_asrc(a[2], st), GX_CA_ZERO);
+    else
+        GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, tnl_asrc(a[0], st), tnl_asrc(a[2], st), tnl_asrc(a[3], st));
+    gx_set_tev_op(GX_TEVSTAGE0);
+
+    if (f->opt_texture_edge && f->opt_alpha)
+    {
+        GX_SetAlphaCompare(GX_GREATER, GX_TEXTURE_EDGE_ALPHA_THRESHOLD, GX_AOP_AND, GX_ALWAYS, 0);
+        GX_SetZCompLoc(GX_FALSE);
+    }
+    else
+    {
+        GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+        GX_SetZCompLoc(GX_TRUE);
+    }
+}
+
+static void tnl_apply_lighting(const struct GxTnlState *st)
+{
+    uint8_t mask = 0;
+    if (st->lighting)
+    {
+        for (int i = 0; i < st->num_lights && i < 2; i++)
+        {
+            GXLightObj lo;
+            // Directional: a position very far along the direction, no attenuation
+            GX_InitLightPos(&lo, st->light_dir[i][0] * 1e10f, st->light_dir[i][1] * 1e10f,
+                            st->light_dir[i][2] * 1e10f);
+            GX_InitLightColor(&lo, (GXColor){ st->light_col[i][0], st->light_col[i][1], st->light_col[i][2], 255 });
+            GX_InitLightAttn(&lo, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            GX_LoadLightObj(&lo, i == 0 ? GX_LIGHT0 : GX_LIGHT1);
+            mask |= i == 0 ? GX_LIGHT0 : GX_LIGHT1;
+        }
+        GX_SetChanAmbColor(GX_COLOR0A0, (GXColor){ st->ambient[0], st->ambient[1], st->ambient[2], 0 });
+    }
+    GX_SetChanMatColor(GX_COLOR0A0, (GXColor){ 255, 255, 255, 255 });
+    // N64 lighting: colour = ambient + sum of clamped N.L * light colour, clamped; material white
+    GX_SetChanCtrl(GX_COLOR0, st->lighting ? GX_ENABLE : GX_DISABLE, GX_SRC_REG,
+                   st->lighting ? GX_SRC_REG : GX_SRC_VTX, mask, GX_DF_CLAMP, GX_AF_NONE);
+    GX_SetChanCtrl(GX_ALPHA0, GX_DISABLE, GX_SRC_REG, st->alpha_one ? GX_SRC_REG : GX_SRC_VTX,
+                   GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+}
+
+static void tnl_apply_texmtx(const struct GxTnlState *st)
+{
+    GX_SetNumTexGens(st->textured ? 1 : 0);
+    if (!st->textured)
+        return;
+    __Mtx m;
+    memset(m, 0, sizeof(m));
+    memcpy(m[0], st->texmtx[0], sizeof(m[0]));
+    memcpy(m[1], st->texmtx[1], sizeof(m[1]));
+    GX_LoadTexMtxImm(m, GX_TEXMTX0, GX_MTX2x4);
+    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_TEXMTX0);
+}
+
+static void tnl_apply_fog(const struct GxTnlState *st)
+{
+    GXColor c = { st->fog_col[0], st->fog_col[1], st->fog_col[2], 255 };
+    if (st->fog)
+        GX_SetFog(GX_FOG_ORTHO_LIN, st->fog_start, st->fog_end, 0.0f, 1.0f, c);
+    else
+        GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, c);
+}
+
+static uint8_t tnl_cull_mode(uint8_t n64)
+{
+    // N64 culls in a y-up screen space and GX in a y-down one, so the senses swap
+    return n64 == 1 ? GX_CULL_FRONT : n64 == 2 ? GX_CULL_BACK : GX_CULL_NONE;
+}
+
+static void gx_tnl_enter(void)
+{
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_PTNMTXIDX, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_POS, GX_INDEX16);
+    GX_SetVtxDesc(GX_VA_NRM, GX_INDEX16);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_INDEX16);
+    GX_SetVtxDesc(GX_VA_TEX0, GX_INDEX16);
+    GX_SetNumChans(1);
+    tnl_active = true;
+    tnl_valid = false;
+    tnl_proj_loaded = false;
+}
+
+// Back to the CPU path's set-up
+static void gx_tnl_leave(void)
+{
+    tnl_active = false;
+    tnl_valid = false;
+    GX_SetCullMode(GX_CULL_NONE);
+    GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, (GXColor){ 0, 0, 0, 255 });
+    if (hr_enabled)
+        gx_set_fixed_vtx_desc(); // vertex format and texgen the tiled replay expects
+    if (shader_program_pool_size > 0)
+        gfx_gx_load_shader(&shader_program_pool[current_shader]); // VCD (non-tiled), TEV, channels
+}
+
+void gfx_gx_tnl_draw(const struct GxTnlState *st, const uint8_t *mtx, const uint16_t *idx, int n)
+{
+    if (n <= 0)
+        return;
+    if (!tnl_active)
+        gx_tnl_enter();
+
+    const struct GxTnlState *o = tnl_valid ? &tnl_cur : NULL;
+    if (o == NULL || o->prg != st->prg || memcmp(o->map, st->map, sizeof(st->map)) != 0
+        || o->textured != st->textured)
+        tnl_apply_tev(st);
+    if (o == NULL || memcmp(o->prim, st->prim, 4) != 0)
+        GX_SetTevColor(GX_TEVREG0, (GXColor){ st->prim[0], st->prim[1], st->prim[2], st->prim[3] });
+    if (o == NULL || memcmp(o->env, st->env, 4) != 0)
+        GX_SetTevColor(GX_TEVREG1, (GXColor){ st->env[0], st->env[1], st->env[2], st->env[3] });
+    if (o == NULL || o->lighting != st->lighting || o->alpha_one != st->alpha_one
+        || (st->lighting && (o->num_lights != st->num_lights || memcmp(o->light_dir, st->light_dir, sizeof(st->light_dir))
+                             || memcmp(o->light_col, st->light_col, sizeof(st->light_col))
+                             || memcmp(o->ambient, st->ambient, sizeof(st->ambient)))))
+        tnl_apply_lighting(st);
+    if (o == NULL || o->textured != st->textured
+        || (st->textured && memcmp(o->texmtx, st->texmtx, sizeof(st->texmtx)) != 0))
+        tnl_apply_texmtx(st);
+    if (o == NULL || o->fog != st->fog
+        || (st->fog && (o->fog_start != st->fog_start || o->fog_end != st->fog_end
+                        || memcmp(o->fog_col, st->fog_col, 3) != 0)))
+        tnl_apply_fog(st);
+    if (o == NULL || o->cull != st->cull)
+        GX_SetCullMode(tnl_cull_mode(st->cull));
+    tnl_cur = *st;
+    tnl_valid = true;
+
+    if (st->textured && texture_storage[texture_units[0]].data != NULL)
+        gx_load_tex(0, texture_units[0]);
+
+    if (gBenchOn)
+        bench_gpu_class(BENCH_GPU_WORLD);
+    if (hr_recording && cur_proj != tnl_hr_proj)
+    {
+        // A CPU-path draw since the last GPU-path one switched to its own projection
+        cur_proj = tnl_hr_proj;
+        hr_state_changed();
+    }
+    if (!hr_recording && !tnl_proj_loaded)
+    {
+        GX_LoadProjectionMtx(tnl_proj, GX_PERSPECTIVE);
+        tnl_proj_loaded = true;
+    }
+    const f32 want_far_z = st->decal ? (1.0f - decal_bias) : 1.0f;
+    if (want_far_z != applied_far_z)
+        gx_issue_viewport(want_far_z);
+    if (hr_recording)
+        hr_seg_drawn = true;
+
+    GX_Begin(GX_TRIANGLES, GX_VTXFMT1, n);
+    for (int i = 0; i < n; i++)
+    {
+        GX_MatrixIndex1x8(mtx[i]);
+        GX_Position1x16(idx[i]);
+        GX_Normal1x16(idx[i]);
+        GX_Color1x16(idx[i]);
+        GX_TexCoord1x16(idx[i]);
     }
     GX_End();
 }
@@ -1146,6 +1764,13 @@ static void gx_bench_draw_overlay(void)
     if (!bench_overlay_enabled())
         return;
     bench_push(BENCH_OVERLAY);
+    // The frame may have ended with GPU-path draws (opt_gpu_tnl): reset what they change
+    if (tnl_active && !hr_enabled)
+        gx_tnl_leave();
+    GX_SetCullMode(GX_CULL_NONE);
+    GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, (GXColor){ 0, 0, 0, 255 });
+    if (hr_enabled)
+        gx_set_fixed_vtx_desc();
 
     if (ov_tex == NULL) {
         ov_tex = memalign(32, OV_TEX_W * OV_TEX_H * sizeof(uint16_t));
@@ -1205,6 +1830,7 @@ static void gx_bench_draw_overlay(void)
     GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
     GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
     GX_LoadTexObj(&ov_texobj, GX_TEXMAP0);
+    gx_invalidate_loaded_tex();
 
     const f32 vx[4] = { x0, x1, x1, x0 }, vy[4] = { y0, y0, y1, y1 };
     const f32 vs[4] = { 0.0f, 1.0f, 1.0f, 0.0f }, vt[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
@@ -1305,11 +1931,12 @@ static void gx_init()
 {
     // initialise graphics
     GX_Init(gp_fifo, DEFAULT_FIFO_SIZE);
+    gpu_heap_init();
 
     dbglog("gx_init: GX_Init done");
     if (gfx_gx_wm_hires())
     {
-        hr_dl = memalign(32, HIRES_DL_SIZE);
+        hr_dl = gpu_alloc(HIRES_DL_SIZE);
         dbglog("gx_init: hires display list buffer %p", hr_dl);
         if (hr_dl != NULL)
         {
@@ -1320,7 +1947,7 @@ static void gx_init()
             dbglog("gx_init: tiles %dx%d of %dx%d", hr_tiles_x, hr_tiles_y, hr_tile_w, hr_tile_h);
             if (gfx_gx_wm_crop()) {
                 const u32 bytes = (u32)gfx_gx_wm_get_rmode()->fbWidth * hr_tile_h * 2;
-                hr_crop_scratch = memalign(32, bytes);
+                hr_crop_scratch = gpu_alloc(bytes);
                 if (hr_crop_scratch != NULL)
                     DCInvalidateRange(hr_crop_scratch, bytes); // GPU-written only
                 dbglog("gx_init: crop scratch %p (%u bytes)", hr_crop_scratch, (unsigned)bytes);
@@ -1384,12 +2011,20 @@ static void gfx_gx_start_frame(void)
     {
         hr_nseg = 0;
         hr_pos = 0;
+        hw_nproj = 0;
+        sw_persp_proj = PROJ_PERSP;
         hr_overflow = false;
         hr_recording = true;
         hr_begin_seg();
 
         // Each tile replays this frame from the state the previous replay left behind, so the
         // frame has to start by setting everything gfx_pc expects to carry over between frames
+        // (including undoing whatever GPU-path draws changed)
+        tnl_active = false;
+        tnl_valid = false;
+        GX_SetCullMode(GX_CULL_NONE);
+        GX_SetFog(GX_FOG_NONE, 0.0f, 1.0f, 0.0f, 1.0f, (GXColor){ 0, 0, 0, 255 });
+        gx_set_fixed_vtx_desc();
         if (shader_program_pool_size > 0)
             gfx_gx_load_shader(&shader_program_pool[current_shader]);
         gfx_gx_set_use_alpha(cur_use_alpha);
@@ -1400,6 +2035,7 @@ static void gfx_gx_start_frame(void)
         bench_frame_start_gpu();
 
     GX_InvalidateTexAll();
+    gx_invalidate_loaded_tex();
     set_z_mode();
 }
 
@@ -1414,7 +2050,8 @@ static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int
     const f32 a = (f32)seg->vp[2] / tw;
     const f32 b = (2.0f * (f32)(seg->vp[0] - tile_x0) + (f32)seg->vp[2]) / tw - 1.0f;
 
-    memcpy(m, seg->is_2d ? gx_ortho_mtx : gx_perspective_mtx, sizeof(m));
+    memcpy(m, seg->proj == PROJ_ORTHO ? gx_ortho_mtx : seg->proj == PROJ_PERSP ? gx_perspective_mtx
+                                                    : hw_proj[seg->proj - PROJ_HW], sizeof(m));
     for (int j = 0; j < 4; j++)
         m[0][j] = a * m[0][j] + b * m[3][j];
     if (hr_tiles_y > 1) {
@@ -1423,7 +2060,7 @@ static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int
         for (int j = 0; j < 4; j++)
             m[1][j] = ay * m[1][j] + by * m[3][j];
     }
-    GX_LoadProjectionMtx(m, seg->is_2d ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
+    GX_LoadProjectionMtx(m, seg->proj == PROJ_ORTHO ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
 }
 
 static void hr_replay(void)
@@ -1437,9 +2074,21 @@ static void hr_replay(void)
         const int tile_x0 = tx * hr_tile_w, tile_x1 = tile_x0 + hr_tile_w;
         const int tile_y0 = ty * hr_tile_h, tile_y1 = tile_y0 + hr_tile_h;
 
+        const struct HiresSeg *prev = NULL;
         for (int i = 0; i < hr_nseg; i++)
         {
             const struct HiresSeg *seg = &hr_segs[i];
+            if (seg->cullable && (seg->bb[2] <= tile_x0 || seg->bb[0] >= tile_x1
+                                  || seg->bb[3] <= tile_y0 || seg->bb[1] >= tile_y1))
+                continue; // this draw misses the tile
+            // Projection, viewport and scissor only change between segments with different ones
+            if (prev != NULL && configOptStateCache && prev->proj == seg->proj && prev->far_z == seg->far_z
+                && memcmp(prev->vp, seg->vp, sizeof(seg->vp)) == 0 && memcmp(prev->sc, seg->sc, sizeof(seg->sc)) == 0)
+            {
+                GX_CallDispList(hr_dl + seg->offset, seg->size);
+                continue;
+            }
+            prev = seg;
             int x0 = MAX(seg->sc[0], tile_x0);
             int x1 = MIN(seg->sc[0] + seg->sc[2], tile_x1);
 

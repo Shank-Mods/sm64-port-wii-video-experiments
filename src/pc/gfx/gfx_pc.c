@@ -18,6 +18,12 @@
 #include "../configfile.h"
 #include "../bench.h"
 
+#ifdef TARGET_GX
+// gfx_gx.c: converts N64 texture data straight into a native GX format (false = not handled)
+bool gfx_gx_upload_texture_n64(uint8_t fmt, uint8_t siz, const uint8_t *addr, uint32_t size_bytes,
+                               uint32_t line_size_bytes, const uint8_t *palette);
+#endif
+
 #define SUPPORT_CHECK(x) assert(x)
 
 // SCALE_M_N: upscale/downscale M-bit integer to N-bit
@@ -53,6 +59,15 @@ struct LoadedVertex {
     float u, v;
     struct RGBA color;
     uint8_t clip_rej;
+#ifdef TARGET_GX
+    // GPU vertex path (opt_gpu_tnl)
+    uint8_t tnl_flags;   // TNL_HW: in the arena, TNL_SW: x..clip_rej valid, TNL_LIT: loaded lit
+    uint8_t tnl_slot;    // GX matrix slot holding its modelview
+    uint16_t tnl_idx;    // index in this frame's arrays
+    uint32_t tnl_gen;    // slot generation when loaded
+    uint32_t tnl_pver;   // projection version when loaded
+    Vtx raw;             // for a late CPU transform if a triangle can't take the GPU path
+#endif
 };
 
 struct TextureHashmapNode {
@@ -94,6 +109,8 @@ static struct RSP {
     Light_t current_lights[MAX_LIGHTS + 1];
     float current_lights_coeffs[MAX_LIGHTS][3];
     float current_lookat_coeffs[2][3]; // lookat_x, lookat_y
+    float ps_light[MAX_LIGHTS][4];     // light coeffs / 127, padded for paired-single loads
+    float ps_lookat[2][4];
     uint8_t current_num_lights; // includes ambient light
     bool lights_changed;
 
@@ -164,6 +181,37 @@ static size_t buf_vbo_num_tris;
 static struct GfxWindowManagerAPI *gfx_wapi;
 static struct GfxRenderingAPI *gfx_rapi;
 
+#ifdef TARGET_GX
+#include <malloc.h>
+#include <ogc/cache.h>
+#include "gfx_gx_tnl.h"
+#define TNL_HW 1
+#define TNL_SW 2
+#define TNL_LIT 4
+#define TNL_MAX_VTX 32768
+#define TNL_MAX_BUF (MAX_BUFFERED * 3)
+static float *tnl_pos;            // per frame: position xyz
+static int16_t *tnl_tc;           //            texcoord st
+static uint8_t *tnl_col;          //            colour rgba / normal xyz + alpha
+static uint32_t tnl_n, tnl_stored; // vertices written / written back to memory for the GPU
+static bool tnl_on;               // GPU path in use this frame
+static uint32_t mv_version = 1, p_version = 1;
+static uint32_t mv_checked, p_checked, p_sent;
+static bool mv_affine, mv_uniform, p_ok;
+static float mv_nscale;
+static float p_gx[4][4];
+static int tnl_slot;               // slot holding the current modelview (0 = none)
+static uint32_t tnl_slot_mvv;
+static uint32_t slot_gen[GX_TNL_MAX_SLOTS];
+static int next_slot = 1;
+static uint8_t tnl_buf_mtx[TNL_MAX_BUF];
+static uint16_t tnl_buf_idx[TNL_MAX_BUF];
+static int tnl_buf_n;
+static struct GxTnlState tnl_st;   // state of the buffered GPU-path triangles
+static uint32_t tnl_stat_hw, tnl_stat_sw, tnl_stat_late;
+static void tnl_flush(void);
+#endif
+
 static uint32_t gfx_hash_bytes(const uint8_t *data, uint32_t size) {
     uint32_t hash = 2166136261U;
 
@@ -171,12 +219,52 @@ static uint32_t gfx_hash_bytes(const uint8_t *data, uint32_t size) {
         return hash;
     }
 
-    for (uint32_t i = 0; i < size; i++) {
+    uint32_t i = 0;
+#ifdef TARGET_GX
+    // A word at a time where aligned (FNV-1a over 32-bit words): 4x fewer multiplies. The hash
+    // only has to be consistent for a given address, which it is
+    if (((uintptr_t)data & 3) == 0) {
+        const uint32_t *w = (const uint32_t *)data;
+        for (; i + 4 <= size; i += 4) {
+            hash ^= *w++;
+            hash *= 16777619U;
+        }
+    }
+#endif
+    for (; i < size; i++) {
         hash ^= data[i];
         hash *= 16777619U;
     }
     return hash;
 }
+
+#ifdef TARGET_GX
+// opt_tex_hash: every texture switch used to hash the texture's bytes again, even when it was
+// already cached. Texture data doesn't change while a frame's display list is processed, so a
+// hash is remembered for the rest of the frame.
+static uint32_t gfx_frame_no = 1;
+static struct {
+    const uint8_t *addr;
+    uint32_t size, frame, hash;
+} hash_memo[512];
+
+static uint32_t gfx_hash_cached(const uint8_t *data, uint32_t size) {
+    if (!configOptTexHash || data == NULL) {
+        return gfx_hash_bytes(data, size);
+    }
+    uint32_t slot = ((uint32_t)(uintptr_t)data >> 3 ^ size) & 511;
+    if (hash_memo[slot].addr == data && hash_memo[slot].size == size && hash_memo[slot].frame == gfx_frame_no) {
+        return hash_memo[slot].hash;
+    }
+    hash_memo[slot].addr = data;
+    hash_memo[slot].size = size;
+    hash_memo[slot].frame = gfx_frame_no;
+    hash_memo[slot].hash = gfx_hash_bytes(data, size);
+    return hash_memo[slot].hash;
+}
+#else
+#define gfx_hash_cached gfx_hash_bytes
+#endif
 
 #include <time.h>
 static unsigned long get_time(void) {
@@ -186,6 +274,11 @@ static unsigned long get_time(void) {
 }
 
 static void gfx_flush(void) {
+#ifdef TARGET_GX
+    if (tnl_buf_n > 0) {
+        tnl_flush();
+    }
+#endif
     if (buf_vbo_len > 0) {
         int num = buf_vbo_num_tris;
         unsigned long t0 = get_time();
@@ -517,12 +610,12 @@ static void import_texture_impl(int tile) {
     uint8_t siz = rdp.texture_tile.siz;
     uint32_t size_bytes = rdp.loaded_texture[tile].size_bytes;
     uint32_t line_size_bytes = rdp.texture_tile.line_size_bytes;
-    uint32_t texture_hash = gfx_hash_bytes(rdp.loaded_texture[tile].addr, size_bytes);
+    uint32_t texture_hash = gfx_hash_cached(rdp.loaded_texture[tile].addr, size_bytes);
     uint32_t palette_hash = 0;
 
     if (fmt == G_IM_FMT_CI) {
         uint32_t palette_size = (siz == G_IM_SIZ_4b) ? 16 * 2 : 256 * 2;
-        palette_hash = gfx_hash_bytes(rdp.palette, palette_size);
+        palette_hash = gfx_hash_cached(rdp.palette, palette_size);
     }
 
     if (gfx_texture_cache_lookup(tile, &rendering_state.textures[tile], rdp.loaded_texture[tile].addr,
@@ -530,6 +623,13 @@ static void import_texture_impl(int tile) {
         return;
     }
 
+#ifdef TARGET_GX
+    // opt_native_tex: straight from N64 data to a native GX format, with no RGBA32 step
+    if (configOptNativeTex && gfx_gx_upload_texture_n64(fmt, siz, rdp.loaded_texture[tile].addr, size_bytes,
+                                                        line_size_bytes, rdp.palette)) {
+        return;
+    }
+#endif
     int t0 = get_time();
     if (fmt == G_IM_FMT_RGBA) {
         if (siz == G_IM_SIZ_16b) {
@@ -625,6 +725,15 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
     memcpy(matrix, addr, sizeof(matrix));
 #endif
 
+#ifdef TARGET_GX
+    if (parameters & G_MTX_PROJECTION) {
+        p_version++;
+        if (tnl_on)
+            gfx_flush(); // buffered triangles use the depth planes of the old projection
+    } else {
+        mv_version++;
+    }
+#endif
     if (parameters & G_MTX_PROJECTION) {
         if (parameters & G_MTX_LOAD) {
             memcpy(rsp.P_matrix, matrix, sizeof(matrix));
@@ -647,6 +756,9 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t *addr) {
 }
 
 static void gfx_sp_pop_matrix(uint32_t count) {
+#ifdef TARGET_GX
+    mv_version++;
+#endif
     while (count--) {
         if (rsp.modelview_matrix_stack_size > 0) {
             --rsp.modelview_matrix_stack_size;
@@ -663,24 +775,306 @@ static float gfx_adjust_x_for_aspect_ratio(float x) {
 
 static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *vertices);
 
-static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
-    bench_push(BENCH_VERTEX);
-    gfx_sp_vertex_impl(n_vertices, dest_index, vertices);
+#ifdef TARGET_GX
+// ---------------------------------------------------------------------------------------------
+// GPU vertex path (opt_gpu_tnl)
+
+// The projection in GX_PERSPECTIVE form (columns: x' = p00 ex + p02 ez, y' = p11 ey + p12 ez,
+// z' = p22 ez + p23, w' = -ez), or false if the N64 matrix doesn't have that shape (orthographic
+// HUD projections, anything unusual: those stay on the CPU path). Depth uses the same range as the
+// CPU path, which feeds GX the N64 clip w (= s * -ez), so the two paths' depths agree.
+static bool tnl_make_proj(void) {
+    const float (*P)[4] = rsp.P_matrix;
+    float mx = 0.0f;
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            if (fabsf(P[i][j]) > mx) mx = fabsf(P[i][j]);
+    const float eps = mx * 1e-6f;
+    if (fabsf(P[1][0]) > eps || fabsf(P[3][0]) > eps || fabsf(P[0][1]) > eps || fabsf(P[3][1]) > eps
+        || fabsf(P[0][2]) > eps || fabsf(P[1][2]) > eps
+        || fabsf(P[0][3]) > eps || fabsf(P[1][3]) > eps || fabsf(P[3][3]) > eps)
+        return false;
+    const float s = -P[2][3];
+    if (!(s > 0.0f))
+        return false;
+    // N64 near and far planes in clip-w units: z/w = -1 and +1, with z = A w + B
+    const float A = -P[2][2] / s, B = P[3][2];
+    const float wn = B / (-1.0f - A), wf = B / (1.0f - A);
+    if (!(wn > 0.0f) || !(wf > wn))
+        return false;
+    gfx_gx_tnl_set_depth(wn, wf); // both paths use them from here on
+    const float k = (4.0f / 3.0f) / gfx_current_dimensions.aspect_ratio;
+    const float n = gfx_gx_tnl_near(), f = gfx_gx_tnl_far();
+    memset(p_gx, 0, sizeof(p_gx));
+    p_gx[0][0] = k * P[0][0] / s;
+    p_gx[0][2] = k * P[2][0] / s;
+    p_gx[1][1] = P[1][1] / s;
+    p_gx[1][2] = P[2][1] / s;
+    p_gx[2][2] = -n / (f - n);
+    p_gx[2][3] = -(n * f) / ((f - n) * s);
+    p_gx[3][2] = -1.0f;
+    return true;
+}
+
+// Projection and depth planes for the current P (both paths' depth follows it)
+static void tnl_update_proj(void) {
+    if (p_checked != p_version) {
+        p_ok = tnl_make_proj();
+        p_checked = p_version;
+    }
+}
+
+// Modelview checks: affine (GX position matrices are 3x4), and for lighting a uniform scale (the
+// N64 normalises each light's direction in object space; with a uniform scale that equals
+// dividing the normal matrix by the scale)
+static void tnl_check_mv(void) {
+    const float (*M)[4] = rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1];
+    mv_affine = fabsf(M[0][3]) < 1e-6f && fabsf(M[1][3]) < 1e-6f && fabsf(M[2][3]) < 1e-6f
+                && fabsf(M[3][3] - 1.0f) < 1e-5f;
+    float l[3];
+    for (int r = 0; r < 3; r++)
+        l[r] = sqrtf(M[r][0] * M[r][0] + M[r][1] * M[r][1] + M[r][2] * M[r][2]);
+    const float d01 = M[0][0] * M[1][0] + M[0][1] * M[1][1] + M[0][2] * M[1][2];
+    const float d02 = M[0][0] * M[2][0] + M[0][1] * M[2][1] + M[0][2] * M[2][2];
+    const float d12 = M[1][0] * M[2][0] + M[1][1] * M[2][1] + M[1][2] * M[2][2];
+    const float lm = l[0];
+    mv_uniform = lm > 1e-6f && fabsf(l[1] - lm) < lm * 0.01f && fabsf(l[2] - lm) < lm * 0.01f
+                 && fabsf(d01) < lm * lm * 0.01f && fabsf(d02) < lm * lm * 0.01f && fabsf(d12) < lm * lm * 0.01f;
+    // S8 normals carry 6 fraction bits (n / 64); the N64 uses n / 127
+    mv_nscale = mv_uniform ? (64.0f / 127.0f) / lm : 0.0f;
+}
+
+// Combiner fields that need the CPU path (TEXEL1, LOD), from the raw combine mode
+static bool tnl_cc_needs_cpu(uint32_t cc) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t v = (cc >> (i * 3)) & 7;
+        if (v == CC_TEXEL1 || v == CC_LOD)
+            return true;
+    }
+    return false;
+}
+
+// Can this vertex batch go to the GPU path? (Triangles can still fall back individually.)
+static bool tnl_batch_ok(void) {
+    if (!tnl_on || rsp.modelview_matrix_stack_size == 0)
+        return false;
+    tnl_update_proj(); // first: CPU-path batches use its depth planes too
+    if (rsp.geometry_mode & G_TEXTURE_GEN)
+        return false;
+    if (!p_ok)
+        return false;
+    if (mv_checked != mv_version) {
+        tnl_check_mv();
+        mv_checked = mv_version;
+    }
+    if (!mv_affine)
+        return false;
+    if ((rsp.geometry_mode & G_LIGHTING) && !mv_uniform)
+        return false;
+    // predicted fallbacks: cheaper to transform on the CPU now than late
+    if (tnl_cc_needs_cpu(rdp.combine_mode))
+        return false;
+    if ((rdp.other_mode_l >> 30) == G_BL_CLR_FOG && !(rsp.geometry_mode & G_FOG))
+        return false;
+    return true;
+}
+
+static void tnl_load_vertices(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+    if (tnl_slot == 0 || tnl_slot_mvv != mv_version) {
+        // Pending triangles may still use the slot about to be overwritten
+        gfx_flush();
+        const int slot = next_slot;
+        next_slot = next_slot % (GX_TNL_MAX_SLOTS - 1) + 1; // 1..9
+        // The normal matrix is loaded whatever the lighting mode: lighting can come on later
+        // under the same modelview (0 when the scale isn't uniform; lit batches then don't come here)
+        gfx_gx_tnl_load_mtx(slot, rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1], mv_nscale);
+        slot_gen[slot]++;
+        tnl_slot = slot;
+        tnl_slot_mvv = mv_version;
+    }
+    const uint8_t lit = (rsp.geometry_mode & G_LIGHTING) ? TNL_LIT : 0;
+    for (size_t i = 0; i < n_vertices; i++, dest_index++) {
+        const Vtx_t *v = &vertices[i].v;
+        struct LoadedVertex *d = &rsp.loaded_vertices[dest_index];
+        const uint32_t k = tnl_n++;
+        tnl_pos[3 * k + 0] = v->ob[0];
+        tnl_pos[3 * k + 1] = v->ob[1];
+        tnl_pos[3 * k + 2] = v->ob[2];
+        tnl_tc[2 * k + 0] = v->tc[0];
+        tnl_tc[2 * k + 1] = v->tc[1];
+        memcpy(&tnl_col[4 * k], v->cn, 4); // colour, or normal xyz + alpha
+        d->tnl_flags = TNL_HW | lit;
+        d->tnl_slot = (uint8_t)tnl_slot;
+        d->tnl_idx = (uint16_t)k;
+        d->tnl_gen = slot_gen[tnl_slot];
+        d->tnl_pver = p_version;
+        d->raw = vertices[i];
+    }
+}
+
+// A triangle on the GPU path that turned out to need the CPU path: transform its vertices now,
+// with the current matrices (in display lists these are the ones they were loaded with)
+static void tnl_ensure_sw(struct LoadedVertex *d) {
+    if ((d->tnl_flags & (TNL_HW | TNL_SW)) != TNL_HW)
+        return;
+    const size_t idx = d - rsp.loaded_vertices;
+    Vtx tmp = d->raw;
+    const uint8_t flags = d->tnl_flags;
+    gfx_sp_vertex_impl(1, idx, &tmp);
+    d->tnl_flags = flags | TNL_SW;
+    tnl_stat_late++;
+}
+
+static void tnl_flush(void) {
+    const int n = tnl_buf_n;
+    tnl_buf_n = 0;
+    if (tnl_stored < tnl_n) {
+        // The GPU reads the arrays from memory
+        DCStoreRange(tnl_pos + 3 * tnl_stored, (tnl_n - tnl_stored) * 12);
+        DCStoreRange(tnl_tc + 2 * tnl_stored, (tnl_n - tnl_stored) * 4);
+        DCStoreRange(tnl_col + 4 * tnl_stored, (tnl_n - tnl_stored) * 4);
+        tnl_stored = tnl_n;
+    }
+    if (p_sent != p_version) {
+        gfx_gx_tnl_set_proj(p_gx);
+        p_sent = p_version;
+    }
+    bench_push(BENCH_SUBMIT);
+    gfx_gx_tnl_draw(&tnl_st, tnl_buf_mtx, tnl_buf_idx, n);
     bench_pop();
 }
 
+static void tnl_begin_frame(void) {
+    tnl_on = configOptGpuTnl;
+    if (tnl_on && tnl_pos == NULL) {
+        tnl_pos = memalign(32, TNL_MAX_VTX * 12);
+        tnl_tc = memalign(32, TNL_MAX_VTX * 4);
+        tnl_col = memalign(32, TNL_MAX_VTX * 4);
+        if (tnl_pos == NULL || tnl_tc == NULL || tnl_col == NULL) {
+            configOptGpuTnl = false;
+            tnl_on = false;
+            return;
+        }
+    }
+    tnl_n = tnl_stored = 0;
+    tnl_buf_n = 0;
+    tnl_slot = 0;
+    p_checked = p_sent = 0; // aspect may have changed; resend the projection every frame
+    for (int i = 0; i < MAX_VERTICES + 4; i++)
+        rsp.loaded_vertices[i].tnl_flags = 0;
+    if (tnl_on)
+        gfx_gx_tnl_begin_frame(tnl_pos, tnl_tc, tnl_col);
+    static uint32_t frames;
+    if (++frames % 300 == 0) {
+        dbglog("gpu tnl: last 300 frames %u gpu tris, %u cpu tris, %u late cpu transforms",
+               (unsigned)tnl_stat_hw, (unsigned)tnl_stat_sw, (unsigned)tnl_stat_late);
+        tnl_stat_hw = tnl_stat_sw = tnl_stat_late = 0;
+    }
+}
+#endif
+
+static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+    bench_push(BENCH_VERTEX);
+#ifdef TARGET_GX
+    if (tnl_batch_ok() && tnl_n + n_vertices <= TNL_MAX_VTX && dest_index + n_vertices <= MAX_VERTICES) {
+        tnl_load_vertices(n_vertices, dest_index, vertices);
+        bench_pop();
+        return;
+    }
+#endif
+    gfx_sp_vertex_impl(n_vertices, dest_index, vertices);
+#ifdef TARGET_GX
+    for (size_t i = 0; i < n_vertices && dest_index + i < MAX_VERTICES + 4; i++)
+        rsp.loaded_vertices[dest_index + i].tnl_flags = TNL_SW;
+#endif
+    bench_pop();
+}
+
+#ifdef TARGET_GX
+// Paired-single helpers (opt_ps_vertex). The transform does two lanes per instruction. Positions
+// are already floats in this port (F3DEX2E defines GBI_FLOATS); normals are s8, and the quantized
+// load (psq_l through GQR7 = s8) turns them into floats in hardware, where the C version needs a
+// trip through memory per component (Broadway has no integer-to-float instruction).
+static inline void ps_set_gqrs(void) {
+    __asm__ volatile("mtspr 918,%0\n\tmtspr 919,%1" : : "r"(0x00070007u), "r"(0x00060006u));
+}
+
+// out[0..3] = (x, y, z, 1) * M for a float position
+static inline void ps_xform(const float *ob, const float *m, float *out) {
+    __asm__ volatile(
+        "psq_l 0,0(%0),0,0\n\t"     // (x, y)
+        "psq_l 1,8(%0),1,0\n\t"     // (z, 1)
+        "psq_l 2,0(%1),0,0\n\t"     // m00 m01
+        "psq_l 3,8(%1),0,0\n\t"     // m02 m03
+        "psq_l 4,16(%1),0,0\n\t"    // m10 m11
+        "psq_l 5,24(%1),0,0\n\t"    // m12 m13
+        "psq_l 6,32(%1),0,0\n\t"    // m20 m21
+        "psq_l 7,40(%1),0,0\n\t"    // m22 m23
+        "psq_l 8,48(%1),0,0\n\t"    // m30 m31
+        "psq_l 9,56(%1),0,0\n\t"    // m32 m33
+        "ps_madds0 10,2,0,8\n\t"    // (X, Y)  = row0 * x + row3
+        "ps_madds0 11,3,0,9\n\t"    // (Z, W)
+        "ps_madds1 10,4,0,10\n\t"   //        + row1 * y
+        "ps_madds1 11,5,0,11\n\t"
+        "ps_madds0 10,6,1,10\n\t"   //        + row2 * z
+        "ps_madds0 11,7,1,11\n\t"
+        "psq_st 10,0(%2),0,0\n\t"
+        "psq_st 11,8(%2),0,0"
+        :
+        : "b"(ob), "b"(m), "b"(out)
+        : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "memory");
+}
+
+// n . c for an s8 normal and c = (c0, c1, c2, 0)
+static inline float ps_ndot(const int8_t *n, const float *c) {
+    float r;
+    __asm__ volatile(
+        "psq_l 0,0(%1),0,7\n\t"     // (n0, n1)
+        "psq_l 1,2(%1),1,7\n\t"     // (n2, 1)
+        "psq_l 2,0(%2),0,0\n\t"     // (c0, c1)
+        "psq_l 3,8(%2),0,0\n\t"     // (c2, 0)
+        "ps_mul 4,0,2\n\t"
+        "ps_madd 5,1,3,4\n\t"       // (n0c0 + n2c2, n1c1)
+        "ps_sum0 %0,5,5,5"
+        : "=f"(r)
+        : "b"(n), "b"(c)
+        : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "memory");
+    return r;
+}
+#endif
+
 static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *vertices) {
+#ifdef TARGET_GX
+    const bool ps = configOptPsVertex;
+    if (ps) {
+        ps_set_gqrs();
+    }
+    const float aspect_x = (4.0f / 3.0f) / gfx_current_dimensions.aspect_ratio;
+#endif
     for (size_t i = 0; i < n_vertices; i++, dest_index++) {
         const Vtx_t *v = &vertices[i].v;
         const Vtx_tn *vn = &vertices[i].n;
         struct LoadedVertex *d = &rsp.loaded_vertices[dest_index];
 
-        float x = v->ob[0] * rsp.MP_matrix[0][0] + v->ob[1] * rsp.MP_matrix[1][0] + v->ob[2] * rsp.MP_matrix[2][0] + rsp.MP_matrix[3][0];
-        float y = v->ob[0] * rsp.MP_matrix[0][1] + v->ob[1] * rsp.MP_matrix[1][1] + v->ob[2] * rsp.MP_matrix[2][1] + rsp.MP_matrix[3][1];
-        float z = v->ob[0] * rsp.MP_matrix[0][2] + v->ob[1] * rsp.MP_matrix[1][2] + v->ob[2] * rsp.MP_matrix[2][2] + rsp.MP_matrix[3][2];
-        float w = v->ob[0] * rsp.MP_matrix[0][3] + v->ob[1] * rsp.MP_matrix[1][3] + v->ob[2] * rsp.MP_matrix[2][3] + rsp.MP_matrix[3][3];
+        float x, y, z, w;
+#ifdef TARGET_GX
+        if (ps) {
+            float o[4] __attribute__((aligned(8)));
+            ps_xform(v->ob, &rsp.MP_matrix[0][0], o);
+            x = o[0] * aspect_x;
+            y = o[1];
+            z = o[2];
+            w = o[3];
+        } else
+#endif
+        {
+        x = v->ob[0] * rsp.MP_matrix[0][0] + v->ob[1] * rsp.MP_matrix[1][0] + v->ob[2] * rsp.MP_matrix[2][0] + rsp.MP_matrix[3][0];
+        y = v->ob[0] * rsp.MP_matrix[0][1] + v->ob[1] * rsp.MP_matrix[1][1] + v->ob[2] * rsp.MP_matrix[2][1] + rsp.MP_matrix[3][1];
+        z = v->ob[0] * rsp.MP_matrix[0][2] + v->ob[1] * rsp.MP_matrix[1][2] + v->ob[2] * rsp.MP_matrix[2][2] + rsp.MP_matrix[3][2];
+        w = v->ob[0] * rsp.MP_matrix[0][3] + v->ob[1] * rsp.MP_matrix[1][3] + v->ob[2] * rsp.MP_matrix[2][3] + rsp.MP_matrix[3][3];
 
         x = gfx_adjust_x_for_aspect_ratio(x);
+        }
 
         short U = v->tc[0] * rsp.texture_scaling_factor.s >> 16;
         short V = v->tc[1] * rsp.texture_scaling_factor.t >> 16;
@@ -695,6 +1089,18 @@ static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *
                 calculate_normal_dir(&lookat_x, rsp.current_lookat_coeffs[0]);
                 calculate_normal_dir(&lookat_y, rsp.current_lookat_coeffs[1]);
                 rsp.lights_changed = false;
+#ifdef TARGET_GX
+                for (int l = 0; l < rsp.current_num_lights - 1; l++) {
+                    for (int k = 0; k < 3; k++)
+                        rsp.ps_light[l][k] = rsp.current_lights_coeffs[l][k] / 127.0f;
+                    rsp.ps_light[l][3] = 0.0f;
+                }
+                for (int l = 0; l < 2; l++) {
+                    for (int k = 0; k < 3; k++)
+                        rsp.ps_lookat[l][k] = rsp.current_lookat_coeffs[l][k] / 127.0f;
+                    rsp.ps_lookat[l][3] = 0.0f;
+                }
+#endif
             }
 
             int r = rsp.current_lights[rsp.current_num_lights - 1].col[0];
@@ -703,10 +1109,17 @@ static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *
 
             for (int i = 0; i < rsp.current_num_lights - 1; i++) {
                 float intensity = 0;
+#ifdef TARGET_GX
+                if (ps) {
+                    intensity = ps_ndot(vn->n, rsp.ps_light[i]);
+                } else
+#endif
+                {
                 intensity += vn->n[0] * rsp.current_lights_coeffs[i][0];
                 intensity += vn->n[1] * rsp.current_lights_coeffs[i][1];
                 intensity += vn->n[2] * rsp.current_lights_coeffs[i][2];
                 intensity /= 127.0f;
+                }
                 if (intensity > 0.0f) {
                     r += intensity * rsp.current_lights[i].col[0];
                     g += intensity * rsp.current_lights[i].col[1];
@@ -720,12 +1133,21 @@ static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *
 
             if (rsp.geometry_mode & G_TEXTURE_GEN) {
                 float dotx = 0, doty = 0;
+#ifdef TARGET_GX
+                if (ps) {
+                    // already divided by 127; the formula below divides again, so scale back
+                    dotx = ps_ndot(vn->n, rsp.ps_lookat[0]) * 127.0f;
+                    doty = ps_ndot(vn->n, rsp.ps_lookat[1]) * 127.0f;
+                } else
+#endif
+                {
                 dotx += vn->n[0] * rsp.current_lookat_coeffs[0][0];
                 dotx += vn->n[1] * rsp.current_lookat_coeffs[0][1];
                 dotx += vn->n[2] * rsp.current_lookat_coeffs[0][2];
                 doty += vn->n[0] * rsp.current_lookat_coeffs[1][0];
                 doty += vn->n[1] * rsp.current_lookat_coeffs[1][1];
                 doty += vn->n[2] * rsp.current_lookat_coeffs[1][2];
+                }
 
                 U = (int32_t)((dotx / 127.0f + 1.0f) / 4.0f * rsp.texture_scaling_factor.s);
                 V = (int32_t)((doty / 127.0f + 1.0f) / 4.0f * rsp.texture_scaling_factor.t);
@@ -776,17 +1198,12 @@ static void gfx_sp_vertex_impl(size_t n_vertices, size_t dest_index, const Vtx *
     }
 }
 
-static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
-    struct LoadedVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
-    struct LoadedVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
-    struct LoadedVertex *v3 = &rsp.loaded_vertices[vtx3_idx];
-    struct LoadedVertex *v_arr[3] = {v1, v2, v3};
-
-    //if (rand()%2) return;
-
+// Trivial rejection and back-face culling on CPU-transformed vertices
+static bool sw_tri_rejected(const struct LoadedVertex *v1, const struct LoadedVertex *v2,
+                            const struct LoadedVertex *v3) {
     if (v1->clip_rej & v2->clip_rej & v3->clip_rej) {
         // The whole triangle lies outside the visible area
-        return;
+        return true;
     }
 
     if ((rsp.geometry_mode & G_CULL_BOTH) != 0) {
@@ -804,16 +1221,49 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
 
         switch (rsp.geometry_mode & G_CULL_BOTH) {
             case G_CULL_FRONT:
-                if (cross <= 0) return;
+                if (cross <= 0) return true;
                 break;
             case G_CULL_BACK:
-                if (cross >= 0) return;
+                if (cross >= 0) return true;
                 break;
             case G_CULL_BOTH:
                 // Why is this even an option?
-                return;
+                return true;
         }
     }
+    return false;
+}
+
+static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
+    struct LoadedVertex *v1 = &rsp.loaded_vertices[vtx1_idx];
+    struct LoadedVertex *v2 = &rsp.loaded_vertices[vtx2_idx];
+    struct LoadedVertex *v3 = &rsp.loaded_vertices[vtx3_idx];
+    struct LoadedVertex *v_arr[3] = {v1, v2, v3};
+
+#ifdef TARGET_GX
+    // GPU path if all three vertices are in this frame's arrays under live matrix slots and the
+    // current projection, loaded with the current lighting mode (the GPU clips and culls)
+    const uint8_t lit_now = (rsp.geometry_mode & G_LIGHTING) ? TNL_LIT : 0;
+    bool hw = tnl_on && (v1->tnl_flags & v2->tnl_flags & v3->tnl_flags & TNL_HW)
+              && (v1->tnl_flags & TNL_LIT) == lit_now && (v2->tnl_flags & TNL_LIT) == lit_now
+              && (v3->tnl_flags & TNL_LIT) == lit_now
+              && v1->tnl_gen == slot_gen[v1->tnl_slot] && v2->tnl_gen == slot_gen[v2->tnl_slot]
+              && v3->tnl_gen == slot_gen[v3->tnl_slot]
+              && v1->tnl_pver == p_version && v2->tnl_pver == p_version && v3->tnl_pver == p_version;
+    if (hw) {
+        if ((rsp.geometry_mode & G_CULL_BOTH) == G_CULL_BOTH)
+            return;
+    } else {
+        tnl_ensure_sw(v1);
+        tnl_ensure_sw(v2);
+        tnl_ensure_sw(v3);
+        if (sw_tri_rejected(v1, v2, v3))
+            return;
+    }
+#else
+    if (sw_tri_rejected(v1, v2, v3))
+        return;
+#endif
 
     bool depth_test = (rsp.geometry_mode & G_ZBUFFER) == G_ZBUFFER;
     if (depth_test != rendering_state.depth_test) {
@@ -917,6 +1367,166 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
     uint32_t tex_height = (rdp.texture_tile.lrt - rdp.texture_tile.ult + 4) / 4;
 
     bool z_is_from_0_to_1 = gfx_rapi->z_is_from_0_to_1();
+
+#ifdef TARGET_GX
+    if (hw) {
+        bool lod = false;
+        for (int j = 0; j < 4; j++)
+            lod |= comb->shader_input_mapping[0][j] == CC_LOD || comb->shader_input_mapping[1][j] == CC_LOD;
+        if (!used_textures[1] && !lod && !(use_fog && !(rsp.geometry_mode & G_FOG))) {
+            struct GxTnlState st;
+            memset(&st, 0, sizeof(st));
+            st.prg = prg;
+            memcpy(st.map, comb->shader_input_mapping, sizeof(st.map));
+            memcpy(st.prim, &rdp.prim_color, 4);
+            memcpy(st.env, &rdp.env_color, 4);
+            st.textured = used_textures[0];
+            if (st.textured) {
+                // CPU path: u = ((tc * scale >> 16) - uls * 8) / 32 (+ 0.5 when filtered), / width
+                const bool linear = (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+                const float half = linear ? 0.5f : 0.0f;
+                st.texmtx[0][0] = rsp.texture_scaling_factor.s / 65536.0f / 32.0f / tex_width;
+                st.texmtx[0][3] = (-(float)rdp.texture_tile.uls / 4.0f + half) / tex_width;
+                st.texmtx[1][1] = rsp.texture_scaling_factor.t / 65536.0f / 32.0f / tex_height;
+                st.texmtx[1][3] = (-(float)rdp.texture_tile.ult / 4.0f + half) / tex_height;
+            }
+            st.lighting = lit_now != 0;
+            if (st.lighting) {
+                int nl = rsp.current_num_lights - 1;
+                if (nl < 0) nl = 0;
+                if (nl > 2) nl = 2;
+                st.num_lights = (uint8_t)nl;
+                for (int l = 0; l < nl; l++) {
+                    float d[3] = { rsp.current_lights[l].dir[0], rsp.current_lights[l].dir[1],
+                                   rsp.current_lights[l].dir[2] };
+                    float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                    if (len > 0.0f) {
+                        for (int k = 0; k < 3; k++)
+                            st.light_dir[l][k] = d[k] / len;
+                    }
+                    memcpy(st.light_col[l], rsp.current_lights[l].col, 3);
+                }
+                memcpy(st.ambient, rsp.current_lights[nl].col, 3);
+            }
+            st.alpha_one = use_fog; // shade alpha is 100% for fog
+            if (use_fog && configFog) {
+                // N64 fog is linear in z/w, and so is GX's screen depth d (both linear in 1/w):
+                // fog_z = A + B d, and GX's linear fog runs from d = -A/B to d = -A/B + 255/B
+                const float n = gfx_gx_tnl_near(), f = gfx_gx_tnl_far();
+                const float sc = -rsp.P_matrix[2][3];
+                const float p22 = rsp.P_matrix[2][2], p32 = rsp.P_matrix[3][2];
+                const float A = rsp.fog_mul * (-p22 / sc + p32 / n) + rsp.fog_offset;
+                const float B = -rsp.fog_mul * p32 * (f - n) / (f * n);
+                if (fabsf(B) > 1e-9f) {
+                    st.fog = 1;
+                    st.fog_start = -A / B;
+                    st.fog_end = st.fog_start + 255.0f / B;
+                    memcpy(st.fog_col, &rdp.fog_color, 3);
+                }
+            }
+            switch (rsp.geometry_mode & G_CULL_BOTH) {
+                case G_CULL_BACK: st.cull = 1; break;
+                case G_CULL_FRONT: st.cull = 2; break;
+                default: st.cull = 0; break;
+            }
+            st.decal = (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC;
+
+            if (buf_vbo_len > 0)
+                gfx_flush(); // keep the draw order
+            if (tnl_buf_n > 0 && memcmp(&st, &tnl_st, sizeof(st)) != 0)
+                tnl_flush();
+            tnl_st = st;
+            for (int i = 0; i < 3; i++) {
+                tnl_buf_mtx[tnl_buf_n] = (uint8_t)(v_arr[i]->tnl_slot * 3);
+                tnl_buf_idx[tnl_buf_n++] = v_arr[i]->tnl_idx;
+            }
+            tnl_stat_hw++;
+            if (tnl_buf_n >= TNL_MAX_BUF)
+                tnl_flush();
+            return;
+        }
+        // Not for the GPU path after all
+        tnl_ensure_sw(v1);
+        tnl_ensure_sw(v2);
+        tnl_ensure_sw(v3);
+        if (sw_tri_rejected(v1, v2, v3))
+            return;
+    }
+    if (tnl_buf_n > 0)
+        tnl_flush(); // keep the draw order
+    tnl_stat_sw++;
+
+    // GX layout: x y z w, [u v], [fog: packed RGBA8 = fog rgb + factor], one packed RGBA8 per
+    // combiner input. Colours stay bytes the whole way (they used to go byte -> float/255 ->
+    // *255 -> byte, with a divide per channel), and the texture scale is a multiply.
+    {
+        const bool linear = (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+        const float u_scale = use_texture ? 1.0f / (32.0f * tex_width) : 0.0f;
+        const float v_scale = use_texture ? 1.0f / (32.0f * tex_height) : 0.0f;
+        const float u_off = rdp.texture_tile.uls * 8 - (linear ? 16.0f : 0.0f); // +0.5 texel
+        const float v_off = rdp.texture_tile.ult * 8 - (linear ? 16.0f : 0.0f);
+        uint8_t lod = 0;
+        bool lod_done = false;
+        for (int i = 0; i < 3; i++) {
+            float z = v_arr[i]->z, w = v_arr[i]->w;
+            z = (z + w) * 0.5f;
+            buf_vbo[buf_vbo_len++] = v_arr[i]->x;
+            buf_vbo[buf_vbo_len++] = v_arr[i]->y;
+            buf_vbo[buf_vbo_len++] = z;
+            buf_vbo[buf_vbo_len++] = w;
+            if (use_texture) {
+                buf_vbo[buf_vbo_len++] = (v_arr[i]->u - u_off) * u_scale;
+                buf_vbo[buf_vbo_len++] = (v_arr[i]->v - v_off) * v_scale;
+            }
+            if (use_fog) {
+                uint32_t f = ((uint32_t)rdp.fog_color.r << 24) | ((uint32_t)rdp.fog_color.g << 16)
+                           | ((uint32_t)rdp.fog_color.b << 8) | v_arr[i]->color.a;
+                memcpy(&buf_vbo[buf_vbo_len++], &f, 4); // bits, never through the FPU
+            }
+            for (int j = 0; j < num_inputs; j++) {
+                const struct RGBA *c;
+                struct RGBA tmp;
+                uint8_t r = 0, g = 0, b = 0, a = 255;
+                for (int k = 0; k < 1 + (use_alpha ? 1 : 0); k++) {
+                    switch (comb->shader_input_mapping[k][j]) {
+                        case CC_PRIM: c = &rdp.prim_color; break;
+                        case CC_SHADE: c = &v_arr[i]->color; break;
+                        case CC_ENV: c = &rdp.env_color; break;
+                        case CC_LOD:
+                            if (!lod_done) {
+                                float distance_frac = (v1->w - 3000.0f) / 3000.0f;
+                                if (distance_frac < 0.0f) distance_frac = 0.0f;
+                                if (distance_frac > 1.0f) distance_frac = 1.0f;
+                                lod = (uint8_t)(distance_frac * 255.0f);
+                                lod_done = true;
+                            }
+                            tmp.r = tmp.g = tmp.b = tmp.a = lod;
+                            c = &tmp;
+                            break;
+                        default:
+                            tmp.r = tmp.g = tmp.b = tmp.a = 0;
+                            c = &tmp;
+                            break;
+                    }
+                    if (k == 0) {
+                        r = c->r;
+                        g = c->g;
+                        b = c->b;
+                    } else {
+                        a = (use_fog && c == &v_arr[i]->color) ? 255 : c->a; // shade alpha is 100% for fog
+                    }
+                }
+                uint32_t packed = ((uint32_t)r << 24) | ((uint32_t)g << 16) | ((uint32_t)b << 8) | a;
+                memcpy(&buf_vbo[buf_vbo_len++], &packed, 4);
+            }
+        }
+        (void)z_is_from_0_to_1;
+        if (++buf_vbo_num_tris == MAX_BUFFERED) {
+            gfx_flush();
+        }
+        return;
+    }
+#endif
 
     for (int i = 0; i < 3; i++) {
         float z = v_arr[i]->z, w = v_arr[i]->w;
@@ -1724,6 +2334,9 @@ struct GfxRenderingAPI *gfx_get_current_rendering_api(void) {
 }
 
 void gfx_start_frame(void) {
+#ifdef TARGET_GX
+    gfx_frame_no++;
+#endif
     gfx_wapi->handle_events();
     gfx_wapi->get_dimensions(&gfx_current_dimensions.width, &gfx_current_dimensions.height);
     if (gfx_current_dimensions.height == 0) {
@@ -1757,6 +2370,9 @@ void gfx_run(Gfx *commands) {
     double t0 = gfx_wapi->get_time();
     bench_push(BENCH_DLIST);
     gfx_rapi->start_frame();
+#ifdef TARGET_GX
+    tnl_begin_frame();
+#endif
     gfx_run_dl(commands);
     gfx_flush();
     bench_pop();
