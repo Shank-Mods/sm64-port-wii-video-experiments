@@ -94,7 +94,7 @@ struct HiresSeg {
 
 // Projection the current draws use: the CPU path's perspective or orthographic (2D) pass-through,
 // or one of this frame's GPU-path projections (opt_gpu_tnl)
-enum { PROJ_PERSP, PROJ_ORTHO, PROJ_HW };
+enum { PROJ_PERSP, PROJ_ORTHO, PROJ_SKY, PROJ_HW };
 #define HW_PROJ_MAX 16
 static uint8_t cur_proj;
 static Mtx44 hw_proj[HW_PROJ_MAX];
@@ -118,6 +118,8 @@ static int sc_x, sc_y, sc_w, sc_h; // current scissor, in GX_SetScissor terms
 
 static Mtx44 gx_perspective_mtx; // 3D feeds -w as z, GX divides by real w
 static Mtx44 gx_ortho_mtx;       // 2D/HUD: pass-through of already-NDC coords
+static Mtx44 gx_sky_mtx;         // held-back skybox (opt_sky_last): pass-through x/y, depth just short of the far plane
+static bool sky_on;
 
 static bool gfx_gx_z_is_from_0_to_1(void)
 {
@@ -1336,7 +1338,7 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
     if (hr_recording)
     {
         // Projection is applied per tile at replay time
-        const uint8_t want = is_2d ? PROJ_ORTHO : sw_persp_proj;
+        const uint8_t want = is_2d ? (sky_on ? PROJ_SKY : PROJ_ORTHO) : sw_persp_proj;
         if (want != cur_proj)
         {
             cur_proj = want;
@@ -1344,7 +1346,7 @@ static void gfx_gx_draw_triangles(float buf_vbo[], UNUSED size_t buf_vbo_len, si
         }
     }
     else if (is_2d)
-        GX_LoadProjectionMtx(gx_ortho_mtx, GX_ORTHOGRAPHIC);
+        GX_LoadProjectionMtx(sky_on ? gx_sky_mtx : gx_ortho_mtx, GX_ORTHOGRAPHIC);
     else
         GX_LoadProjectionMtx(gx_perspective_mtx, GX_PERSPECTIVE);
 
@@ -1434,6 +1436,16 @@ float gfx_gx_tnl_near(void) { return tnl_near; }
 float gfx_gx_tnl_far(void) { return tnl_far; }
 
 // Index of a projection in this frame's table (tiled modes), adding it if new
+void gfx_gx_set_sky(bool on)
+{
+#ifdef SKYDBG
+    static unsigned n;
+    if (on && n++ % 300 == 0)
+        dbglog("sky last: %u skyboxes drawn last", n);
+#endif
+    sky_on = on;
+}
+
 static int hw_proj_add(const Mtx44 m)
 {
     for (int i = hw_nproj - 1; i >= 0; i--)
@@ -1925,6 +1937,10 @@ static void gx_build_projection(void)
     gx_ortho_mtx[2][2] = 1.0f;
     gx_ortho_mtx[2][3] = -1.0f; // z [0,1] -> [-1,0]
     gx_ortho_mtx[3][3] = 1.0f;
+    // Depth 16 steps (of 2^24) short of the cleared value: passes LEQUAL only where nothing drew
+    memcpy(gx_sky_mtx, gx_ortho_mtx, sizeof(gx_sky_mtx));
+    gx_sky_mtx[2][2] = 0.0f;
+    gx_sky_mtx[2][3] = -1.0f / (1 << 20);
 }
 
 static void gx_init()
@@ -2050,8 +2066,8 @@ static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int
     const f32 a = (f32)seg->vp[2] / tw;
     const f32 b = (2.0f * (f32)(seg->vp[0] - tile_x0) + (f32)seg->vp[2]) / tw - 1.0f;
 
-    memcpy(m, seg->proj == PROJ_ORTHO ? gx_ortho_mtx : seg->proj == PROJ_PERSP ? gx_perspective_mtx
-                                                    : hw_proj[seg->proj - PROJ_HW], sizeof(m));
+    memcpy(m, seg->proj == PROJ_ORTHO ? gx_ortho_mtx : seg->proj == PROJ_SKY ? gx_sky_mtx
+              : seg->proj == PROJ_PERSP ? gx_perspective_mtx : hw_proj[seg->proj - PROJ_HW], sizeof(m));
     for (int j = 0; j < 4; j++)
         m[0][j] = a * m[0][j] + b * m[3][j];
     if (hr_tiles_y > 1) {
@@ -2060,7 +2076,7 @@ static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int
         for (int j = 0; j < 4; j++)
             m[1][j] = ay * m[1][j] + by * m[3][j];
     }
-    GX_LoadProjectionMtx(m, seg->proj == PROJ_ORTHO ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
+    GX_LoadProjectionMtx(m, (seg->proj == PROJ_ORTHO || seg->proj == PROJ_SKY) ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
 }
 
 static void hr_replay(void)

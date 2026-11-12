@@ -100,6 +100,7 @@ differences are sub-pixel rounding only.
 | `opt_state_cache` | skips redundant texture loads and projection/viewport/scissor reloads in tiled replay |
 | `opt_tile_cull` | tiled modes: draws that miss a tile are skipped on that tile |
 | `opt_mem2_gpu` | textures and the tiled display list in MEM2 (16 MB heap) |
+| `opt_sky_last` | skybox drawn after the opaque level (before cut-outs and translucent layers), depth tested at the far plane, so the GPU only fills the sky where it shows instead of painting the whole screen first |
 | `opt_gpu_tnl` | GPU transform, lighting, texgen and fog: N64 vertices go to GX by index with hardware matrices; the CPU path remains for draws GX can't express |
 
 Also built in (no switch): `-O3 -ffast-math` for the renderer, `-O3 -funroll-loops` and hoisted

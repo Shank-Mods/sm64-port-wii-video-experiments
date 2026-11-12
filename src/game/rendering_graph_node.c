@@ -141,6 +141,20 @@ LookAt lookAt;
 static Gfx *sPerspectivePos;
 static Mtx *sPerspectiveMtx;
 
+// opt_sky_last: the skybox is held back and drawn after the opaque layers instead of first, with
+// the renderer depth testing it at the far plane, so the GPU skips every sky pixel the level
+// already covers. Tagged G_NOOPs tell the renderer where the skybox starts and ends.
+#define SKY_LAST_TAG 0x534B59 // "SKY"
+static struct {
+    void *list, *listInterpolated;
+    void *transform, *transformInterpolated;
+    s16 layer;
+} sSkyPending;
+static bool sSkyPendingValid;
+static u16 sPerspNorm;
+static Mtx *sPerspectiveEmitted;   // projection loaded by the camera's perspective node
+static Gfx *sPerspectiveRestorePos; // its reload after the skybox (patched like sPerspectivePos)
+
 struct {
     Gfx *pos;
     void *mtx;
@@ -156,6 +170,9 @@ void mtx_patch_interpolated(void) {
 
     if (sPerspectivePos != NULL) {
         gSPMatrix(sPerspectivePos, VIRTUAL_TO_PHYSICAL(sPerspectiveMtx), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+    }
+    if (sPerspectiveRestorePos != NULL) {
+        gSPMatrix(sPerspectiveRestorePos, VIRTUAL_TO_PHYSICAL(sPerspectiveMtx), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
     }
 
     for (i = 0; i < gMtxTblSize; i++) {
@@ -175,12 +192,47 @@ void mtx_patch_interpolated(void) {
 
     gMtxTblSize = 0;
     sPerspectivePos = NULL;
+    sPerspectiveRestorePos = NULL;
     sViewportPos = NULL;
 }
 
 /**
  * Process a master list node.
  */
+static void sky_tag(u32 begin) {
+    Gfx *g = gDisplayListHead++;
+    g->words.w0 = ((u32) G_NOOP << 24) | SKY_LAST_TAG;
+    g->words.w1 = begin;
+}
+
+// Draws the held-back skybox. restoreProj: put the camera's projection back for the layers after it
+static void sky_emit(s32 restoreProj) {
+    sSkyPendingValid = false;
+    sky_tag(1);
+    gDPPipeSync(gDisplayListHead++);
+    gSPClearGeometryMode(gDisplayListHead++, G_ZBUFFER);
+    gDPSetRenderMode(gDisplayListHead++, renderModeTable_1Cycle[0].modes[sSkyPending.layer],
+                     renderModeTable_2Cycle[0].modes[sSkyPending.layer]);
+    if ((u32) gMtxTblSize < sizeof(gMtxTbl) / sizeof(gMtxTbl[0])) {
+        gMtxTbl[gMtxTblSize].pos = gDisplayListHead;
+        gMtxTbl[gMtxTblSize].mtx = sSkyPending.transform;
+        gMtxTbl[gMtxTblSize++].displayList = sSkyPending.list;
+    }
+    gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(sSkyPending.transformInterpolated),
+              G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+    gSPDisplayList(gDisplayListHead++, sSkyPending.listInterpolated);
+    gDPPipeSync(gDisplayListHead++);
+    sky_tag(0);
+    gSPSetGeometryMode(gDisplayListHead++, G_ZBUFFER);
+    if (restoreProj && sPerspectiveEmitted != NULL) {
+        gSPPerspNormalize(gDisplayListHead++, sPerspNorm);
+        if (sPerspectivePos != NULL)
+            sPerspectiveRestorePos = gDisplayListHead;
+        gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(sPerspectiveEmitted),
+                  G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
+    }
+}
+
 static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
     struct DisplayListNode *currList;
     s32 i;
@@ -215,6 +267,11 @@ static void geo_process_master_list_sub(struct GraphNodeMasterList *node) {
                 gSPDisplayList(gDisplayListHead++, currList->displayListInterpolated);
                 currList = currList->next;
             }
+        }
+        // The skybox goes after the opaque layers, before the cut-out (alpha) layer, whose
+        // blended edges have to land on the sky, and the translucent layers
+        if (i == LAYER_ALPHA - 1 && enableZBuffer && sSkyPendingValid) {
+            sky_emit(TRUE);
         }
     }
     if (enableZBuffer != 0) {
@@ -326,10 +383,14 @@ static void geo_process_perspective(struct GraphNodePerspective *node) {
 
             sPerspectivePos = gDisplayListHead;
             sPerspectiveMtx = mtx;
+            sPerspectiveEmitted = mtxInterpolated;
+            sPerspNorm = perspNorm;
             gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(mtxInterpolated),
                       G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
         } else {
             gSPPerspNormalize(gDisplayListHead++, perspNorm);
+            sPerspectiveEmitted = mtx;
+            sPerspNorm = perspNorm;
             gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(mtx), G_MTX_PROJECTION | G_MTX_LOAD | G_MTX_NOPUSH);
         }
         node->prevFov = node->fov;
@@ -716,7 +777,16 @@ static void geo_process_background(struct GraphNodeBackground *node) {
         vec3f_copy(gLakituState.focus, focusCopy);
     }
 
-    if (list != NULL) {
+    if (list != NULL && configOptSkyLast && gCurGraphNodeMasterList != NULL
+        && !(gCurGraphNodeMasterList->node.flags & GRAPH_RENDER_Z_BUFFER)) {
+        // Held back for the z-buffered master list that follows (see sky_emit)
+        sSkyPending.list = (void *) VIRTUAL_TO_PHYSICAL(list);
+        sSkyPending.listInterpolated = (void *) VIRTUAL_TO_PHYSICAL(listInterpolated);
+        sSkyPending.transform = gMatStackFixed[gMatStackIndex];
+        sSkyPending.transformInterpolated = gMatStackInterpolatedFixed[gMatStackIndex];
+        sSkyPending.layer = node->fnNode.node.flags >> 8;
+        sSkyPendingValid = true;
+    } else if (list != NULL) {
         geo_append_display_list2((void *) VIRTUAL_TO_PHYSICAL(list),
                                  (void *) VIRTUAL_TO_PHYSICAL(listInterpolated), node->fnNode.node.flags >> 8);
     } else if (gCurGraphNodeMasterList != NULL) {
@@ -1458,8 +1528,13 @@ void geo_process_root(struct GraphNodeRoot *node, Vp *b, Vp *c, s32 clearColor) 
         gSPMatrix(gDisplayListHead++, VIRTUAL_TO_PHYSICAL(gMatStackFixed[gMatStackIndex]),
                   G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
         gCurGraphNodeRoot = node;
+        sSkyPendingValid = false;
+        sPerspectiveEmitted = NULL;
         if (node->node.children != NULL) {
             geo_process_node_and_siblings(node->node.children);
+        }
+        if (sSkyPendingValid) {
+            sky_emit(FALSE); // no z-buffered list followed: draw it last (still only where nothing was drawn)
         }
         gCurGraphNodeRoot = NULL;
         if (gShowDebugText) {

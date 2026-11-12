@@ -22,7 +22,13 @@
 // gfx_gx.c: converts N64 texture data straight into a native GX format (false = not handled)
 bool gfx_gx_upload_texture_n64(uint8_t fmt, uint8_t siz, const uint8_t *addr, uint32_t size_bytes,
                                uint32_t line_size_bytes, const uint8_t *palette);
+// gfx_gx.c: skybox drawn last (opt_sky_last): pinned to the far plane, depth tested
+void gfx_gx_set_sky(bool on);
 #endif
+
+// Tagged G_NOOP around the held-back skybox (rendering_graph_node.c, opt_sky_last)
+#define SKY_LAST_TAG 0x534B59
+static bool sky_last_on;
 
 #define SUPPORT_CHECK(x) assert(x)
 
@@ -856,7 +862,7 @@ static bool tnl_cc_needs_cpu(uint32_t cc) {
 
 // Can this vertex batch go to the GPU path? (Triangles can still fall back individually.)
 static bool tnl_batch_ok(void) {
-    if (!tnl_on || rsp.modelview_matrix_stack_size == 0)
+    if (!tnl_on || sky_last_on || rsp.modelview_matrix_stack_size == 0)
         return false;
     tnl_update_proj(); // first: CPU-path batches use its depth planes too
     if (rsp.geometry_mode & G_TEXTURE_GEN)
@@ -1265,21 +1271,22 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx) {
         return;
 #endif
 
-    bool depth_test = (rsp.geometry_mode & G_ZBUFFER) == G_ZBUFFER;
+    // The held-back skybox only fills what the level left empty: depth tested, never written
+    bool depth_test = sky_last_on || (rsp.geometry_mode & G_ZBUFFER) == G_ZBUFFER;
     if (depth_test != rendering_state.depth_test) {
         gfx_flush();
         gfx_rapi->set_depth_test(depth_test);
         rendering_state.depth_test = depth_test;
     }
 
-    bool z_upd = (rdp.other_mode_l & Z_UPD) == Z_UPD;
+    bool z_upd = !sky_last_on && (rdp.other_mode_l & Z_UPD) == Z_UPD;
     if (z_upd != rendering_state.depth_mask) {
         gfx_flush();
         gfx_rapi->set_depth_mask(z_upd);
         rendering_state.depth_mask = z_upd;
     }
 
-    bool zmode_decal = (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC;
+    bool zmode_decal = !sky_last_on && (rdp.other_mode_l & ZMODE_DEC) == ZMODE_DEC;
     if (zmode_decal != rendering_state.decal_mode) {
         gfx_flush();
         gfx_rapi->set_zmode_decal(zmode_decal);
@@ -2048,6 +2055,15 @@ static void gfx_run_dl(Gfx* cmd) {
         uint32_t opcode = cmd->words.w0 >> 24;
 
         switch (opcode) {
+            case G_NOOP:
+                if ((cmd->words.w0 & 0xFFFFFF) == SKY_LAST_TAG) {
+                    gfx_flush();
+                    sky_last_on = cmd->words.w1 != 0;
+#ifdef TARGET_GX
+                    gfx_gx_set_sky(sky_last_on);
+#endif
+                }
+                break;
             // RSP commands:
             case G_MTX:
 #ifdef F3DEX_GBI_2
@@ -2370,7 +2386,9 @@ void gfx_run(Gfx *commands) {
     double t0 = gfx_wapi->get_time();
     bench_push(BENCH_DLIST);
     gfx_rapi->start_frame();
+    sky_last_on = false;
 #ifdef TARGET_GX
+    gfx_gx_set_sky(false);
     tnl_begin_frame();
 #endif
     gfx_run_dl(commands);

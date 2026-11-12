@@ -1,6 +1,8 @@
 #ifndef CONFIGFILE_H
 #define CONFIGFILE_H
 
+#include <stdbool.h>
+
 #define CONFIG_FILE "sm64config.txt"
 
 #ifdef __wii__
@@ -50,6 +52,7 @@ extern bool         configOptNativeTex;  // N64 textures converted straight to n
 extern bool         configOptTexHash;    // texture hashes computed once per frame, not per switch
 extern bool         configOptStateCache; // skip reloading textures that are already loaded
 extern bool         configOptTileCull;   // tiled modes: skip draws that miss a tile
+extern bool         configOptSkyLast;    // skybox drawn after the opaque level, only where it shows
 extern bool         configOptMem2Gpu;    // Wii: GPU-only buffers (textures, display lists) in MEM2
 extern bool         configOptGpuTnl;     // GPU vertex transform, lighting and fog
 

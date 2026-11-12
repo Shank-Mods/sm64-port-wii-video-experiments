@@ -125,6 +125,7 @@ bool configOptNativeTex          = true;
 bool configOptTexHash            = true;
 bool configOptStateCache         = true;
 bool configOptTileCull           = true;
+bool configOptSkyLast            = true;
 bool configOptMem2Gpu            = true;
 bool configOptGpuTnl             = true;
 bool configAntialias             = false; // (NOTE: Only used in 240p mode) Selects the antialiased video mode variant
@@ -209,6 +210,7 @@ static const struct ConfigOption options[] = {
     {.name = "opt_tex_hash",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTexHash},
     {.name = "opt_state_cache", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptStateCache},
     {.name = "opt_tile_cull",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTileCull},
+    {.name = "opt_sky_last",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptSkyLast},
     {.name = "opt_mem2_gpu",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptMem2Gpu},
     {.name = "opt_gpu_tnl",    .type = CONFIG_TYPE_BOOL, .boolValue = &configOptGpuTnl},
     {.name = "antialias",      .type = CONFIG_TYPE_BOOL, .boolValue = &configAntialias},
