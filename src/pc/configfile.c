@@ -128,6 +128,8 @@ static float cfgVideoRefresh = 60.0f;                            // video_refres
 static bool cfgVideoInterlaced = false;                          // video_scan i
 static bool cfgVideoFromString = false; // video_mode gave the size itself ("1280x720p120")
 unsigned int configVideoAspect   = VIDEO_ASPECT_AUTO;
+float configVideoAspectRatio     = 16.0f / 10.0f; // video_aspect W:H
+static unsigned int cfgAspectW = 16, cfgAspectH = 10; // as written, for saving
 bool configInterlaceField        = true;  // interlaced modes: field rendering (false: whole frames)
 float configVideoMaxPclk         = 125.0f; // MHz (124.2 is the fastest proven on hardware)
 bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
@@ -477,6 +479,7 @@ float configfile_video_dar(unsigned int w, unsigned int h) {
         case VIDEO_ASPECT_4_3: return 4.0f / 3.0f;
         case VIDEO_ASPECT_16_9: return 16.0f / 9.0f;
         case VIDEO_ASPECT_SQUARE: return sq;
+        case VIDEO_ASPECT_RATIO: return configVideoAspectRatio;
         default:
             // Square pixels when that makes a normal picture shape (1280x720, 1920x1080,
             // 1440x1080, 1920x1440), else 4:3 (1440x240, 1440x480, 640x240)
@@ -622,6 +625,18 @@ void configfile_load(const char *filename) {
                                 *option->uintValue = VIDEO_ASPECT_SQUARE;
                             else if (strcmp(tokens[1], "auto") == 0)
                                 *option->uintValue = VIDEO_ASPECT_AUTO;
+                            else {
+                                // Any W:H
+                                unsigned int aw = 0, ah = 0;
+                                if (sscanf(tokens[1], "%u:%u", &aw, &ah) == 2 && aw > 0 && ah > 0
+                                    && (float)aw / ah >= 0.5f && (float)aw / ah <= 4.0f) {
+                                    *option->uintValue = VIDEO_ASPECT_RATIO;
+                                    configVideoAspectRatio = (float)aw / (float)ah;
+                                    cfgAspectW = aw;
+                                    cfgAspectH = ah;
+                                } else
+                                    printf("unknown video_aspect '%s'\n", tokens[1]);
+                            }
                             break;
                         case CONFIG_TYPE_SCAN:
                             if (strcmp(tokens[1], "i") == 0 || strcmp(tokens[1], "interlaced") == 0)
@@ -685,6 +700,7 @@ void configfile_resolve_widescreen(void) {
                 configWidescreen = configfile_video_dar(configVideoCustom.width, configVideoCustom.height) > 1.5f;
             else if (configVideoAspect != VIDEO_ASPECT_AUTO && configVideoMode != VIDEO_MODE_DEFAULT)
                 configWidescreen = configVideoAspect == VIDEO_ASPECT_16_9
+                                   || (configVideoAspect == VIDEO_ASPECT_RATIO && configVideoAspectRatio > 1.5f)
                                    || (configVideoAspect == VIDEO_ASPECT_SQUARE
                                        && (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_1920X1020P));
             else if (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_1920X1020P)
@@ -751,6 +767,10 @@ void configfile_save(const char *filename) {
                         *option->uintValue == VIDEO_MODE_CUSTOM ? custom_mode_string() : "default");
                 break;
             case CONFIG_TYPE_ASPECT:
+                if (*option->uintValue == VIDEO_ASPECT_RATIO) {
+                    fprintf(file, "%s %u:%u\n", option->name, cfgAspectW, cfgAspectH);
+                    break;
+                }
                 fprintf(file, "%s %s\n", option->name,
                         *option->uintValue == VIDEO_ASPECT_4_3 ? "4:3" :
                         *option->uintValue == VIDEO_ASPECT_16_9 ? "16:9" :

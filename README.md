@@ -106,7 +106,7 @@ or `video_mode custom` with the size set separately:
 | `video_width` / `video_height` | `1280` / `720` | the whole frame; width a multiple of 16 (320..2032), height even (a multiple of 4 interlaced) |
 | `video_refresh` | `60` | fields per second |
 | `video_scan` | `p` | `p` progressive, `i` interlaced |
-| `video_aspect` | `auto` | `4:3`, `16:9`, `square` (width:height) or `auto`: square pixels when that's a normal picture shape (1280x720, 1440x1080), else 4:3 (1440x240, 1440x480). Also applies to the named modes |
+| `video_aspect` | `auto` | any `W:H` (`4:3`, `16:9`, `16:10`, `5:4`, `21:9`...; it applies whatever the `widescreen` setting), `square` (width:height) or `auto`: square pixels when that's a normal picture shape (1280x720, 1440x1080), else 4:3 (1440x240, 1440x480). Also applies to the named modes |
 | `interlace_render` | `field` | interlaced modes: `field` renders each field on its own at half height, a quarter line up or down (half the GPU work per image, and with 60fps interpolation or render-uncapped mode each field is a new moment); `frame` renders whole frames and shows every other line in each field |
 | `video_max_pclk` | `125` | MHz. The generator keeps the pixel clock at or below this (124.2 MHz is the fastest run on hardware) |
 

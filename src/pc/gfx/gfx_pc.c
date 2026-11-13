@@ -2392,7 +2392,10 @@ void gfx_start_frame(void) {
         // Square-pixel widescreen frames that aren't 16:9 (1920x1020p) use their real shape
         extern float gfx_gx_wm_frame_aspect(void);
         float fa = gfx_gx_wm_frame_aspect();
-        if (configWidescreen && fa > 0.0f)
+        // An aspect set with video_aspect (or a custom mode's) applies whatever the widescreen
+        // setting, so 5:4 or 16:10 come out right too
+        if (fa > 0.0f && (configWidescreen || configVideoMode == VIDEO_MODE_CUSTOM
+                          || configVideoAspect != VIDEO_ASPECT_AUTO))
             gfx_current_dimensions.aspect_ratio = fa;
     }
 #endif

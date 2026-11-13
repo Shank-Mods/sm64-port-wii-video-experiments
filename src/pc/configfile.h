@@ -42,6 +42,8 @@ void configfile_switch_storage_device(unsigned int newDevice);
 #define VIDEO_ASPECT_4_3    1u
 #define VIDEO_ASPECT_16_9   2u
 #define VIDEO_ASPECT_SQUARE 3u // width / height
+#define VIDEO_ASPECT_RATIO  4u // any W:H ("16:10", "21:9", "5:4"): configVideoAspectRatio
+extern float configVideoAspectRatio;
 
 // Custom video mode ("video_mode 1280x720p120", or "video_mode custom" with the video_* options)
 struct VideoCustom {
