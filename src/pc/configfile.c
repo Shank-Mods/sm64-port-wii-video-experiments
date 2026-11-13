@@ -125,6 +125,7 @@ bool configOptNativeTex          = true;
 bool configOptTexHash            = true;
 bool configOptStateCache         = true;
 bool configOptTileCull           = true;
+bool configN64Controller         = true;  // N64 controllers on the GameCube ports (passive adapter)
 bool configBenchRender           = false; // bench_uncapped render: 30 Hz logic, frames drawn as fast as possible
 bool configOptSkyLast            = true;
 bool configOptHwFog              = true;
@@ -214,6 +215,7 @@ static const struct ConfigOption options[] = {
     {.name = "opt_tex_hash",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTexHash},
     {.name = "opt_state_cache", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptStateCache},
     {.name = "opt_tile_cull",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTileCull},
+    {.name = "n64_controller", .type = CONFIG_TYPE_BOOL, .boolValue = &configN64Controller},
     {.name = "opt_sky_last",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptSkyLast},
     {.name = "opt_hw_fog",     .type = CONFIG_TYPE_BOOL, .boolValue = &configOptHwFog},
     {.name = "opt_tri_bin",    .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTriBin},

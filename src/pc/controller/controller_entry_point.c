@@ -14,6 +14,7 @@
 #include "controller_wii.h"
 #endif
 #include "controller_gamecube.h"
+#include "controller_n64.h"
 #else
 #include "controller_sdl.h"
 #endif
@@ -28,6 +29,7 @@ static struct ControllerAPI *controller_implementations[] = {
     &controller_wii,
 #endif
     &controller_gamecube,
+    &controller_n64, // after PAD_Init (controller_gamecube); its stick wins when off centre
 #else
     #if defined(_WIN32) || defined(_WIN64)
         &controller_xinput,

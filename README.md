@@ -86,6 +86,17 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 In capped mode the overlay's FPS is the presented rate; the **busy** line shows the time per
 frame excluding the vsync wait, and the frame rate that alone would allow.
 
+### N64 controllers (`n64_controller`, default `true`)
+
+A real N64 controller works in any GameCube port through a passive 3-wire adapter: GameCube pin 2
+(data) to the N64 data pin, pin 3/4 (ground) to ground, pin 6 (3.43 V) to the N64's 3.3 V pin.
+**Never connect pin 1 (5 V).** The console's serial interface sends the N64 Joybus commands
+itself. The controller's buttons and stick go to the game exactly as on an N64 (1:1 stick, no
+remapping). Ports are probed once a second, so controllers can be plugged in and out while the
+game runs; ports holding a GameCube controller are left to the normal GameCube controller code.
+With several N64 controllers, the lowest-numbered port is player 1. Protocol proven with
+`Shank-Mods/n64_pad_tester_wii`.
+
 ### Optimizations (`wii-optimize` branch)
 
 All on by default; each can be switched off in `sm64config.txt` (`opt_x false`) to measure what it
