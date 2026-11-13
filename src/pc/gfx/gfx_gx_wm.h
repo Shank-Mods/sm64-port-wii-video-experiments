@@ -56,6 +56,17 @@ double gfx_gx_wm_get_field_hz(void);
 // The framebuffer that the next swap will display
 void *gfx_gx_wm_get_back_buffer(void);
 
+// Field rendering (interlaced modes with interlace_render field): each image is one field
+bool gfx_gx_wm_field_mode(void);
+// Render passes this image (2 when a frame's two fields are drawn from one image), the
+// buffer each goes to, and its vertical offset in rendered lines (the half-line of interlace)
+int gfx_gx_wm_pass_count(void);
+void *gfx_gx_wm_get_pass_buffer(int k);
+float gfx_gx_wm_pass_shift(int k);
+
+// Display aspect ratio of the high resolution modes (0 in the console's own modes)
+float gfx_gx_wm_frame_aspect(void);
+
 // True when frames are presented without waiting for vsync (benchmark mode)
 bool gfx_gx_wm_uncapped(void);
 

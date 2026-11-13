@@ -1985,10 +1985,27 @@ static void gx_bench_draw_overlay(void)
     // In the tiled modes the overlay sits inside the top left tile, whose origin is the frame's
     const f32 efb_w = hr_enabled ? hr_tile_w : rmode->fbWidth;
     const f32 efb_h = hr_enabled ? hr_tile_h : rmode->efbHeight;
-    const bool short_efb = gx_frame_h() < 400;   // 240-line modes: squeeze rows to fit
-    const f32 sx = (hr_enabled && gx_frame_h() < 400) ? 2.0f : 1.0f; // 1280x240p pixels are half as wide
-    const f32 sy = short_efb ? 0.5f : 1.0f;
-    GX_InitTexObjFilterMode(&ov_texobj, short_efb ? GX_LINEAR : GX_NEAR, short_efb ? GX_LINEAR : GX_NEAR);
+    // Overlay texels square on the display whatever the pixel shape: a rendered pixel is
+    // dar * H / W as wide as a display line is tall (H: display lines; a field-rendered row
+    // covers two), so the texel width:height needed is ratio = rows * W / (dar * H)
+    f32 dar = gfx_gx_wm_frame_aspect();
+    if (dar <= 0.0f)
+        dar = configWidescreen ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const f32 fw = (f32)gfx_gx_wm_get_frame_width();
+    const f32 rows = gfx_gx_wm_field_mode() ? 2.0f : 1.0f;
+    const f32 ratio = rows * fw / (dar * (f32)gx_frame_h() * rows);
+    f32 sy = ratio >= 1.5f ? 0.5f : 1.0f; // short or wide-pixel modes: half-height rows
+    f32 sx = ratio * sy;
+    {
+        // and small enough for the top left tile
+        f32 k = 1.0f;
+        if (OV_TEX_W * sx + 48.0f > efb_w) k = fminf(k, (efb_w - 48.0f) / (OV_TEX_W * sx));
+        if (OV_TEX_H * sy + 32.0f > efb_h) k = fminf(k, (efb_h - 32.0f) / (OV_TEX_H * sy));
+        sx *= k;
+        sy *= k;
+    }
+    const bool exact = (sx == 1.0f || sx == 2.0f) && sy == 1.0f;
+    GX_InitTexObjFilterMode(&ov_texobj, exact ? GX_NEAR : GX_LINEAR, exact ? GX_NEAR : GX_LINEAR);
 
     const f32 px0 = 24.0f;
     const f32 py0 = 16.0f * sy;
@@ -2053,7 +2070,8 @@ static void gx_apply_copy_filter(void)
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
     // Not in 720p: the filter blends neighbouring lines, which would mark the seam between the
     // two rows of tiles (each copy only sees its own tile), and progressive 720p has no flicker
-    const bool deflicker = configViDeflicker && !gfx_gx_wm_hd() && !gfx_gx_wm_crop();
+    // Field rendering has interlace flicker to soften again, so it's allowed there
+    const bool deflicker = configViDeflicker && (!gfx_gx_wm_hd() || gfx_gx_wm_field_mode()) && !gfx_gx_wm_crop();
     GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, deflicker ? GX_TRUE : GX_FALSE, rmode->vfilter);
 }
 
@@ -2241,7 +2259,7 @@ static void gfx_gx_start_frame(void)
 // viewport (in frame coordinates) that falls inside the tile onto a viewport the size of the
 // tile. With more than one row of tiles y is remapped the same way (GX viewports run top down,
 // so NDC y = +1 is the viewport's top row vp[1]); with one row the viewport keeps its own y.
-static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int tile_y0)
+static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int tile_y0, bool remap_y, f32 shift)
 {
     Mtx44 m;
     const f32 tw = (f32)hr_tile_w, th = (f32)hr_tile_h;
@@ -2252,19 +2270,33 @@ static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int
               : seg->proj == PROJ_PERSP ? gx_perspective_mtx : hw_proj[seg->proj - PROJ_HW], sizeof(m));
     for (int j = 0; j < 4; j++)
         m[0][j] = a * m[0][j] + b * m[3][j];
-    if (hr_tiles_y > 1) {
+    if (remap_y) {
+        // shift: field rendering's quarter-line offset, moving the picture down by that many
+        // rendered lines
         const f32 ay = (f32)seg->vp[3] / th;
-        const f32 by = 1.0f - (2.0f * (f32)(seg->vp[1] - tile_y0) + (f32)seg->vp[3]) / th;
+        const f32 by = 1.0f - (2.0f * (f32)(seg->vp[1] - tile_y0) + (f32)seg->vp[3]) / th - 2.0f * shift / th;
         for (int j = 0; j < 4; j++)
             m[1][j] = ay * m[1][j] + by * m[3][j];
     }
     GX_LoadProjectionMtx(m, (seg->proj == PROJ_ORTHO || seg->proj == PROJ_SKY) ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
 }
 
+static void hr_replay_pass(void *xfb, f32 shift);
+
+// Replays the recorded frame once per render pass: once, or (field rendering at 30 fps) once
+// for each of the frame's two fields, a quarter line up and down
 static void hr_replay(void)
 {
+    const int passes = gfx_gx_wm_pass_count();
+    for (int k = 0; k < passes; k++)
+        hr_replay_pass(gfx_gx_wm_get_pass_buffer(k), gfx_gx_wm_pass_shift(k));
+    GX_Flush();
+}
+
+static void hr_replay_pass(void *xfb, f32 shift)
+{
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
-    void *xfb = gfx_gx_wm_get_back_buffer();
+    const bool remap_y = hr_tiles_y > 1 || shift != 0.0f;
 
     for (int ty = 0; ty < hr_tiles_y; ty++)
     for (int tx = 0; tx < hr_tiles_x; tx++)
@@ -2290,8 +2322,8 @@ static void hr_replay(void)
             int x0 = MAX(seg->sc[0], tile_x0);
             int x1 = MIN(seg->sc[0] + seg->sc[2], tile_x1);
 
-            hr_load_tile_projection(seg, tile_x0, tile_y0);
-            if (hr_tiles_y > 1) {
+            hr_load_tile_projection(seg, tile_x0, tile_y0, remap_y, shift);
+            if (remap_y) {
                 int y0 = MAX(seg->sc[1], tile_y0);
                 int y1 = MIN(seg->sc[1] + seg->sc[3], tile_y1);
                 GX_SetViewport(0.0f, 0.0f, (f32)hr_tile_w, (f32)hr_tile_h, 0.0f, seg->far_z);
@@ -2322,8 +2354,6 @@ static void hr_replay(void)
             GX_CopyDisp((uint8_t *)xfb + offset, GX_TRUE);
         }
     }
-
-    GX_Flush();
 }
 
 static void gfx_gx_end_frame(void)

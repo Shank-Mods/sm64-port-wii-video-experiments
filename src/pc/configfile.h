@@ -35,6 +35,25 @@ void configfile_switch_storage_device(unsigned int newDevice);
 #define VIDEO_MODE_1280X960P  4u // 1280x960p60 (4:3), VESA timing, 108 MHz pixels
 #define VIDEO_MODE_1920X1020P 5u // 1920x1020p60 (square pixels), minimal vertical blanking
 #define VIDEO_MODE_1920X1440I 6u // 1920x1440i60 (4:3), 720 lines per field
+#define VIDEO_MODE_CUSTOM     7u // timing generated from a size, scan and refresh (see below)
+
+// configVideoAspect: display aspect ratio of the high resolution modes
+#define VIDEO_ASPECT_AUTO   0u // square pixels when the size is a sensible picture shape, else 4:3
+#define VIDEO_ASPECT_4_3    1u
+#define VIDEO_ASPECT_16_9   2u
+#define VIDEO_ASPECT_SQUARE 3u // width / height
+
+// Custom video mode ("video_mode 1280x720p120", or "video_mode custom" with the video_* options)
+struct VideoCustom {
+    unsigned int width, height; // the whole frame (both fields when interlaced)
+    float refresh;              // fields per second
+    bool interlaced;
+};
+extern struct VideoCustom configVideoCustom; // resolved: what the custom mode uses
+extern unsigned int configVideoAspect;
+extern bool         configInterlaceField; // interlaced modes: render each field on its own
+extern float        configVideoMaxPclk;   // MHz: the custom timing generator stays below this
+float configfile_video_dar(unsigned int w, unsigned int h); // display aspect of a w x h mode
 
 extern bool         configFullscreen;
 extern bool         config60Fps;

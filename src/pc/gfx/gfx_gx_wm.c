@@ -1,6 +1,7 @@
 #ifdef TARGET_GX
 
 #include <malloc.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,8 @@
 #include "../early_console.h"
 
 static GXRModeObj *rmode;
-static void *framebuffer[3];
+#define MAX_XFB 5
+static void *framebuffer[MAX_XFB];
 static bool fb;
 static bool tiled_active; // 1280x240p or 720p: the frame is rendered in EFB tiles
 static bool hd_active;    // 720p modes: VI programmed directly, libogc kept on the safe mode
@@ -32,6 +34,19 @@ static int draw_idx = -1;
 static volatile int shown_idx;
 static volatile int pending_idx = -1;
 static volatile u32 retrace_count; // counted by retrace_callback (debug log and bounded waits)
+static volatile u32 last_flip_retrace; // retrace at which the newest frame went up (frame pacing)
+
+// Field rendering (interlaced modes with interlace_render field): every image is one field,
+// rendered at half height into a buffer of its own. The VI reads the top field from one base
+// register and the bottom field from the other, so a field buffer is put in its own parity's
+// register at a retrace and the VI shows it the next time it scans that field. Five buffers:
+// the two in the registers, at most one queued per parity, and one being drawn (or two when a
+// 30 fps image is drawn as both of its fields).
+static bool field_mode;
+static int fm_reg[2];                     // buffer in each field's base register
+static volatile int fm_pend[2] = { -1, -1 }; // queued for each field
+static int fm_draw[2] = { -1, -1 };       // being drawn this image (pass 0, pass 1)
+static int fm_next_par;                   // field the next image's first pass is for (0 = top)
 
 #define VI ((volatile u16 *)0xCC002000)
 #define HWREG(o) (*(volatile u32 *)(0xCD800000 + (o)))
@@ -80,6 +95,7 @@ struct HdTiming {
     u8 equ, psb;        // EQU, PSB of the odd field (PRB is what's left)
     u8 nfb, v;          // PLL
     u32 p_hz;           // pixel rate (F/2)
+    float dar;          // display aspect ratio (0: w / h, square pixels)
 };
 static const struct HdTiming hd_1280  = { "1280x720p",  1280,  720, 2, 2, false, 1650,  40, 220, 1500,  720, 10, 2, 22, 8,  74250000 };
 static const struct HdTiming hd_960   = { "960x720p",    960,  720, 2, 2, false, 1200,  30, 160, 1500,  720, 10, 2, 14, 7,  54000000 };
@@ -87,6 +103,10 @@ static const struct HdTiming hd_1280x960 = { "1280x960p", 1280, 960, 2, 2, false
 static const struct HdTiming hd_1920x1020 = { "1920x1020p", 1920, 1020, 3, 2, false, 2026, 44, 54, 2044, 1020, 1, 0, 23, 5, 124200000 };
 static const struct HdTiming hd_1920x1440 = { "1920x1440i", 1920, 1440, 3, 3, true, 2038, 44, 66, 1501, 720, 6, 3, 17, 5, 91800000 };
 static const struct HdTiming *hd = &hd_1280;
+static struct HdTiming hd_custom;  // generated (video_mode WxH[p|i][rate] or custom)
+static char hd_custom_name[40];
+static struct HdTiming hd_sel;     // the selected mode, with its tile grid for how it's rendered
+static bool sel_custom;            // hd_sel came from the generator
 // crop: the mode whose frame size and tile grid are rendered (its timing is unused)
 static const struct HdTiming *crop_t;
 static char crop_name[24];
@@ -143,7 +163,7 @@ static void fbb_values(void *xfb, u16 *tfbl_hi, u16 *tfbl_lo) {
 // Interlaced scanout: the bottom field starts one XFB line down, and each field reads every
 // other line
 static bool scan_il(void) {
-    return hd->il;
+    return hd->il && !field_mode; // field rendering: each field has a buffer of its own
 }
 
 static void fbb_pair(void *xfb, u16 *hi, u16 *lo, u16 *bhi, u16 *blo) {
@@ -158,6 +178,19 @@ static void hd_set_fbb(void *xfb) {
     VI[0x1E / 2] = lo;
     VI[0x24 / 2] = bhi;
     VI[0x26 / 2] = blo;
+}
+
+// Field rendering: one field's base register
+static void fm_set_field(int parity, void *xfb) {
+    u16 hi, lo;
+    fbb_values(xfb, &hi, &lo);
+    if (parity == 0) {
+        VI[0x1C / 2] = hi;
+        VI[0x1E / 2] = lo;
+    } else {
+        VI[0x24 / 2] = hi;
+        VI[0x26 / 2] = lo;
+    }
 }
 
 static void img_set_fbb(void *xfb) {
@@ -191,7 +224,7 @@ static void hd_build_image(void *xfb) {
     const u16 bsO = 2 * hd->equ, bsE = bsO + il;
     const u16 beO = hd->vn - hd->equ + il, beE = beO - il;
     const u16 wpl = hd->w / 16;
-    const u16 std = il ? wpl * 2 : wpl;
+    const u16 std = scan_il() ? wpl * 2 : wpl;
 
     hd_img = safe_img; // filters, DI2/DI3, scaler width etc.
     img_set(&hd_img, 0x6C, 1); // VICLK: F passed through
@@ -350,7 +383,20 @@ static void retrace_callback(UNUSED u32 count)
 {
     bool new_frame = false;
     retrace_count++;
-    if (hd_active) {
+    if (hd_active && field_mode) {
+        // Each queued field goes into its own field's register; the VI picks it up the next
+        // time it scans that field
+        for (int p = 0; p < 2; p++) {
+            if (fm_pend[p] >= 0) {
+                fm_set_field(p, framebuffer[fm_pend[p]]);
+                fm_reg[p] = fm_pend[p];
+                fm_pend[p] = -1;
+                new_frame = true;
+            }
+        }
+        if (new_frame)
+            last_flip_retrace = retrace_count;
+    } else if (hd_active) {
         // The retrace interrupt comes at the end of the field's active picture, so the queued
         // buffer is read from the next field on and the one that was showing is free again
         if (pending_idx >= 0) {
@@ -358,11 +404,13 @@ static void retrace_callback(UNUSED u32 count)
             shown_idx = pending_idx;
             pending_idx = -1;
             new_frame = true;
+            last_flip_retrace = retrace_count;
         }
     } else if (pending_idx >= 0 && VIDEO_GetCurrentFramebuffer() == framebuffer[pending_idx]) {
         shown_idx = pending_idx;
         pending_idx = -1;
         new_frame = true;
+        last_flip_retrace = retrace_count;
     }
     bench_on_retrace(new_frame);
 }
@@ -413,26 +461,47 @@ static const struct HdTiming *frame_mode(void)
     return hd_active ? hd : (crop_active ? crop_t : NULL);
 }
 
-// Shape of the rendered frame in the high resolution modes (square pixels), else 0
+// Display aspect ratio of the high resolution modes, else 0
 float gfx_gx_wm_frame_aspect(void)
 {
     const struct HdTiming *t = frame_mode();
-    return t != NULL ? (float)t->w / (float)t->h : 0.0f;
+    if (t == NULL)
+        return 0.0f;
+    if (configVideoAspect != VIDEO_ASPECT_AUTO || sel_custom)
+        return configfile_video_dar(t->w, t->h);
+    return t->dar > 0.0f ? t->dar : (float)t->w / (float)t->h;
+}
+
+bool gfx_gx_wm_field_mode(void)
+{
+    return field_mode;
 }
 
 const char *gfx_gx_wm_hd_name(void)
 {
+    static char buf[48];
+    if (hd_active && field_mode) {
+        snprintf(buf, sizeof(buf), "%s fields", hd->name);
+        return buf;
+    }
     return hd_active ? hd->name : (crop_active ? crop_name : NULL);
+}
+
+// Height actually rendered per image: the field's in field rendering, else the frame's
+static int render_h(const struct HdTiming *t)
+{
+    return (field_mode && t == hd) ? t->h / 2 : t->h;
 }
 
 void gfx_gx_wm_get_tiles(int *tiles_x, int *tiles_y, int *tile_w, int *tile_h)
 {
-    // From the mode table (e.g. 1920x1440: 3x3 tiles of 640x480); 1280x240p: 2x1 of 640x240
+    // Grid worked out for the rendered size (e.g. 1920x1440: 3x3 tiles of 640x480);
+    // 1280x240p: 2x1 of 640x240
     const struct HdTiming *t = frame_mode();
     *tiles_x = t != NULL ? t->tx : 2;
     *tiles_y = t != NULL ? t->ty : 1;
     *tile_w = t != NULL ? t->w / t->tx : HIRES_TILE_WIDTH;
-    *tile_h = t != NULL ? t->h / t->ty : (rmode != NULL ? rmode->efbHeight : 240);
+    *tile_h = t != NULL ? render_h(t) / t->ty : (rmode != NULL ? rmode->efbHeight : 240);
 }
 
 int gfx_gx_wm_get_frame_width(void)
@@ -448,11 +517,64 @@ int gfx_gx_wm_get_frame_height(void)
     if (rmode == NULL)
         return DESIRED_SCREEN_HEIGHT;
     const struct HdTiming *t = frame_mode();
-    return t != NULL ? t->h : rmode->efbHeight;
+    return t != NULL ? render_h(t) : rmode->efbHeight;
+}
+
+// Images a 30 or 60 fps frame stays up for, in fields of the selected mode
+static int fields_per_image(void)
+{
+    const int n = (int)(gfx_gx_wm_get_field_hz() / (config60Fps ? 60.0 : 30.0) + 0.5);
+    return n < 1 ? 1 : n;
+}
+
+// Field rendering: a free field buffer for render pass k of this image
+static void *fm_acquire(int k)
+{
+    if (fm_draw[k] < 0) {
+        u32 level = IRQ_Disable();
+        for (int i = 0; i < MAX_XFB; i++) {
+            if (i != fm_reg[0] && i != fm_reg[1] && i != fm_pend[0] && i != fm_pend[1]
+                && i != fm_draw[0] && i != fm_draw[1]) {
+                fm_draw[k] = i;
+                break;
+            }
+        }
+        IRQ_Restore(level);
+        if (fm_draw[k] < 0)
+            fm_draw[k] = 0; // can't happen with five buffers; never leave the renderer without one
+    }
+    return framebuffer[fm_draw[k]];
+}
+
+// Render passes per image: field rendering at a frame rate below the field rate draws a frame's
+// two fields (one image held for two fields); otherwise one
+int gfx_gx_wm_pass_count(void)
+{
+    if (!field_mode || uncapped)
+        return 1;
+    return fields_per_image() >= 2 ? 2 : 1;
+}
+
+void *gfx_gx_wm_get_pass_buffer(int k)
+{
+    if (!field_mode)
+        return gfx_gx_wm_get_back_buffer();
+    return fm_acquire(k);
+}
+
+// Vertical offset of render pass k, in rendered lines: the top field's lines sit a quarter of a
+// field line above the middle of the half-height image and the bottom field's a quarter below
+float gfx_gx_wm_pass_shift(int k)
+{
+    if (!field_mode)
+        return 0.0f;
+    return ((fm_next_par + k) & 1) == 0 ? 0.25f : -0.25f;
 }
 
 void *gfx_gx_wm_get_back_buffer(void)
 {
+    if (field_mode)
+        return fm_acquire(0);
     if (!triple)
         return framebuffer[fb ^ 1];
 
@@ -492,6 +614,131 @@ static void gfx_gx_wm_apply_hires_timing(void)
     _CPU_ISR_Restore(level);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Custom modes: a timing generated from a size, scan and refresh rate
+
+#define VI_HT_MAX 2046     // pixel clocks per line (10-bit half-line width)
+#define VI_VN_MAX 2047     // half-lines per field
+#define VI_HBLANK_MIN 106  // the narrowest horizontal blanking used on hardware (1920x1020p)
+#define PLL_NFB_MIN 14     // feedback multipliers proven on hardware: 14..23 (VCO 756..1242 MHz)
+#define PLL_NFB_MAX 23
+
+// Tile grid for a rendered size: as few tiles as fit the EFB (640x528), each the same size,
+// widths a multiple of 16 and heights even (what the EFB -> XFB copy needs)
+static bool tile_grid(unsigned w, unsigned h, u8 *tx, u8 *ty)
+{
+    *tx = *ty = 0;
+    for (unsigned x = 1; x <= 15 && !*tx; x++)
+        if (w % x == 0 && (w / x) % 16 == 0 && w / x <= 640)
+            *tx = (u8)x;
+    for (unsigned y = 1; y <= 15 && !*ty; y++)
+        if (h % y == 0 && (h / y) % 2 == 0 && h / y <= 528)
+            *ty = (u8)y;
+    return *tx && *ty && *tx * *ty <= 16;
+}
+
+// Searches the PLL settings and line lengths for the timing closest to the requested refresh,
+// preferring blanking close to the usual proportions (720p's 29% of the line and 4% of the
+// lines) and never above the pixel clock limit. why: the reason when nothing fits.
+static bool gen_timing(struct HdTiming *t, unsigned w, unsigned h, double rate, bool il, char *why, size_t why_len)
+{
+    if (w % 16 || w < 320 || w > 2032) {
+        snprintf(why, why_len, "width %u: must be a multiple of 16 from 320 to 2032", w);
+        return false;
+    }
+    if (h < 120 || h % (il ? 4 : 2)) {
+        snprintf(why, why_len, "height %u: must be at least 120 and a multiple of %u", h, il ? 4 : 2);
+        return false;
+    }
+    if (w + VI_HBLANK_MIN > VI_HT_MAX) {
+        snprintf(why, why_len, "width %u: a line can't be longer than %u pixels with blanking", w, VI_HT_MAX);
+        return false;
+    }
+    if (rate < 20.0 || rate > 1000.0) {
+        snprintf(why, why_len, "refresh %.2f Hz is out of range", rate);
+        return false;
+    }
+    const unsigned acv = il ? h / 2 : h;                  // active lines per field
+    const unsigned vn_min = 2 * acv + (il ? 5 : 4);       // EQU 1, PRB 1, PSB 1 (interlaced)
+    if (vn_min > VI_VN_MAX) {
+        snprintf(why, why_len, "%u active lines per field: the field limit is about %u", acv, (VI_VN_MAX - 5) / 2);
+        return false;
+    }
+    const double pmax = (double)configVideoMaxPclk * 1e6;
+    const double hb_t = fmax(VI_HBLANK_MIN, w * 0.29), vb_t = fmax(3.0, acv * 0.042);
+    double best = 1e30;
+    unsigned b_nfb = 0, b_v = 0, b_ht = 0, b_vn = 0;
+    double b_p = 0;
+    for (unsigned nfb = PLL_NFB_MIN; nfb <= PLL_NFB_MAX; nfb++) {
+        for (unsigned v = 1; v <= 15; v++) {
+            const double p = 54e6 * nfb / v / 2.0;
+            if (p > pmax)
+                continue;
+            for (unsigned ht = (w + VI_HBLANK_MIN + 1) & ~1u; ht <= VI_HT_MAX; ht += 2) {
+                // The field lengths (odd interlaced, even progressive) either side of the exact one
+                const double vnf = 2.0 * p / (ht * rate);
+                if (vnf < 3.0)
+                    continue;
+                const unsigned lo = il ? 2 * (unsigned)floor((vnf - 1.0) / 2.0) + 1 : 2 * (unsigned)floor(vnf / 2.0);
+                for (unsigned vn = lo; vn <= lo + 2; vn += 2) {
+                    if (vn < vn_min || vn > VI_VN_MAX)
+                        continue;
+                    const double actual = p / (ht * (vn / 2.0));
+                    const double err = fabs(actual - rate) / rate;
+                    if (err > 0.005)
+                        continue;
+                    const double score = err * 1000.0 + fabs((ht - w) - hb_t) / hb_t
+                                         + 0.5 * fabs((vn - 2.0 * acv) / 2.0 - vb_t) / vb_t;
+                    if (score < best) {
+                        best = score;
+                        b_nfb = nfb;
+                        b_v = v;
+                        b_ht = ht;
+                        b_vn = vn;
+                        b_p = p;
+                    }
+                }
+            }
+        }
+    }
+    if (b_ht == 0) {
+        snprintf(why, why_len, "no timing for %ux%u%c at %.2f Hz within the limits (pixel clock <= %.1f MHz, "
+                 "line <= %u, field <= %u half-lines)", w, h, il ? 'i' : 'p', rate, (double)configVideoMaxPclk,
+                 VI_HT_MAX, VI_VN_MAX);
+        return false;
+    }
+
+    memset(t, 0, sizeof(*t));
+    t->w = (u16)w;
+    t->h = (u16)h;
+    t->il = il;
+    t->ht = (u16)b_ht;
+    const unsigned blank = b_ht - w;
+    t->hs = (u16)(blank >= 200 ? 40 : 32);
+    const unsigned hfp = blank / 4 > 8 ? blank / 4 : 8;
+    t->hbp = (u16)(blank - t->hs - hfp);
+    t->vn = (u16)b_vn;
+    t->acv = (u16)acv;
+    // Vertical blanking (half-lines): 3 EQU + PRB + PSB
+    const int vbh = (int)b_vn - 2 * (int)acv;
+    int psb = il ? (vbh >= 12 ? 3 : 1) : (vbh >= 10 ? 2 : 0);
+    int equ = vbh / 10;
+    if (equ < 1) equ = 1;
+    if (equ > 10) equ = 10;
+    while (vbh - 3 * equ - psb < 1 && equ > 1)
+        equ--;
+    if (vbh - 3 * equ - psb < 1) {
+        snprintf(why, why_len, "vertical blanking too short");
+        return false;
+    }
+    t->equ = (u8)equ;
+    t->psb = (u8)psb;
+    t->nfb = (u8)b_nfb;
+    t->v = (u8)b_v;
+    t->p_hz = (u32)(b_p + 0.5);
+    return true;
+}
+
 // Pick the video mode to render in
 // Options are 720p, 1280x240p, 240p or the console's own 480p/480i (576i for PAL)
 static GXRModeObj *gfx_gx_wm_select_mode(void)
@@ -505,25 +752,60 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
         case VIDEO_MODE_1920X1020P: sel = &hd_1920x1020; break;
         case VIDEO_MODE_1920X1440I: sel = &hd_1920x1440; break;
         case VIDEO_MODE_960P_CROP:  sel = &hd_1280x960; force_crop = true; break;
+        case VIDEO_MODE_CUSTOM: {
+            const struct VideoCustom *c = &configVideoCustom;
+            char why[160];
+            snprintf(hd_custom_name, sizeof(hd_custom_name), "%ux%u%c%g", c->width, c->height,
+                     c->interlaced ? 'i' : 'p', (double)c->refresh);
+            if (gen_timing(&hd_custom, c->width, c->height, c->refresh, c->interlaced, why, sizeof(why))) {
+                hd_custom.name = hd_custom_name;
+                sel = &hd_custom;
+                sel_custom = true;
+                dbglog("custom mode %s: %u x %u half-lines, active %u, EQU %u PSB %u, P %.3f MHz (Nfb %u V %u), "
+                       "%.3f Hz", hd_custom_name, hd_custom.ht, hd_custom.vn, hd_custom.acv, hd_custom.equ,
+                       hd_custom.psb, hd_custom.p_hz / 1e6, hd_custom.nfb, hd_custom.v,
+                       2.0 * ((double)hd_custom.p_hz / hd_custom.ht) / hd_custom.vn);
+            } else {
+                dbglog("custom mode %s not possible: %s; using the console's own mode", hd_custom_name, why);
+            }
+            break;
+        }
         default: break;
     }
 #ifndef __wii__
     force_crop = true; // the GameCube's VI clock can't be raised: only the crops exist there
 #endif
-    if (sel != NULL && (configCrop480 || force_crop)) {
+    const bool crop = sel != NULL && (configCrop480 || force_crop);
+    if (sel != NULL) {
+        // Rendered size and tile grid: per field with field rendering (not for the crops, which
+        // show the top left of a whole frame)
+        hd_sel = *sel;
+        hd = &hd_sel;
+        field_mode = !crop && hd_sel.il && configInterlaceField;
+        const unsigned rh = field_mode ? hd_sel.h / 2 : hd_sel.h;
+        if (!tile_grid(hd_sel.w, rh, &hd_sel.tx, &hd_sel.ty)) {
+            dbglog("mode %s: no tile grid for %ux%u; using the console's own mode", hd_sel.name, hd_sel.w, rh);
+            sel = NULL;
+            field_mode = false;
+        } else {
+            dbglog("mode %s%s: rendered %ux%u as %ux%u tiles of %ux%u", hd_sel.name,
+                   field_mode ? " (field rendering)" : "", hd_sel.w, rh, hd_sel.tx, hd_sel.ty,
+                   hd_sel.w / hd_sel.tx, rh / hd_sel.ty);
+        }
+    }
+    if (sel != NULL && crop) {
         // Normal 480p/480i signal; the frame is rendered at sel's size
-        crop_t = sel;
-        snprintf(crop_name, sizeof(crop_name), "%ux%u>480", sel->w, sel->h);
+        crop_t = &hd_sel;
+        snprintf(crop_name, sizeof(crop_name), "%ux%u>480", hd_sel.w, hd_sel.h);
         crop_active = true;
         tiled_active = true;
         return VIDEO_GetPreferredMode(NULL);
     }
 #ifdef __wii__
     if (sel != NULL) {
-        hd = sel;
         TVHd720.fbWidth = hd->w;
-        TVHd720.efbHeight = hd->h / hd->ty;
-        TVHd720.xfbHeight = hd->h;
+        TVHd720.xfbHeight = render_h(hd);
+        TVHd720.efbHeight = render_h(hd) / hd->ty;
         hd_active = true;
         tiled_active = true;
         return &TVHd720;
@@ -613,8 +895,18 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
             uncapped = (configBenchUncapped || configBenchRender);
         }
     }
-    dbglog("wm_init: fb0=%p fb1=%p fb2=%p (%u bytes each) triple=%d uncapped=%d", framebuffer[0],
-           framebuffer[1], framebuffer[2], (unsigned)fb_bytes, triple, uncapped);
+    if (field_mode && hd_active) {
+        // Field buffers (each one field tall): five, see fm_*
+        for (int i = 3; i < MAX_XFB; i++) {
+            void *b = memalign(32, fb_bytes);
+            framebuffer[i] = b != NULL ? MEM_K0_TO_K1(b) : NULL;
+            if (b == NULL)
+                triple = false; // reported as not enough memory below
+        }
+    }
+    dbglog("wm_init: fb0=%p fb1=%p fb2=%p fb3=%p fb4=%p (%u bytes each) triple=%d uncapped=%d field=%d",
+           framebuffer[0], framebuffer[1], framebuffer[2], framebuffer[3], framebuffer[4], (unsigned)fb_bytes,
+           triple, uncapped, field_mode);
     log_arenas("after XFBs");
 
     const bool fb_missing = framebuffer[0] == MEM_K0_TO_K1(NULL) || framebuffer[1] == MEM_K0_TO_K1(NULL);
@@ -624,6 +916,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         hd_active = false;
         crop_active = false;
         tiled_active = false;
+        field_mode = false;
         rmode = VIDEO_GetPreferredMode(NULL);
         triple = uncapped = false;
         fb_bytes = VIDEO_GetFrameBufferSize(rmode);
@@ -638,7 +931,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         }
     }
 
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < MAX_XFB; i++)
         if (framebuffer[i] != MEM_K0_TO_K1(NULL) && framebuffer[i] != NULL)
             clear_xfb(framebuffer[i], fb_bytes);
 
@@ -673,6 +966,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         boot1c4 = HWREG(0x1C4);
         boot1c8 = HWREG(0x1C8);
         hd_build_image(framebuffer[0]);
+        fm_reg[0] = fm_reg[1] = 0; // field rendering: both fields start on the black buffer 0
         log_image("safe", &safe_img);
         log_image(hd->name, &hd_img);
         dbglog("wm_init: boot PLL 0x1C4=%08X 0x1C8=%08X -> 720p 0x1C4=%08X 0x1C8=%08X",
@@ -781,7 +1075,7 @@ static bool gfx_gx_wm_start_frame(void)
 static void wait_pending_shown(void)
 {
     u64 to = gettime() + millisecs_to_ticks(100);
-    while (pending_idx >= 0 && gettime() < to) {
+    while ((pending_idx >= 0 || fm_pend[0] >= 0 || fm_pend[1] >= 0) && gettime() < to) {
     }
 }
 
@@ -812,6 +1106,29 @@ static void gfx_gx_wm_swap_buffers_begin(void)
     if (frames == 120 && tiled_active)
         dbg_vi_regs("frame120");
 
+    if (triple && field_mode) {
+        // Queue each drawn field for its own field's register (replacing an older one still
+        // waiting there)
+        u32 level = IRQ_Disable();
+        int n = 0;
+        for (int k = 0; k < 2; k++) {
+            if (fm_draw[k] >= 0) {
+                fm_pend[(fm_next_par + k) & 1] = fm_draw[k];
+                fm_draw[k] = -1;
+                n++;
+            }
+        }
+        fm_next_par = (fm_next_par + n) & 1;
+        IRQ_Restore(level);
+        if (uncapped || n == 0)
+            return;
+        wait_pending_shown();
+        while ((u32)(retrace_count - last_flip_retrace) + 1 < (u32)fields_per_image())
+            if (!wait_vsync_ms(100, "frame hold"))
+                break;
+        return;
+    }
+
     if (triple) {
         // The renderer has already copied the frame into the draw buffer and waited for it
         if (draw_idx < 0)
@@ -827,11 +1144,13 @@ static void gfx_gx_wm_swap_buffers_begin(void)
         if (uncapped)
             return;
 
-        // Presenting at the field rate (only reached in 720p): wait for this frame to go up,
-        // and hold it for a second field at 30 fps
+        // Presenting at the field rate (only reached in the high resolution modes): wait for
+        // this frame to go up, and hold it until the 30 or 60 fps frame time has passed (at
+        // 60 Hz: a second field at 30 fps; at 120 Hz, four fields)
         wait_pending_shown();
-        if (!config60Fps)
-            wait_vsync_ms(100, "30 fps hold");
+        while ((u32)(retrace_count - last_flip_retrace) + 1 < (u32)fields_per_image())
+            if (!wait_vsync_ms(100, "frame hold"))
+                break;
         return;
     }
 

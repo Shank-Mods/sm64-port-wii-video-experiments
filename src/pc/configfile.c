@@ -92,6 +92,9 @@ enum ConfigOptionType {
     CONFIG_TYPE_FLOAT,
     CONFIG_TYPE_WIDESCREEN, // off / on / auto / pillarbox
     CONFIG_TYPE_VIDEOMODE,  // 720p / default
+    CONFIG_TYPE_ASPECT,     // auto / 4:3 / 16:9 / square
+    CONFIG_TYPE_SCAN,       // p / i
+    CONFIG_TYPE_FIELDMODE,  // field / frame
 };
 
 struct ConfigOption {
@@ -119,6 +122,14 @@ unsigned int configVideoMode     = VIDEO_MODE_720P; // 1280x720p output (takes p
 #else
 unsigned int configVideoMode     = VIDEO_MODE_1920X1020P; // GameCube: rendered at 1920x1020, top left shown as 480p
 #endif
+struct VideoCustom configVideoCustom = { 1280, 720, 60.0f, false };
+static unsigned int cfgVideoWidth = 1280, cfgVideoHeight = 720; // video_width / video_height
+static float cfgVideoRefresh = 60.0f;                            // video_refresh
+static bool cfgVideoInterlaced = false;                          // video_scan i
+static bool cfgVideoFromString = false; // video_mode gave the size itself ("1280x720p120")
+unsigned int configVideoAspect   = VIDEO_ASPECT_AUTO;
+bool configInterlaceField        = true;  // interlaced modes: field rendering (false: whole frames)
+float configVideoMaxPclk         = 125.0f; // MHz (124.2 is the fastest proven on hardware)
 bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
 bool configOptPsVertex           = true;
 bool configOptNativeTex          = true;
@@ -209,6 +220,13 @@ static const struct ConfigOption options[] = {
     {.name = "240p",           .type = CONFIG_TYPE_BOOL, .boolValue = &config240p},
     {.name = "hires_1280x240p", .type = CONFIG_TYPE_BOOL, .boolValue = &configHires1280},
     {.name = "video_mode",     .type = CONFIG_TYPE_VIDEOMODE, .uintValue = &configVideoMode},
+    {.name = "video_width",    .type = CONFIG_TYPE_UINT, .uintValue = &cfgVideoWidth},
+    {.name = "video_height",   .type = CONFIG_TYPE_UINT, .uintValue = &cfgVideoHeight},
+    {.name = "video_refresh",  .type = CONFIG_TYPE_FLOAT, .floatValue = &cfgVideoRefresh},
+    {.name = "video_scan",     .type = CONFIG_TYPE_SCAN, .boolValue = &cfgVideoInterlaced},
+    {.name = "video_aspect",   .type = CONFIG_TYPE_ASPECT, .uintValue = &configVideoAspect},
+    {.name = "interlace_render", .type = CONFIG_TYPE_FIELDMODE, .boolValue = &configInterlaceField},
+    {.name = "video_max_pclk", .type = CONFIG_TYPE_FLOAT, .floatValue = &configVideoMaxPclk},
     {.name = "crop_480p",      .type = CONFIG_TYPE_BOOL, .boolValue = &configCrop480},
     {.name = "opt_ps_vertex",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptPsVertex},
     {.name = "opt_native_tex", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptNativeTex},
@@ -414,6 +432,58 @@ void configfile_switch_storage_device(unsigned int newDevice) {
 #endif
 
 // Loads the config file specified by 'filename'
+// "1280x720p120", "1920x1080i" (60 Hz when no rate is given), "240p360" (640 wide), "maxi"
+static bool parse_video_mode_string(const char *str, struct VideoCustom *out) {
+    unsigned int w = 0, h = 0;
+    float rate = 60.0f;
+    char scan = 0;
+    int n = 0;
+    if (strcmp(str, "maxi") == 0) {
+        // The tallest interlaced frame the VI's field length allows, at 60 fields a second
+        str = "1920x2040i60";
+    }
+    if (sscanf(str, "%ux%u%c%n", &w, &h, &scan, &n) >= 3) {
+    } else if (sscanf(str, "%u%c%n", &h, &scan, &n) >= 2) {
+        w = h <= 480 ? 640 : (h * 16 / 9 + 15) / 16 * 16;
+    } else {
+        return false;
+    }
+    if (scan != 'p' && scan != 'i')
+        return false;
+    if (str[n] != '\0' && sscanf(str + n, "%f", &rate) != 1)
+        return false;
+    if (w == 0 || h == 0 || rate <= 0.0f)
+        return false;
+    out->width = w;
+    out->height = h;
+    out->refresh = rate;
+    out->interlaced = scan == 'i';
+    return true;
+}
+
+static const char *custom_mode_string(void) {
+    static char buf[32];
+    if (!cfgVideoFromString)
+        return "custom";
+    snprintf(buf, sizeof(buf), "%ux%u%c%g", configVideoCustom.width, configVideoCustom.height,
+             configVideoCustom.interlaced ? 'i' : 'p', (double)configVideoCustom.refresh);
+    return buf;
+}
+
+// Display aspect of a w x h mode under video_aspect
+float configfile_video_dar(unsigned int w, unsigned int h) {
+    const float sq = h > 0 ? (float)w / (float)h : 4.0f / 3.0f;
+    switch (configVideoAspect) {
+        case VIDEO_ASPECT_4_3: return 4.0f / 3.0f;
+        case VIDEO_ASPECT_16_9: return 16.0f / 9.0f;
+        case VIDEO_ASPECT_SQUARE: return sq;
+        default:
+            // Square pixels when that makes a normal picture shape (1280x720, 1920x1080,
+            // 1440x1080, 1920x1440), else 4:3 (1440x240, 1440x480, 640x240)
+            return (sq >= 1.25f && sq <= 1.9f) ? sq : 4.0f / 3.0f;
+    }
+}
+
 void configfile_load(const char *filename) {
     const char *path = filename;
 #ifdef __wii__
@@ -527,13 +597,43 @@ void configfile_load(const char *filename) {
                                 *option->uintValue = VIDEO_MODE_960P_CROP;
                             else if (strcmp(tokens[1], "1280x960p") == 0)
                                 *option->uintValue = VIDEO_MODE_1280X960P;
-                            else if (strcmp(tokens[1], "1920x1020p") == 0)
+                            else if (strcmp(tokens[1], "1920x1020p") == 0 || strcmp(tokens[1], "maxp") == 0)
                                 *option->uintValue = VIDEO_MODE_1920X1020P;
                             else if (strcmp(tokens[1], "1920x1440i") == 0)
                                 *option->uintValue = VIDEO_MODE_1920X1440I;
                             else if (strcmp(tokens[1], "default") == 0 || strcmp(tokens[1], "480p") == 0
                                      || strcmp(tokens[1], "480i") == 0 || strcmp(tokens[1], "auto") == 0)
                                 *option->uintValue = VIDEO_MODE_DEFAULT;
+                            else if (strcmp(tokens[1], "custom") == 0) {
+                                *option->uintValue = VIDEO_MODE_CUSTOM;
+                                cfgVideoFromString = false;
+                            } else if (parse_video_mode_string(tokens[1], &configVideoCustom)) {
+                                *option->uintValue = VIDEO_MODE_CUSTOM;
+                                cfgVideoFromString = true;
+                            } else
+                                printf("unknown video_mode '%s'\n", tokens[1]);
+                            break;
+                        case CONFIG_TYPE_ASPECT:
+                            if (strcmp(tokens[1], "4:3") == 0)
+                                *option->uintValue = VIDEO_ASPECT_4_3;
+                            else if (strcmp(tokens[1], "16:9") == 0)
+                                *option->uintValue = VIDEO_ASPECT_16_9;
+                            else if (strcmp(tokens[1], "square") == 0)
+                                *option->uintValue = VIDEO_ASPECT_SQUARE;
+                            else if (strcmp(tokens[1], "auto") == 0)
+                                *option->uintValue = VIDEO_ASPECT_AUTO;
+                            break;
+                        case CONFIG_TYPE_SCAN:
+                            if (strcmp(tokens[1], "i") == 0 || strcmp(tokens[1], "interlaced") == 0)
+                                *option->boolValue = true;
+                            else if (strcmp(tokens[1], "p") == 0 || strcmp(tokens[1], "progressive") == 0)
+                                *option->boolValue = false;
+                            break;
+                        case CONFIG_TYPE_FIELDMODE:
+                            if (strcmp(tokens[1], "field") == 0)
+                                *option->boolValue = true;
+                            else if (strcmp(tokens[1], "frame") == 0)
+                                *option->boolValue = false;
                             break;
                         default:
                             assert(0); // bad type
@@ -547,6 +647,12 @@ void configfile_load(const char *filename) {
     }
 
     fclose(file);
+    if (configVideoMode == VIDEO_MODE_CUSTOM && !cfgVideoFromString) {
+        configVideoCustom.width = cfgVideoWidth;
+        configVideoCustom.height = cfgVideoHeight;
+        configVideoCustom.refresh = cfgVideoRefresh;
+        configVideoCustom.interlaced = cfgVideoInterlaced;
+    }
 }
 
 bool configfile_console_is_widescreen(void) {
@@ -575,7 +681,13 @@ void configfile_resolve_widescreen(void) {
         default:
             // 1280x720p is a 16:9 mode, 960x720p and 1280x240p are 4:3 ones, so "auto" follows
             // those modes rather than the console setting
-            if (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_1920X1020P)
+            if (configVideoMode == VIDEO_MODE_CUSTOM)
+                configWidescreen = configfile_video_dar(configVideoCustom.width, configVideoCustom.height) > 1.5f;
+            else if (configVideoAspect != VIDEO_ASPECT_AUTO && configVideoMode != VIDEO_MODE_DEFAULT)
+                configWidescreen = configVideoAspect == VIDEO_ASPECT_16_9
+                                   || (configVideoAspect == VIDEO_ASPECT_SQUARE
+                                       && (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_1920X1020P));
+            else if (configVideoMode == VIDEO_MODE_720P || configVideoMode == VIDEO_MODE_1920X1020P)
                 configWidescreen = true;
             else if (configVideoMode == VIDEO_MODE_960X720P || configVideoMode == VIDEO_MODE_960P_CROP
                      || configVideoMode == VIDEO_MODE_1280X960P || configVideoMode == VIDEO_MODE_1920X1440I)
@@ -635,7 +747,20 @@ void configfile_save(const char *filename) {
                         *option->uintValue == VIDEO_MODE_960P_CROP ? "1280x960crop" :
                         *option->uintValue == VIDEO_MODE_1280X960P ? "1280x960p" :
                         *option->uintValue == VIDEO_MODE_1920X1020P ? "1920x1020p" :
-                        *option->uintValue == VIDEO_MODE_1920X1440I ? "1920x1440i" : "default");
+                        *option->uintValue == VIDEO_MODE_1920X1440I ? "1920x1440i" :
+                        *option->uintValue == VIDEO_MODE_CUSTOM ? custom_mode_string() : "default");
+                break;
+            case CONFIG_TYPE_ASPECT:
+                fprintf(file, "%s %s\n", option->name,
+                        *option->uintValue == VIDEO_ASPECT_4_3 ? "4:3" :
+                        *option->uintValue == VIDEO_ASPECT_16_9 ? "16:9" :
+                        *option->uintValue == VIDEO_ASPECT_SQUARE ? "square" : "auto");
+                break;
+            case CONFIG_TYPE_SCAN:
+                fprintf(file, "%s %s\n", option->name, *option->boolValue ? "i" : "p");
+                break;
+            case CONFIG_TYPE_FIELDMODE:
+                fprintf(file, "%s %s\n", option->name, *option->boolValue ? "field" : "frame");
                 break;
             default:
                 assert(0); // unknown type

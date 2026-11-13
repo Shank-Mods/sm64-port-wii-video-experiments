@@ -86,6 +86,39 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 In capped mode the overlay's FPS is the presented rate; the **busy** line shows the time per
 frame excluding the vsync wait, and the frame rate that alone would allow.
 
+### Custom video modes (Wii)
+
+Besides the named modes, `video_mode` takes any size, scan and refresh rate written as
+`WIDTHxHEIGHT` + `p`/`i` + refresh (60 when left out), and the console works out a timing for it:
+
+```
+video_mode 1920x1080i      video_mode 1440x1080i      video_mode 1280x960i
+video_mode 1280x720p120    video_mode 640x480p120     video_mode 640x480p240
+video_mode 1440x240p       video_mode 1440x480p       video_mode 240p360   (640x240 at 360 Hz)
+video_mode maxp            (= 1920x1020p, the tallest progressive frame at 60 Hz)
+video_mode maxi            (= 1920x2040i, the tallest interlaced frame at 60 Hz)
+```
+
+or `video_mode custom` with the size set separately:
+
+| Option | Default | |
+|---|---|---|
+| `video_width` / `video_height` | `1280` / `720` | the whole frame; width a multiple of 16 (320..2032), height even (a multiple of 4 interlaced) |
+| `video_refresh` | `60` | fields per second |
+| `video_scan` | `p` | `p` progressive, `i` interlaced |
+| `video_aspect` | `auto` | `4:3`, `16:9`, `square` (width:height) or `auto`: square pixels when that's a normal picture shape (1280x720, 1440x1080), else 4:3 (1440x240, 1440x480). Also applies to the named modes |
+| `interlace_render` | `field` | interlaced modes: `field` renders each field on its own at half height, a quarter line up or down (half the GPU work per image, and with 60fps interpolation or render-uncapped mode each field is a new moment); `frame` renders whole frames and shows every other line in each field |
+| `video_max_pclk` | `125` | MHz. The generator keeps the pixel clock at or below this (124.2 MHz is the fastest run on hardware) |
+
+The generator searches the VI clock multiplier/divider and the line and field lengths for the
+timing closest to the requested refresh (within 0.5%), with blanking as close as possible to
+720p's proportions, inside the VI's limits: a line of at most 2046 pixel clocks, a field of at
+most 2047 half-lines. Asked for 1280x720p60 it lands on the standard 1650 x 750 at 74.25 MHz. A
+size it can't time, or can't split into EFB tiles, falls back to the console's own mode; the
+debug log (`-DDBGLOG` builds) gives the timing chosen or the reason. In the normal (capped)
+mode a frame is held for as many fields as the 30 or 60 fps frame lasts (4 at 120 Hz).
+`crop_480p` works with any size.
+
 ### N64 controllers (`n64_controller`, default `true`)
 
 A real N64 controller works in any GameCube port through a passive 3-wire adapter: GameCube pin 2
