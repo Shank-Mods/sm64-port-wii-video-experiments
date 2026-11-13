@@ -74,7 +74,11 @@ extern bool         configOptTexHash;    // texture hashes computed once per fra
 extern bool         configOptStateCache; // skip reloading textures that are already loaded
 extern bool         configOptTileCull;   // tiled modes: skip draws that miss a tile
 extern bool         configN64Controller; // N64 controllers on the GameCube ports
-extern bool         configCrop960i;      // crop of an interlaced mode: 640x960i output
+// configCropInterlaced: output of crop_480p on an interlaced mode
+#define CROP_IL_480P 0u // plain 480p crop of whole frames
+#define CROP_IL_960I 1u // 640x960i at the 480p line rate
+#define CROP_IL_BOB  2u // 480p showing one field of the interlaced frame per frame (bobs)
+extern unsigned int configCropInterlaced;
 extern bool         configBenchRender;
 extern unsigned int configDebugFrameDelayMs;
 extern bool         configFramePacingRealtime; // frame_pacing realtime: game logic on a real-time clock

@@ -127,8 +127,11 @@ most 2047 half-lines. Asked for 1280x720p60 it lands on the standard 1650 x 750 
 size it can't time, or can't split into EFB tiles, falls back to the console's own mode; the
 debug log (`-DDBGLOG` builds) gives the timing chosen or the reason. In the normal (capped)
 mode a frame is held for as many fields as the 30 or 60 fps frame lasts (4 at 120 Hz).
-`crop_480p` works with any size. For an interlaced mode the crop is output as **640x960i**
-(`crop_interlaced 960i`, the default; `480p` for the plain crop): the console's stock clock and
+`crop_480p` works with any size. For an interlaced mode, `crop_interlaced` picks the output:
+`bob` (default) is the console's ordinary 480p signal showing **one field of the interlaced
+frame per frame**, alternating, at the field's own lines (the picture bobs by half a line, as
+the fields aren't offset), so the rendering is exactly the full interlaced mode's while the
+signal is plain 480p; `480p` is the plain crop of whole frames; `960i` outputs **640x960i**: the console's stock clock and
 480p's horizontal timing (31.47 kHz lines), interlaced vertically (524.5 lines a field, 480
 active, 59.997 Hz), showing the top left 640x960 of the frame. The frame is rendered exactly as
 the full interlaced mode would be, field rendering included. No clock change is involved, so

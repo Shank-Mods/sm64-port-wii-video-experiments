@@ -102,6 +102,7 @@ struct HdTiming {
     u32 p_hz;           // pixel rate (F/2)
     float dar;          // display aspect ratio (0: w / h, square pixels)
     bool stock_clock;   // keep the boot clock and the safe mode's horizontal timing (960i crop)
+    bool bob;           // the safe 480p mode as is, showing one field per frame (bob crop)
 };
 static const struct HdTiming hd_1280  = { "1280x720p",  1280,  720, 2, 2, false, 1650,  40, 220, 1500,  720, 10, 2, 22, 8,  74250000 };
 static const struct HdTiming hd_960   = { "960x720p",    960,  720, 2, 2, false, 1200,  30, 160, 1500,  720, 10, 2, 14, 7,  54000000 };
@@ -122,6 +123,7 @@ static bool crop_il;
 static struct HdTiming hd_out;     // the output timing (hd points at it)
 static int crop_lines;             // lines of each output buffer that are shown
 static int crop_buf_lines;         // lines allocated per output buffer (whole tiles)
+static int bob_line;               // bob crop with whole frames: field (line) the VI reads this frame
 // crop: the mode whose frame size and tile grid are rendered (its timing is unused)
 static const struct HdTiming *crop_t;
 static char crop_name[24];
@@ -249,6 +251,14 @@ static void hd_build_image(void *xfb) {
     const u16 std = scan_il() ? wpl * 2 : wpl;
 
     hd_img = safe_img; // filters, DI2/DI3, scaler width etc.
+    if (hd->bob) {
+        // Plain 480p; only what's read changes: one field per frame (every other line of a
+        // whole frame, or a field buffer)
+        const u16 bwpl = hd->w / 16;
+        img_set(&hd_img, 0x48, (u16)((bwpl << 8) | (field_mode ? bwpl : bwpl * 2)));
+        img_set_fbb(xfb);
+        return;
+    }
     if (!hd->stock_clock) {
         img_set(&hd_img, 0x6C, 1); // VICLK: F passed through
         img_set(&hd_img, 0x04, (u16)((hcs << 8) | hce));
@@ -411,7 +421,18 @@ static void retrace_callback(UNUSED u32 count)
 {
     bool new_frame = false;
     retrace_count++;
-    if (hd_active && field_mode) {
+    if (hd_active && field_mode && hd->bob) {
+        // Bob crop: the queued fields in order, one per 480p frame
+        if (fm_pend[0] >= 0) {
+            const int idx = fm_pend[0];
+            hd_set_fbb(framebuffer[idx]);
+            fm_reg[0] = fm_reg[1] = idx;
+            fm_pend[0] = fm_pend[1];
+            fm_pend[1] = -1;
+            new_frame = true;
+            last_flip_retrace = retrace_count;
+        }
+    } else if (hd_active && field_mode) {
         // Each queued field goes into its own field's register; the VI picks it up the next
         // time it scans that field
         for (int p = 0; p < 2; p++) {
@@ -433,6 +454,16 @@ static void retrace_callback(UNUSED u32 count)
             pending_idx = -1;
             new_frame = true;
             last_flip_retrace = retrace_count;
+        }
+        if (hd->bob) {
+            // Bob crop of whole frames: alternate frames read the even and the odd lines
+            bob_line ^= 1;
+            u16 hi, lo;
+            fbb_values((u8 *)framebuffer[shown_idx] + bob_line * hd->w * 2, &hi, &lo);
+            VI[0x1C / 2] = hi;
+            VI[0x1E / 2] = lo;
+            VI[0x24 / 2] = hi;
+            VI[0x26 / 2] = lo;
         }
     } else if (pending_idx >= 0 && VIDEO_GetCurrentFramebuffer() == framebuffer[pending_idx]) {
         shown_idx = pending_idx;
@@ -515,7 +546,8 @@ const char *gfx_gx_wm_hd_name(void)
 {
     static char buf[48];
     if (crop_il) {
-        snprintf(buf, sizeof(buf), "%s>960i%s", crop_t->name, field_mode ? " fields" : "");
+        snprintf(buf, sizeof(buf), "%s>%s%s", crop_t->name, hd->bob ? "480p bob" : "960i",
+                 field_mode ? " fields" : "");
         return buf;
     }
     if (hd_active && field_mode) {
@@ -816,9 +848,9 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
     const bool crop = sel != NULL && (configCrop480 || force_crop);
     GXRModeObj *pref = VIDEO_GetPreferredMode(NULL);
     const bool pref_480p = (pref->viTVMode & 3) == VI_PROGRESSIVE && pref->xfbHeight == 480;
-    crop_il = crop && sel->il && configCrop960i && pref_480p;
-    if (crop && sel->il && configCrop960i && !pref_480p)
-        dbglog("960i crop needs the console in 480p; showing a plain 480 line crop");
+    crop_il = crop && sel->il && configCropInterlaced != CROP_IL_480P && pref_480p;
+    if (crop && sel->il && configCropInterlaced != CROP_IL_480P && !pref_480p)
+        dbglog("960i/bob crop needs the console in 480p; showing a plain 480 line crop");
     if (sel != NULL) {
         // Rendered size and tile grid: per field with field rendering (the plain 480p/480i crops
         // show the top left of whole frames)
@@ -845,15 +877,24 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
             // 640x960i at the 480p line rate: 858 clocks a line (27 MHz pixels), 524.5 lines a
             // field (59.997 Hz), 480 active per field; EQU/PSB taken from the 480p mode at init
             memset(&hd_out, 0, sizeof(hd_out));
-            hd_out.name = "640x960i";
-            hd_out.w = 640;
-            hd_out.h = 960;
-            hd_out.il = true;
-            hd_out.ht = 858;
-            hd_out.vn = 1049;
-            hd_out.acv = 480;
             hd_out.p_hz = 27000000;
+            hd_out.ht = 858;
+            hd_out.acv = 480;
             hd_out.stock_clock = true;
+            if (configCropInterlaced == CROP_IL_BOB) {
+                // Bob: the 480p signal itself, one field of the interlaced frame per frame
+                hd_out.name = "640x480p bob";
+                hd_out.w = 640;
+                hd_out.h = 480;
+                hd_out.vn = 1050;
+                hd_out.bob = true;
+            } else {
+                hd_out.name = "640x960i";
+                hd_out.w = 640;
+                hd_out.h = 960;
+                hd_out.il = true;
+                hd_out.vn = 1049;
+            }
             hd = &hd_out;
             hd_active = true;
             // Field buffers show 480 lines of each field; frame rendering keeps the 960 lines of
@@ -865,7 +906,7 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
         }
         crop_buf_lines = (crop_lines + th - 1) / th * th;
         snprintf(crop_name, sizeof(crop_name), "%ux%u>%u", hd_sel.w, hd_sel.h, (unsigned)pref->xfbHeight);
-        dbglog("crop: %s, showing %d lines per buffer (%d allocated)%s", crop_il ? "640x960i output" : "console mode",
+        dbglog("crop: %s, showing %d lines per buffer (%d allocated)%s", crop_il ? hd_out.name : "console mode",
                crop_lines, crop_buf_lines, field_mode ? ", field rendering" : "");
         if (!crop_il)
             return pref;
@@ -1037,7 +1078,7 @@ static void gfx_gx_wm_init(UNUSED const char *game_name, UNUSED bool start_in_fu
         safe_img.dcr |= 0x0001; // the safe image re-enables the VI when restored
         boot1c4 = HWREG(0x1C4);
         boot1c8 = HWREG(0x1C8);
-        if (hd->stock_clock) {
+        if (hd->stock_clock && !hd->bob) {
             // 960i crop: the 480p mode's vertical sync placement (EQU, PSB), interlaced
             hd_out.equ = (u8)(img_get(&safe_img, 0x00) & 0x0F);
             hd_out.psb = (u8)img_get(&safe_img, 0x0C);
@@ -1190,6 +1231,36 @@ static void gfx_gx_wm_swap_buffers_begin(void)
                draw_idx, shown_idx, pending_idx, VI[0x02 / 2], VI[0x1C / 2], VI[0x1E / 2]);
     if (frames == 120 && tiled_active)
         dbg_vi_regs("frame120");
+
+    if (triple && field_mode && hd->bob) {
+        // Bob crop: fields shown in order, one per frame. At vsync, wait for room in the
+        // two-field queue (which paces the game); uncapped, the oldest waiting field is dropped
+        int n = (fm_draw[0] >= 0) + (fm_draw[1] >= 0);
+        if (n == 0)
+            return;
+        if (!uncapped) {
+            u64 to = gettime() + millisecs_to_ticks(200);
+            while ((fm_pend[0] >= 0) + (fm_pend[1] >= 0) + n > 2 && gettime() < to) {
+            }
+        }
+        u32 level = IRQ_Disable();
+        for (int k = 0; k < 2; k++) {
+            if (fm_draw[k] < 0)
+                continue;
+            if (fm_pend[0] < 0)
+                fm_pend[0] = fm_draw[k];
+            else if (fm_pend[1] < 0)
+                fm_pend[1] = fm_draw[k];
+            else {
+                fm_pend[0] = fm_pend[1];
+                fm_pend[1] = fm_draw[k];
+            }
+            fm_draw[k] = -1;
+        }
+        fm_next_par = (fm_next_par + n) & 1;
+        IRQ_Restore(level);
+        return;
+    }
 
     if (triple && field_mode) {
         // Queue each drawn field for its own field's register (replacing an older one still
