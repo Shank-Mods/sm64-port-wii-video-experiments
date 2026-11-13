@@ -885,7 +885,7 @@ static void geo_process_background(struct GraphNodeBackground *node) {
         listInterpolated = node->fnNode.func(GEO_CONTEXT_RENDER, &node->fnNode.node, NULL);
         vec3f_copy(gLakituState.pos, posCopy);
         vec3f_copy(gLakituState.focus, focusCopy);
-        if (configBenchRender && node->fnNode.func == (GraphNodeFunc) geo_skybox_main && listInterpolated != NULL) {
+        if (config_rt_pacing() && node->fnNode.func == (GraphNodeFunc) geo_skybox_main && listInterpolated != NULL) {
             // Render-uncapped mode rebuilds it per frame (rt_render_at)
             struct GraphNodeCamera *camNode = (struct GraphNodeCamera *) gCurGraphNodeRoot->views[0];
             sRtSkyFov = ((struct GraphNodePerspective *) camNode->fnNode.node.parent)->fov;

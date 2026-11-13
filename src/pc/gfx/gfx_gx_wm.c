@@ -1096,6 +1096,10 @@ static void heartbeat(void)
 
 static void gfx_gx_wm_swap_buffers_begin(void)
 {
+#ifdef DBGLOG
+    if (configDebugFrameDelayMs)
+        delay_ms(configDebugFrameDelayMs); // simulated rendering load (testing frame pacing)
+#endif
     static unsigned int frames;
     frames++;
     heartbeat();

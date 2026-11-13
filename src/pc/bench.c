@@ -377,12 +377,13 @@ static void finish_pass(void) {
     fprintf(f, "video:  %s, %.3f Hz field rate\n", video_desc(), field_hz);
     fprintf(f, "mode:   %s\n", configBenchUncapped ? "uncapped (one game tick per frame, no vsync)"
                                 : configBenchRender ? "render uncapped (30 Hz game logic, frames interpolated, no vsync)"
+                                : configFramePacingRealtime ? "capped, realtime pacing (30 Hz game logic, frames interpolated, at vsync)"
                                                     : "capped (presented at vsync)");
     fprintf(f, "clock:  timebase %.3f MHz -> bus %.1f MHz (x%.3f of stock)%s; CPU est. %.0f MHz\n",
             tb_hz / 1e6, tb_hz * 4.0 / 1e6, tb_hz / STOCK_TB_HZ,
             tb_calibrated ? "" : " [not yet calibrated]", cpu_mhz);
     fprintf(f, "\n%-9s %7s %9s %8s %9s %9s", "demo", "frames", "avg fps", "1% low", "ms/frame", "worst ms");
-    if (configBenchRender)
+    if (config_rt_pacing())
         fprintf(f, " %8s %8s", "logic Hz", "fr/tick");
     if (pass_split)
         fprintf(f, " %8s %8s", "cpu ms", "gpu ms");
@@ -403,7 +404,7 @@ static void finish_pass(void) {
         double dlow = d < pass_ndemo ? low_fps(pass_ft + s->ft_first, s->frames) : low;
         fprintf(f, "%-9s %7u %9.2f %8.2f %9.3f %9.2f", name, (unsigned)s->frames, dfps, dlow,
                 ms(s->sum) / s->frames, ms(s->worst));
-        if (configBenchRender)
+        if (config_rt_pacing())
             fprintf(f, " %8.2f %8.2f", s->ticks / (ms(s->sum) / 1000.0),
                     s->ticks > 0 ? (double)s->frames / s->ticks : 0.0);
         if (pass_split && s->gpu_frames > 0) {
@@ -547,6 +548,7 @@ static void build_overlay_text(void) {
     char head[64];
     if (!configBenchmark) {
         snprintf(head, sizeof(head), "PLAY %s%s", configBenchUncapped ? "UNCAPPED" : configBenchRender ? "RENDER"
+                                                  : configFramePacingRealtime ? (config60Fps ? "60FPS RT" : "30FPS RT")
                                                   : (config60Fps ? "60FPS" : "30FPS"),
                  frame_split ? " \4SPLIT" : "");
     } else if (pass_running) {
@@ -565,10 +567,10 @@ static void build_overlay_text(void) {
     }
 
     ov_line("FPS \2%6.1f\1  frame %5.2fms  max %5.1f", s->fps, s->frame_ms, s->max_ms);
-    if (configBenchRender)
+    if (!configBenchUncapped) // game ticks per second: 30 at full speed, lower when slowed down
         ov_line("\4logic %5.2f Hz  %5.2f frames/tick", s->tick_hz,
                 s->tick_hz > 0 ? s->fps / s->tick_hz : 0.0);
-    else if (!configBenchUncapped) {
+    if (!configBenchUncapped && !configBenchRender) {
         // At vsync most of the frame can be waiting; what's left is the real load
         double busy = s->frame_ms - s->cat_ms[BENCH_PRESENT];
         ov_line("\4busy %5.2fms  %3.0f%% of frame  (~%.0f fps)", busy,

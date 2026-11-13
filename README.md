@@ -86,6 +86,16 @@ it's the VI timing or the video chain. Set `video_mode default` to go back to 48
 In capped mode the overlay's FPS is the presented rate; the **busy** line shows the time per
 frame excluding the vsync wait, and the frame rate that alone would allow.
 
+### Frame pacing (`frame_pacing`, default `vsync`)
+
+In normal (capped) play, `vsync` ties the game's speed to the display: every game tick waits for
+its frames to be shown, so when frames take longer than a refresh the whole game slows down
+(at 60fps a sustained 30 fps runs at half speed). `realtime` runs game ticks on a real-time
+30 Hz clock instead and draws each frame at the moment it's rendered (the render-uncapped
+mode's interpolation), still at most one frame per refresh: when rendering falls behind,
+frames drop (60, ~45, 30) and the game keeps its normal speed. The overlay's `logic` line shows
+the game tick rate (30 Hz at full speed).
+
 ### Custom video modes (Wii)
 
 Besides the named modes, `video_mode` takes any size, scan and refresh rate written as

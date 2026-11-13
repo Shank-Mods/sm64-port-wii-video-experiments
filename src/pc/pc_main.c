@@ -111,7 +111,7 @@ static void patch_interpolations(void) {
 // 60fps interpolation draws a second frame per game tick; uncapped draws one per tick
 static bool interpolate_60fps(void) {
 #ifdef TARGET_GX
-    if (configBenchUncapped || configBenchRender)
+    if (configBenchUncapped || config_rt_pacing())
         return false;
 #endif
     return config60Fps;
@@ -147,7 +147,7 @@ void send_display_list(struct SPTask *spTask) {
         return;
     }
 #ifdef TARGET_GX
-    if (configBenchRender) {
+    if (config_rt_pacing()) {
         rt_draw((Gfx *)spTask->task.t.data_ptr);
         return;
     }
@@ -195,7 +195,9 @@ void produce_one_frame(void) {
     static unsigned int pf;
     if (++pf <= 5)
         dbglog("produce_one_frame %u (%s)", pf, configBenchUncapped ? "uncapped" : "capped");
-    if (configBenchRender) {
+    if (config_rt_pacing()) {
+        // Render-uncapped, or frame_pacing realtime (the same, with each frame waiting for its
+        // refresh in the window manager)
         extern void rt_tick_reset(void);
         const double period = bench_tb_hz() / RT_TICK_HZ;
         const uint64_t now = bench_tb64();

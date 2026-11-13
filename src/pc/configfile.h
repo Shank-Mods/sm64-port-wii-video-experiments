@@ -74,7 +74,10 @@ extern bool         configOptTexHash;    // texture hashes computed once per fra
 extern bool         configOptStateCache; // skip reloading textures that are already loaded
 extern bool         configOptTileCull;   // tiled modes: skip draws that miss a tile
 extern bool         configN64Controller; // N64 controllers on the GameCube ports
-extern bool         configBenchRender;   // bench_uncapped render: 30 Hz logic, frames uncapped and interpolated
+extern bool         configBenchRender;
+extern unsigned int configDebugFrameDelayMs;
+extern bool         configFramePacingRealtime; // frame_pacing realtime: game logic on a real-time clock
+bool config_rt_pacing(void); // game ticks on a real-time 30 Hz clock, frames interpolated (render or realtime)   // bench_uncapped render: 30 Hz logic, frames uncapped and interpolated
 extern bool         configOptSkyLast;    // skybox drawn after the opaque level, only where it shows
 extern bool         configOptHwFog;      // CPU-path fog in GX's fog unit (no extra TEV stage)
 extern bool         configOptTriBin;     // tiled modes: split draws into per-tile runs of triangles

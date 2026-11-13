@@ -95,6 +95,7 @@ enum ConfigOptionType {
     CONFIG_TYPE_ASPECT,     // auto / 4:3 / 16:9 / square
     CONFIG_TYPE_SCAN,       // p / i
     CONFIG_TYPE_FIELDMODE,  // field / frame
+    CONFIG_TYPE_PACING,     // vsync / realtime
 };
 
 struct ConfigOption {
@@ -139,6 +140,8 @@ bool configOptTexHash            = true;
 bool configOptStateCache         = true;
 bool configOptTileCull           = true;
 bool configN64Controller         = true;  // N64 controllers on the GameCube ports (passive adapter)
+unsigned int configDebugFrameDelayMs = 0; // DBGLOG builds: extra CPU time per frame (simulated load)
+bool configFramePacingRealtime   = false; // frame_pacing: vsync (game speed follows the display) / realtime
 bool configBenchRender           = false; // bench_uncapped render: 30 Hz logic, frames drawn as fast as possible
 bool configOptSkyLast            = true;
 bool configOptHwFog              = true;
@@ -236,6 +239,10 @@ static const struct ConfigOption options[] = {
     {.name = "opt_state_cache", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptStateCache},
     {.name = "opt_tile_cull",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTileCull},
     {.name = "n64_controller", .type = CONFIG_TYPE_BOOL, .boolValue = &configN64Controller},
+#ifdef DBGLOG
+    {.name = "debug_frame_delay_ms", .type = CONFIG_TYPE_UINT, .uintValue = &configDebugFrameDelayMs},
+#endif
+    {.name = "frame_pacing",   .type = CONFIG_TYPE_PACING, .boolValue = &configFramePacingRealtime},
     {.name = "opt_sky_last",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptSkyLast},
     {.name = "opt_hw_fog",     .type = CONFIG_TYPE_BOOL, .boolValue = &configOptHwFog},
     {.name = "opt_tri_bin",    .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTriBin},
@@ -472,6 +479,13 @@ static const char *custom_mode_string(void) {
     return buf;
 }
 
+// Game ticks on a real-time 30 Hz clock with frames interpolated to the moment they're drawn:
+// bench_uncapped render (frames as fast as possible), or frame_pacing realtime (frames at
+// most one per refresh; when rendering falls behind, frames drop instead of the game slowing)
+bool config_rt_pacing(void) {
+    return configBenchRender || (configFramePacingRealtime && !configBenchUncapped);
+}
+
 // Display aspect of a w x h mode under video_aspect
 float configfile_video_dar(unsigned int w, unsigned int h) {
     const float sq = h > 0 ? (float)w / (float)h : 4.0f / 3.0f;
@@ -644,6 +658,12 @@ void configfile_load(const char *filename) {
                             else if (strcmp(tokens[1], "p") == 0 || strcmp(tokens[1], "progressive") == 0)
                                 *option->boolValue = false;
                             break;
+                        case CONFIG_TYPE_PACING:
+                            if (strcmp(tokens[1], "realtime") == 0)
+                                *option->boolValue = true;
+                            else if (strcmp(tokens[1], "vsync") == 0)
+                                *option->boolValue = false;
+                            break;
                         case CONFIG_TYPE_FIELDMODE:
                             if (strcmp(tokens[1], "field") == 0)
                                 *option->boolValue = true;
@@ -778,6 +798,9 @@ void configfile_save(const char *filename) {
                 break;
             case CONFIG_TYPE_SCAN:
                 fprintf(file, "%s %s\n", option->name, *option->boolValue ? "i" : "p");
+                break;
+            case CONFIG_TYPE_PACING:
+                fprintf(file, "%s %s\n", option->name, *option->boolValue ? "realtime" : "vsync");
                 break;
             case CONFIG_TYPE_FIELDMODE:
                 fprintf(file, "%s %s\n", option->name, *option->boolValue ? "field" : "frame");
