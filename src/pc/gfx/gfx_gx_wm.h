@@ -32,7 +32,10 @@ bool gfx_gx_wm_hires(void);
 bool gfx_gx_wm_hd(void);
 
 // True when a high resolution frame is rendered and its top left shown as normal 480p/480i
+// (or as 640x960i for the interlaced modes)
 bool gfx_gx_wm_crop(void);
+// Crop modes: lines of each output buffer that are shown
+int gfx_gx_wm_crop_lines(void);
 
 // Width of the whole rendered frame in pixels
 int gfx_gx_wm_get_frame_width(void);

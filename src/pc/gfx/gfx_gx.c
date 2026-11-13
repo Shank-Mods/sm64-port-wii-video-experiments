@@ -2346,9 +2346,27 @@ static void hr_replay_pass(void *xfb, f32 shift)
         GX_SetColorUpdate(GX_TRUE);
         GX_SetAlphaUpdate(GX_TRUE);
         if (gfx_gx_wm_crop()) {
-            // Only the top left tile is shown; the rest are copied out all the same
-            const bool shown = tx == 0 && ty == 0;
-            GX_CopyDisp(shown || hr_crop_scratch == NULL ? xfb : hr_crop_scratch, GX_TRUE);
+            // The tiles in the shown top left part go to their place in the (640 wide) output
+            // buffer; the rest are copied out all the same, into a scratch tile
+            const int fbw = rmode->fbWidth;
+            const bool shown = tile_x0 < fbw && tile_y0 < gfx_gx_wm_crop_lines();
+            void *scratch = hr_crop_scratch != NULL ? hr_crop_scratch : xfb;
+            if (shown) {
+                uint8_t *dst = (uint8_t *)xfb + ((uint32_t)tile_y0 * fbw + (uint32_t)tile_x0) * 2;
+                const int cw = MIN(hr_tile_w, fbw - tile_x0) & ~15;
+                if (cw == hr_tile_w) {
+                    GX_CopyDisp(dst, GX_TRUE);
+                } else {
+                    // A tile reaching past the output's right edge: its left part, then the
+                    // whole tile again so the copy's clear covers all of it
+                    GX_SetDispCopySrc(0, 0, cw, hr_tile_h);
+                    GX_CopyDisp(dst, GX_FALSE);
+                    GX_SetDispCopySrc(0, 0, hr_tile_w, hr_tile_h);
+                    GX_CopyDisp(scratch, GX_TRUE);
+                }
+            } else {
+                GX_CopyDisp(scratch, GX_TRUE);
+            }
         } else {
             const uint32_t offset = ((uint32_t)tile_y0 * rmode->fbWidth + (uint32_t)tile_x0) * 2;
             GX_CopyDisp((uint8_t *)xfb + offset, GX_TRUE);

@@ -74,6 +74,7 @@ extern bool         configOptTexHash;    // texture hashes computed once per fra
 extern bool         configOptStateCache; // skip reloading textures that are already loaded
 extern bool         configOptTileCull;   // tiled modes: skip draws that miss a tile
 extern bool         configN64Controller; // N64 controllers on the GameCube ports
+extern bool         configCrop960i;      // crop of an interlaced mode: 640x960i output
 extern bool         configBenchRender;
 extern unsigned int configDebugFrameDelayMs;
 extern bool         configFramePacingRealtime; // frame_pacing realtime: game logic on a real-time clock

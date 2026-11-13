@@ -96,6 +96,7 @@ enum ConfigOptionType {
     CONFIG_TYPE_SCAN,       // p / i
     CONFIG_TYPE_FIELDMODE,  // field / frame
     CONFIG_TYPE_PACING,     // vsync / realtime
+    CONFIG_TYPE_CROPIL,     // 960i / 480p
 };
 
 struct ConfigOption {
@@ -133,6 +134,7 @@ float configVideoAspectRatio     = 16.0f / 10.0f; // video_aspect W:H
 static unsigned int cfgAspectW = 16, cfgAspectH = 10; // as written, for saving
 bool configInterlaceField        = true;  // interlaced modes: field rendering (false: whole frames)
 float configVideoMaxPclk         = 125.0f; // MHz (124.2 is the fastest proven on hardware)
+bool configCrop960i              = true;  // crop of an interlaced mode: 640x960i output (480p line rate)
 bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
 bool configOptPsVertex           = true;
 bool configOptNativeTex          = true;
@@ -233,6 +235,7 @@ static const struct ConfigOption options[] = {
     {.name = "interlace_render", .type = CONFIG_TYPE_FIELDMODE, .boolValue = &configInterlaceField},
     {.name = "video_max_pclk", .type = CONFIG_TYPE_FLOAT, .floatValue = &configVideoMaxPclk},
     {.name = "crop_480p",      .type = CONFIG_TYPE_BOOL, .boolValue = &configCrop480},
+    {.name = "crop_interlaced", .type = CONFIG_TYPE_CROPIL, .boolValue = &configCrop960i},
     {.name = "opt_ps_vertex",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptPsVertex},
     {.name = "opt_native_tex", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptNativeTex},
     {.name = "opt_tex_hash",   .type = CONFIG_TYPE_BOOL, .boolValue = &configOptTexHash},
@@ -658,6 +661,12 @@ void configfile_load(const char *filename) {
                             else if (strcmp(tokens[1], "p") == 0 || strcmp(tokens[1], "progressive") == 0)
                                 *option->boolValue = false;
                             break;
+                        case CONFIG_TYPE_CROPIL:
+                            if (strcmp(tokens[1], "960i") == 0)
+                                *option->boolValue = true;
+                            else if (strcmp(tokens[1], "480p") == 0)
+                                *option->boolValue = false;
+                            break;
                         case CONFIG_TYPE_PACING:
                             if (strcmp(tokens[1], "realtime") == 0)
                                 *option->boolValue = true;
@@ -798,6 +807,9 @@ void configfile_save(const char *filename) {
                 break;
             case CONFIG_TYPE_SCAN:
                 fprintf(file, "%s %s\n", option->name, *option->boolValue ? "i" : "p");
+                break;
+            case CONFIG_TYPE_CROPIL:
+                fprintf(file, "%s %s\n", option->name, *option->boolValue ? "960i" : "480p");
                 break;
             case CONFIG_TYPE_PACING:
                 fprintf(file, "%s %s\n", option->name, *option->boolValue ? "realtime" : "vsync");

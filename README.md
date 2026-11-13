@@ -127,7 +127,14 @@ most 2047 half-lines. Asked for 1280x720p60 it lands on the standard 1650 x 750 
 size it can't time, or can't split into EFB tiles, falls back to the console's own mode; the
 debug log (`-DDBGLOG` builds) gives the timing chosen or the reason. In the normal (capped)
 mode a frame is held for as many fields as the 30 or 60 fps frame lasts (4 at 120 Hz).
-`crop_480p` works with any size.
+`crop_480p` works with any size. For an interlaced mode the crop is output as **640x960i**
+(`crop_interlaced 960i`, the default; `480p` for the plain crop): the console's stock clock and
+480p's horizontal timing (31.47 kHz lines), interlaced vertically (524.5 lines a field, 480
+active, 59.997 Hz), showing the top left 640x960 of the frame. The frame is rendered exactly as
+the full interlaced mode would be, field rendering included. No clock change is involved, so
+this works on the GameCube too (in 480p, i.e. with a component cable). Crops now copy every tile
+that falls in the shown area, so modes whose tiles are shorter than 480 lines (720p: 360) or
+narrower than 640 (1440 wide: 480) fill the whole crop.
 
 ### N64 controllers (`n64_controller`, default `true`)
 
