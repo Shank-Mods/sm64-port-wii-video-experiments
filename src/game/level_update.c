@@ -5,6 +5,9 @@
 #include "dialog_ids.h"
 #include "audio/external.h"
 #include "level_update.h"
+#ifdef TARGET_GX
+#include "pc/wtb.h"
+#endif
 #include "game_init.h"
 #include "level_update.h"
 #include "main.h"
@@ -1150,6 +1153,9 @@ s32 update_level(void) {
 }
 
 s32 init_level(void) {
+#ifdef TARGET_GX
+    wtb_mark("level %d area %d", gCurrLevelNum, gCurrAreaIndex);
+#endif
     s32 val4 = 0;
 
     set_play_mode(PLAY_MODE_NORMAL);

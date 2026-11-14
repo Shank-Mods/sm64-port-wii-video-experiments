@@ -1290,6 +1290,7 @@ static void gfx_gx_wm_swap_buffers_begin(void)
     static unsigned int frames;
     frames++;
     heartbeat();
+    wtb_alive();
     if (frames <= 10 || frames % 300 == 0)
         dbglog("swap: frame %u retraces %u beam V=%u H=%u draw=%d shown=%d pending=%d DCR=%04X FBB=%04X%04X",
                frames, (unsigned)retrace_count, VI[0x2C / 2] & 0x7FF, VI[0x2E / 2] & 0x7FF,
