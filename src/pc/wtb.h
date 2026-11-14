@@ -66,6 +66,18 @@ void wtb_alive(void);
 // the watchdog thread and before any report, so a run that dies still leaves its log. Lines
 // beyond 16 KB a second are dropped (counted). Any thread.
 void wtb_stream(const char *line);
+
+// Profiling and frame timing, asked for by the job (both off unless it does; the client sends
+// what was collected with DONE, as prof.txt and frames.bin, for the runner to analyse):
+//   cfg=wtb_prof=on|T0-T1[ HZ]   sample the CPU's program counter HZ times a second (default
+//                                2000) with the performance monitor, the whole run or from T0
+//                                to T1 seconds (the wtb_set_clock clock if set). Code running
+//                                with interrupts off is attributed to where they come back on.
+//   cfg=wtb_frames=on|T0-T1      log when each image is finished (wtb_alive) and when one goes
+//                                on screen (wtb_frame_shown), for frame pacing
+// Memory (heap in use and its peak, MEM1/MEM2 arena space) is always reported (mem.txt).
+// Call from the video retrace interrupt when a new image went on screen at this retrace
+void wtb_frame_shown(unsigned retrace);
 // A short note of what the game is doing (scene, phase); the last 8 go into crash/hang reports
 void wtb_mark(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
