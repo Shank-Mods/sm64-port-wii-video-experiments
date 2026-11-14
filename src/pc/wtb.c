@@ -24,6 +24,20 @@ static char cfg_name[WTB_MAX_CFG][48];
 static char cfg_value[WTB_MAX_CFG][96];
 static int ncfg;
 static bool net_ok;
+static u64 t_start;
+
+// Screenshots: the schedule (milliseconds since wtb_init, sorted), the queue of captured images
+static unsigned shot_ms[WTB_MAX_SHOTS];
+static int nshot_ms, next_shot;
+static unsigned shot_every_ms;
+static int shot_no = -1;      // the shot being captured (wtb_shot_due returned true for it)
+static int last_shot = -1;
+static unsigned shot_t_ms;    // its time
+struct Shot { char name[64]; char *data; size_t len; };
+static struct Shot shots[WTB_MAX_SHOTS * 2];
+static int nshots, shots_taken;
+static size_t shots_bytes;
+#define WTB_SHOT_MEMORY (40u << 20)  // never hold more than this many bytes of images
 
 bool wtb_active(void) {
     return active;
@@ -39,6 +53,28 @@ const char *wtb_cfg_name(int i) {
 
 const char *wtb_cfg_value(int i) {
     return (i >= 0 && i < ncfg) ? cfg_value[i] : "";
+}
+
+static int cmp_uint(const void *a, const void *b) {
+    unsigned x = *(const unsigned *)a, y = *(const unsigned *)b;
+    return x < y ? -1 : x > y;
+}
+
+// "5,20.5,60" and/or "every:N" (seconds)
+static void parse_shots(const char *v) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", v);
+    for (char *tok = strtok(buf, ", \r\n"); tok != NULL; tok = strtok(NULL, ", \r\n")) {
+        if (strncmp(tok, "every:", 6) == 0) {
+            double e = atof(tok + 6);
+            shot_every_ms = e > 0.1 ? (unsigned)(e * 1000.0) : 0;
+        } else if (nshot_ms < WTB_MAX_SHOTS) {
+            double t = atof(tok);
+            if (t >= 0)
+                shot_ms[nshot_ms++] = (unsigned)(t * 1000.0);
+        }
+    }
+    qsort(shot_ms, nshot_ms, sizeof(shot_ms[0]), cmp_uint);
 }
 
 // One request item: "wtb=HOST:PORT:JOB" or "cfg=NAME=VALUE" (also "wtb HOST:PORT:JOB" and
@@ -65,6 +101,10 @@ static void parse_item(const char *s) {
         const char *sep = strpbrk(n, "= ");
         if (sep == NULL)
             return;
+        if ((size_t)(sep - n) == 9 && strncmp(n, "wtb_shots", 9) == 0) {
+            parse_shots(sep + 1);
+            return;
+        }
         snprintf(cfg_name[ncfg], sizeof(cfg_name[0]), "%.*s", (int)(sep - n), n);
         snprintf(cfg_value[ncfg], sizeof(cfg_value[0]), "%s", sep + 1);
         char *v = cfg_value[ncfg];
@@ -131,6 +171,7 @@ bool wtb_init(int argc, char **argv, const char *file_path, const char *game, co
     }
     if (!active)
         return false;
+    t_start = gettime();
 
     // DHCP; a few seconds
     char ip[16] = { 0 }, mask[16] = { 0 }, gw[16] = { 0 };
@@ -194,6 +235,72 @@ bool wtb_send_path(const char *name, const char *path) {
     return ok;
 }
 
+bool wtb_shot_due(void) {
+    shot_no = -1;
+    if (!active || shots_taken >= WTB_MAX_SHOTS)
+        return false;
+    const unsigned now = (unsigned)ticks_to_millisecs(gettime() - t_start);
+    unsigned due = ~0u;
+    if (next_shot < nshot_ms && shot_ms[next_shot] <= now) {
+        due = shot_ms[next_shot++];
+        // several times passed at once (a long load): take one now, the next ones on later images
+    } else if (shot_every_ms && now >= shot_every_ms * (unsigned)(shots_taken + 1)) {
+        due = now;
+    } else {
+        return false;
+    }
+    shot_no = last_shot = shots_taken++;
+    shot_t_ms = due;
+    return true;
+}
+
+bool wtb_shot_again(void) {
+    if (!active || last_shot < 0)
+        return false;
+    shot_no = last_shot;
+    return true;
+}
+
+bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes) {
+    if (!active || shot_no < 0 || w <= 0 || h <= 0 || nshots >= (int)(sizeof(shots) / sizeof(shots[0])))
+        return false;
+    char header[64];
+    const int hl = snprintf(header, sizeof(header), "WTBIMG1 yuy2 %d %d\n", w, h);
+    const size_t row = (size_t)w * 2, len = (size_t)hl + row * (size_t)h;
+    if (shots_bytes + len > WTB_SHOT_MEMORY) {
+        wtb_log("screenshot %d skipped: over the memory limit", shot_no);
+        return false;
+    }
+    char *d = malloc(len);
+    if (d == NULL) {
+        wtb_log("screenshot %d skipped: out of memory (%u bytes)", shot_no, (unsigned)len);
+        return false;
+    }
+    memcpy(d, header, (size_t)hl);
+    for (int y = 0; y < h; y++)
+        memcpy(d + hl + row * (size_t)y, (const char *)yuy2 + (size_t)stride_bytes * (size_t)y, row);
+    struct Shot *s = &shots[nshots++];
+    snprintf(s->name, sizeof(s->name), "shot_%02d_%u.%03us_%s.wtbimg", shot_no, shot_t_ms / 1000,
+             shot_t_ms % 1000, kind);
+    s->data = d;
+    s->len = len;
+    shots_bytes += len;
+    return true;
+}
+
+void wtb_shots_send(void) {
+    for (int i = 0; i < nshots; i++) {
+        if (!wtb_send_file(shots[i].name, shots[i].data, shots[i].len))
+            wtb_log("sending %s failed", shots[i].name);
+        free(shots[i].data);
+    }
+    if (nshot_ms || shot_every_ms)
+        wtb_log("screenshots: %d taken of %d scheduled, %d images sent", shots_taken,
+                shot_every_ms ? shots_taken : nshot_ms, nshots);
+    nshots = 0;
+    shots_bytes = 0;
+}
+
 void wtb_done(const char *status) {
     if (!active)
         return;
@@ -218,5 +325,11 @@ void wtb_log(const char *fmt, ...) { (void)fmt; }
 bool wtb_send_file(const char *name, const void *data, size_t len) { (void)name; (void)data; (void)len; return false; }
 bool wtb_send_path(const char *name, const char *path) { (void)name; (void)path; return false; }
 void wtb_done(const char *status) { (void)status; }
+bool wtb_shot_due(void) { return false; }
+bool wtb_shot_again(void) { return false; }
+bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes) {
+    (void)kind; (void)w; (void)h; (void)yuy2; (void)stride_bytes; return false;
+}
+void wtb_shots_send(void) {}
 
 #endif
