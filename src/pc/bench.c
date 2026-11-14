@@ -358,6 +358,7 @@ static void passes_done_check(void) {
     if (wtb_active()) {
         wtb_send_file("sm64_bench.txt", report_buf, report_len);
         wtb_send_path("sm64_debug.txt", "sd:/sm64_debug.txt");
+        wtb_shots_send();
         wtb_done(report_len > 0 ? "ok" : "no results file (SD card?)");
     }
     exit(0);

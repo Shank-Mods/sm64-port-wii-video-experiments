@@ -36,4 +36,17 @@ bool wtb_send_path(const char *name, const char *path);
 // Final report ("ok", or a short reason); the caller then exits
 void wtb_done(const char *status);
 
+// Screenshots. The runner schedules them with cfg=wtb_shots=LIST (handled here; not listed by
+// wtb_cfg_*): seconds since wtb_init, "5,20.5,60", and/or "every:N" (every N seconds), at most
+// WTB_MAX_SHOTS. The game calls wtb_shot_due() once per image it puts on screen; when it returns
+// true, it hands the image that's about to be shown to wtb_shot_add, copied straight from the
+// XFB (YUY2, Y0 U Y1 V, the console's framebuffer format). Shots are kept in memory and sent by
+// wtb_shots_send (call it before wtb_done), so sending doesn't disturb the run's timing.
+#define WTB_MAX_SHOTS 32
+bool wtb_shot_due(void);
+// kind: "frame" (a whole image), or "top" / "bottom" (one field of an interlaced image; the
+// runner weaves a top and a bottom added for the same shot into one frame)
+bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes);
+void wtb_shots_send(void);
+
 #endif
