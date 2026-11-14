@@ -14,6 +14,8 @@ bool test_script_level_wanted(void);
 int test_script_take_level(int *act);
 // Called when a level has loaded (init_level): starts the script clock for test_level
 void test_script_level_loaded(void);
+// Between taking test_level and its first load (the star select is skipped)
+bool test_script_entering(void);
 
 // The script clock: game ticks (30 a second) since it started
 bool test_script_started(void);

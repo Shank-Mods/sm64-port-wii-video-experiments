@@ -1312,6 +1312,11 @@ s32 lvl_set_current_level(UNUSED s16 arg0, s32 levelNum) {
     if (gDebugLevelSelect && !gShowProfiler) {
         return 0;
     }
+#ifdef TARGET_GX
+    if (test_script_entering()) {
+        return 0; // test_level: no star select, its act was chosen already
+    }
+#endif
 
     return 1;
 }

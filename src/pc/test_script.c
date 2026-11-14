@@ -143,6 +143,7 @@ int test_script_take_level(int *act) {
     if (!level_pending)
         return -1;
     level_pending = false;
+    dbglog("test_level: entering level %d act %d", test_level, test_act);
     *act = test_act;
     return test_level;
 }
@@ -151,11 +152,16 @@ bool test_script_level_wanted(void) {
     return level_pending;
 }
 
+bool test_script_entering(void) {
+    return test_level > 0 && !level_pending && !started;
+}
+
 void test_script_level_loaded(void) {
     if (test_level > 0 && !started) {
         started = true;
         ticks = 0;
         wtb_mark("test level %d loaded: script clock starts", test_level);
+        dbglog("test_level: level %d loaded, script clock starts", test_level);
     }
 }
 
