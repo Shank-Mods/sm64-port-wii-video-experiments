@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include <ogc/lwp_watchdog.h>
 #include <ogc/lwp.h>
+#include <ogc/irq.h>
 #include <ogc/libversion.h>
 #if _V_MAJOR_ >= 3
 #include <tuxedo/ppc/exception.h>
@@ -33,6 +34,7 @@ static char cfg_value[WTB_MAX_CFG][96];
 static int ncfg;
 static bool net_ok;
 static u64 t_start;
+static unsigned (*game_clock)(void);
 
 // Screenshots: the schedule (milliseconds since wtb_init, sorted), the queue of captured images
 static unsigned shot_ms[WTB_MAX_SHOTS];
@@ -73,6 +75,13 @@ static char crash_text[3072];
 static char marks[8][64];
 static volatile unsigned nmarks;
 static lwp_t watchdog_thread = LWP_THREAD_NULL;
+
+// Streamed log: lines collected here, sent by the watchdog thread
+#define STREAM_SIZE (16 * 1024)
+static char stream_buf[STREAM_SIZE];
+static char stream_out[STREAM_SIZE];
+static volatile size_t stream_len;
+static volatile unsigned stream_dropped;
 
 static void start_watchdog(void);
 
@@ -267,11 +276,15 @@ bool wtb_send_path(const char *name, const char *path) {
     return ok;
 }
 
+void wtb_set_clock(unsigned (*ms)(void)) {
+    game_clock = ms;
+}
+
 bool wtb_shot_due(void) {
     shot_no = -1;
     if (!active || shots_taken >= WTB_MAX_SHOTS)
         return false;
-    const unsigned now = (unsigned)ticks_to_millisecs(gettime() - t_start);
+    const unsigned now = game_clock ? game_clock() : (unsigned)ticks_to_millisecs(gettime() - t_start);
     unsigned due = ~0u;
     if (next_shot < nshot_ms && shot_ms[next_shot] <= now) {
         due = shot_ms[next_shot++];
@@ -488,7 +501,45 @@ static void install_crash_hook(void) {
 }
 #endif
 
+void wtb_stream(const char *line) {
+    if (!active || line == NULL)
+        return;
+    const size_t n = strlen(line);
+    u32 level = IRQ_Disable();
+    if (stream_len + n + 1 <= STREAM_SIZE) {
+        memcpy(stream_buf + stream_len, line, n);
+        stream_buf[stream_len + n] = '\n';
+        stream_len += n + 1;
+    } else {
+        stream_dropped++;
+    }
+    IRQ_Restore(level);
+}
+
+static void stream_flush(void) {
+    if (stream_len == 0 && stream_dropped == 0)
+        return;
+    u32 level = IRQ_Disable();
+    size_t n = stream_len;
+    memcpy(stream_out, stream_buf, n);
+    stream_len = 0;
+    const unsigned dropped = stream_dropped;
+    stream_dropped = 0;
+    IRQ_Restore(level);
+    char header[96];
+    snprintf(header, sizeof(header), "WTB/1 LOGS %s %u\n", job, (unsigned)n);
+    int s = connect_runner();
+    if (s < 0)
+        return;
+    if (send_all(s, header, strlen(header)))
+        send_all(s, stream_out, n);
+    net_close(s);
+    if (dropped)
+        wtb_log("log stream: %u lines dropped (more than 16 KB a second)", dropped);
+}
+
 static void send_report_and_exit(const char *file, const char *text, const char *status) {
+    stream_flush();
     wtb_send_file(file, text, strlen(text));
     wtb_shots_send();
     wtb_done(status);
@@ -501,8 +552,13 @@ static void *watchdog(void *arg) {
     (void)arg;
     u32 last = alive_count;
     unsigned last_change = now_ms();
+    unsigned last_flush = now_ms();
     for (;;) {
         usleep(250 * 1000);
+        if (now_ms() - last_flush >= 1000) {
+            stream_flush();
+            last_flush = now_ms();
+        }
         if (crashed) {
             format_crash();
             char status[160];
@@ -560,6 +616,7 @@ void wtb_alive(void) {
 void wtb_done(const char *status) {
     if (!active)
         return;
+    stream_flush();
     char line[200];
     snprintf(line, sizeof(line), "WTB/1 DONE %s %s\n", job, status);
     send_msg(line, NULL, 0);
@@ -582,12 +639,14 @@ bool wtb_send_file(const char *name, const void *data, size_t len) { (void)name;
 bool wtb_send_path(const char *name, const char *path) { (void)name; (void)path; return false; }
 void wtb_done(const char *status) { (void)status; }
 bool wtb_shot_due(void) { return false; }
+void wtb_set_clock(unsigned (*ms)(void)) { (void)ms; }
 bool wtb_shot_again(void) { return false; }
 bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes) {
     (void)kind; (void)w; (void)h; (void)yuy2; (void)stride_bytes; return false;
 }
 void wtb_shots_send(void) {}
 void wtb_alive(void) {}
+void wtb_stream(const char *line) { (void)line; }
 void wtb_mark(const char *fmt, ...) { (void)fmt; }
 
 #endif

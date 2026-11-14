@@ -15,6 +15,7 @@
 #endif
 #include "controller_gamecube.h"
 #include "controller_n64.h"
+#include "../test_script.h"
 #else
 #include "controller_sdl.h"
 #endif
@@ -72,5 +73,6 @@ void osContGetReadData(OSContPad *pad) {
         pad->stick_x = 0;
         pad->stick_y = 0;
     }
+    test_script_apply(&pad->button, &pad->stick_x, &pad->stick_y);
 #endif
 }

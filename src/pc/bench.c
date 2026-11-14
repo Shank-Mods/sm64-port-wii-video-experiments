@@ -20,6 +20,7 @@
 #include "bench.h"
 #include "configfile.h"
 #include "wtb.h"
+#include "test_script.h"
 
 bool gBenchOn;
 uint32_t gBenchMark;
@@ -208,7 +209,7 @@ static char result_note[48];
 // ---------------------------------------------------------------------------------------------
 
 bool bench_wanted(void) {
-    return configBenchmark || configBenchOverlay;
+    return configBenchmark || configBenchOverlay || configBenchSeconds > 0;
 }
 
 static uint32_t win_no; // 0.5 s overlay windows closed so far
@@ -276,6 +277,8 @@ static const char *level_name(int level) {
 }
 
 static int demo_count(void) {
+    if (configBenchSeconds > 0 && !configBenchmark)
+        return 1; // a timed pass is one "demo"
     if (gDemo.animDmaTable != NULL && gDemo.animDmaTable->count > 0 && gDemo.animDmaTable->count <= MAX_DEMOS)
         return (int)gDemo.animDmaTable->count;
     return 7;
@@ -512,8 +515,13 @@ static void demo_end(void) {
 void bench_tick_done(void) {
     if (!gBenchOn)
         return;
-    // Passes are only timed in demo mode (an idle title screen also plays demos)
-    bool active = configBenchmark && gCurrDemoInput != NULL;
+    // Passes are only timed in demo mode (an idle title screen also plays demos), or, with
+    // bench_seconds, for that many game seconds from the test level's start (or boot)
+    bool active;
+    if (configBenchSeconds > 0 && !configBenchmark)
+        active = test_script_started() && test_script_ticks() < configBenchSeconds * 30u;
+    else
+        active = configBenchmark && gCurrDemoInput != NULL;
     if (active && !demo_active)
         demo_start();
     else if (!active && demo_active)
@@ -521,7 +529,7 @@ void bench_tick_done(void) {
     demo_active = active;
     frame_ticked = true;
     frame_demo = active && pass_running && cur_demo != NULL;
-    if (frame_demo && gCurrCourseNum != COURSE_NONE)
+    if (frame_demo && (gCurrCourseNum != COURSE_NONE || configBenchSeconds > 0))
         cur_demo->level = gCurrLevelNum;
 }
 

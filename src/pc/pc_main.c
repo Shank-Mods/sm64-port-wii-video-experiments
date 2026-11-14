@@ -20,6 +20,7 @@
 #include "gfx/gfx_dummy.h"
 #ifdef TARGET_GX
 #include "wtb.h"
+#include "test_script.h"
 #include "gfx/gfx_gx_wm.h"
 #include "gfx/gfx_gx.h"
 #include "gx_shutdown.h"
@@ -364,6 +365,10 @@ void main_func(void) {
         }
         if (configBenchPasses == 0)
             configBenchPasses = 2; // one overlapped and one split pass, then report and exit
+        if (configBenchSeconds > 0 && !configBenchmark)
+            configBenchPasses = 1; // a timed pass happens once
+        if (test_script_active())
+            wtb_set_clock(test_script_ms); // screenshots on the script's game clock
     }
 #endif
 #ifdef HIRES_FORCE
