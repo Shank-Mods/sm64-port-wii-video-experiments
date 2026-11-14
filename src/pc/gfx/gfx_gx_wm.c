@@ -704,7 +704,7 @@ static bool tile_grid(unsigned w, unsigned h, u8 *tx, u8 *ty)
     for (unsigned y = 1; y <= 15 && !*ty; y++)
         if (h % y == 0 && (h / y) % 2 == 0 && h / y <= 528)
             *ty = (u8)y;
-    return *tx && *ty && *tx * *ty <= 16;
+    return *tx && *ty; // up to 15 x 15 tiles (the tile culling packs tile indices in 4 bits)
 }
 
 // Searches the PLL settings and line lengths for the timing closest to the requested refresh,
@@ -827,7 +827,32 @@ static GXRModeObj *gfx_gx_wm_select_mode(void)
             char why[160];
             snprintf(hd_custom_name, sizeof(hd_custom_name), "%ux%u%c%g", c->width, c->height,
                      c->interlaced ? 'i' : 'p', (double)c->refresh);
-            if (gen_timing(&hd_custom, c->width, c->height, c->refresh, c->interlaced, why, sizeof(why))) {
+#ifdef __wii__
+            const bool crop_req = configCrop480;
+#else
+            const bool crop_req = true; // GameCube: always a crop
+#endif
+            if (crop_req) {
+                // A crop never sends this size to the VI, so only rendering limits apply: width
+                // a multiple of 16, height even (a multiple of 4 interlaced, for the fields),
+                // and a tile grid (checked below; up to 15 x 15 tiles of at most 640x528)
+                const bool ok = c->width >= 320 && c->width % 16 == 0 && c->height >= 240
+                                && c->height % (c->interlaced ? 4 : 2) == 0;
+                if (ok) {
+                    memset(&hd_custom, 0, sizeof(hd_custom));
+                    hd_custom.name = hd_custom_name;
+                    hd_custom.w = (u16)c->width;
+                    hd_custom.h = (u16)c->height;
+                    hd_custom.il = c->interlaced;
+                    sel = &hd_custom;
+                    sel_custom = true;
+                    dbglog("custom mode %s: rendered only (crop), no VI timing needed", hd_custom_name);
+                } else {
+                    dbglog("custom mode %s not possible: width must be a multiple of 16 (320 or more), height "
+                           "at least 240 and a multiple of %u; using the console's own mode", hd_custom_name,
+                           c->interlaced ? 4 : 2);
+                }
+            } else if (gen_timing(&hd_custom, c->width, c->height, c->refresh, c->interlaced, why, sizeof(why))) {
                 hd_custom.name = hd_custom_name;
                 sel = &hd_custom;
                 sel_custom = true;
