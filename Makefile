@@ -501,6 +501,8 @@ ifeq ($(TARGET_GX),1)
     WII_LIBS := -lwiiuse -lbte
   endif
   PLATFORM_LDFLAGS := $(MACHDEP) -L$(LIBOGC)/lib/$(GX_PLATFORM) -g -lm -lasnd $(WII_LIBS) -lfat -logc
+  # test bench crash reports on libogc 2.x (harmless on 3.x, which has a panic hook instead)
+  PLATFORM_LDFLAGS += -Wl,--wrap=c_default_exceptionhandler
 endif
 
 PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC

@@ -4,6 +4,7 @@
 #if defined(TARGET_GX) && defined(__wii__)
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,13 @@
 #include <network.h>
 #include <unistd.h>
 #include <ogc/lwp_watchdog.h>
+#include <ogc/lwp.h>
+#include <ogc/libversion.h>
+#if _V_MAJOR_ >= 3
+#include <tuxedo/ppc/exception.h>
+#else
+#include <ogc/context.h>
+#endif
 
 #include "wtb.h"
 
@@ -54,6 +62,19 @@ const char *wtb_cfg_name(int i) {
 const char *wtb_cfg_value(int i) {
     return (i >= 0 && i < ncfg) ? cfg_value[i] : "";
 }
+
+// Crash / freeze watchdog state
+static unsigned hang_s = 20;
+static int test_kind;            // wtb_test: 1 trap, 2 null write (DSI), 3 freeze
+static unsigned test_ms;
+static volatile u32 alive_count;
+static volatile int crashed;     // set by the exception hook
+static char crash_text[3072];
+static char marks[8][64];
+static volatile unsigned nmarks;
+static lwp_t watchdog_thread = LWP_THREAD_NULL;
+
+static void start_watchdog(void);
 
 static int cmp_uint(const void *a, const void *b) {
     unsigned x = *(const unsigned *)a, y = *(const unsigned *)b;
@@ -103,6 +124,16 @@ static void parse_item(const char *s) {
             return;
         if ((size_t)(sep - n) == 9 && strncmp(n, "wtb_shots", 9) == 0) {
             parse_shots(sep + 1);
+            return;
+        }
+        if ((size_t)(sep - n) == 10 && strncmp(n, "wtb_hang_s", 10) == 0) {
+            hang_s = (unsigned)atoi(sep + 1);
+            return;
+        }
+        if ((size_t)(sep - n) == 8 && strncmp(n, "wtb_test", 8) == 0) {
+            const char *v = sep + 1, *at = strchr(v, '@');
+            test_kind = strncmp(v, "crash", 5) == 0 ? 1 : strncmp(v, "dsi", 3) == 0 ? 2 : strncmp(v, "hang", 4) == 0 ? 3 : 0;
+            test_ms = at ? (unsigned)(atof(at + 1) * 1000.0) : 10000;
             return;
         }
         snprintf(cfg_name[ncfg], sizeof(cfg_name[0]), "%.*s", (int)(sep - n), n);
@@ -174,7 +205,7 @@ bool wtb_init(int argc, char **argv, const char *file_path, const char *game, co
     t_start = gettime();
 
     // DHCP; a few seconds
-    char ip[16] = { 0 }, mask[16] = { 0 }, gw[16] = { 0 };
+    char ip[16] = { 0 };
     // On real hardware, right after the Homebrew Channel starts us, IOS needs several seconds
     // before the network is usable: if_config's own retries run out first (Dolphin hides this).
     // Loop on net_init while it says -EAGAIN, then wait for DHCP to give us an address.
@@ -190,6 +221,7 @@ bool wtb_init(int argc, char **argv, const char *file_path, const char *game, co
         if (net_ok)
             snprintf(ip, sizeof(ip), "%u.%u.%u.%u", hip >> 24, (hip >> 16) & 255, (hip >> 8) & 255, hip & 255);
     }
+    start_watchdog();
     char hello[256];
     snprintf(hello, sizeof(hello), "WTB/1 HELLO %s %s %s %s\n", job, game, net_ok ? ip : "-", build);
     send_msg(hello, NULL, 0);
@@ -301,6 +333,206 @@ void wtb_shots_send(void) {
     shots_bytes = 0;
 }
 
+// ---- crashes and freezes ---------------------------------------------------------------------
+
+static unsigned now_ms(void) {
+    return (unsigned)ticks_to_millisecs(gettime() - t_start);
+}
+
+void wtb_mark(const char *fmt, ...) {
+    if (!active)
+        return;
+    char *m = marks[nmarks % 8];
+    int n = snprintf(m, sizeof(marks[0]), "%u.%03u ", now_ms() / 1000, now_ms() % 1000);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(m + n, sizeof(marks[0]) - (size_t)n, fmt, ap);
+    va_end(ap);
+    nmarks++;
+}
+
+static int append(char *buf, size_t size, int pos, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
+static int append(char *buf, size_t size, int pos, const char *fmt, ...) {
+    if (pos < 0 || (size_t)pos >= size)
+        return pos;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + pos, size - (size_t)pos, fmt, ap);
+    va_end(ap);
+    return n < 0 ? pos : pos + n > (int)size - 1 ? (int)size - 1 : pos + n;
+}
+
+static bool code_addr(u32 a) {
+    return (a >= 0x80000000 && a < 0x81800000) || (a >= 0x90000000 && a < 0x94000000);
+}
+
+static int append_marks(char *buf, size_t size, int pos) {
+    pos = append(buf, size, pos, "recent marks (oldest first):\n");
+    const unsigned n = nmarks;
+    for (unsigned i = n > 8 ? n - 8 : 0; i < n; i++)
+        pos = append(buf, size, pos, "  %s\n", marks[i % 8]);
+    return pos;
+}
+
+static void parked(void) {
+    for (;;)
+        usleep(1000 * 1000); // the crashed thread sleeps here; the watchdog takes over
+}
+
+static const char *exc_name(unsigned exid) {
+#if _V_MAJOR_ >= 3
+    switch (exid) {
+        case PPC_EXCPT_DSI: return "DSI (bad data access)";
+        case PPC_EXCPT_ISI: return "ISI (bad instruction fetch)";
+        case PPC_EXCPT_ALIGN: return "alignment";
+        case PPC_EXCPT_UNDEF: return "program (trap or illegal instruction)";
+        case PPC_EXCPT_MCHK: return "machine check";
+        case PPC_EXCPT_FPU: return "floating point";
+        default: return "exception";
+    }
+#else
+    switch (exid) {
+        case EX_DSI: return "DSI (bad data access)";
+        case EX_ISI: return "ISI (bad instruction fetch)";
+        case EX_ALIGN: return "alignment";
+        case EX_PRG: return "program (trap or illegal instruction)";
+        case EX_MACH_CHECK: return "machine check";
+        case EX_FP: return "floating point";
+        default: return "exception";
+    }
+#endif
+}
+
+// Runs in exception context: record everything (no locks, no I/O), park the thread
+static u32 record_crash(unsigned exid, u32 pc, u32 lr, u32 msr, const u32 *gpr) {
+    u32 dar, dsisr;
+    __asm__ volatile("mfspr %0, 19" : "=r"(dar));
+    __asm__ volatile("mfspr %0, 18" : "=r"(dsisr));
+    char *b = crash_text;
+    const size_t z = sizeof(crash_text);
+    int p = append(b, z, 0, "crash: %s (exception %u) at %u.%03u s, thread %p\n", exc_name(exid), exid,
+                   now_ms() / 1000, now_ms() % 1000, (void *)LWP_GetSelf());
+    p = append(b, z, p, "pc %08X lr %08X sp %08X msr %08X dar %08X dsisr %08X\n", (unsigned)pc, (unsigned)lr,
+               (unsigned)gpr[1], (unsigned)msr, (unsigned)dar, (unsigned)dsisr);
+    for (int i = 0; i < 32; i += 4)
+        p = append(b, z, p, "r%-2d %08X  r%-2d %08X  r%-2d %08X  r%-2d %08X\n", i, (unsigned)gpr[i], i + 1,
+                   (unsigned)gpr[i + 1], i + 2, (unsigned)gpr[i + 2], i + 3, (unsigned)gpr[i + 3]);
+    // Call chain: pc, lr, then the saved LR of each frame up the back chain
+    p = append(b, z, p, "stack: %08X %08X", (unsigned)pc, (unsigned)lr);
+    u32 sp = gpr[1];
+    for (int i = 0; i < 24 && code_addr(sp) && (sp & 3) == 0; i++) {
+        const u32 next = *(volatile u32 *)sp;
+        if (!code_addr(next) || next <= sp)
+            break;
+        const u32 saved_lr = *(volatile u32 *)(next + 4);
+        if (code_addr(saved_lr))
+            p = append(b, z, p, " %08X", (unsigned)saved_lr);
+        sp = next;
+    }
+    p = append(b, z, p, "\n");
+    append_marks(b, z, p);
+    crashed = 1;
+    return (u32)(uintptr_t)parked;
+}
+
+#if _V_MAJOR_ >= 3
+static PPCExcptPanicFn prev_panic;
+static void wtb_panic(unsigned exid, PPCContext *ctx) {
+    if (crashed || exid == PPC_EXCPT_RESET) {
+        prev_panic(exid, ctx);
+        return;
+    }
+    ctx->pc = record_crash(exid, ctx->pc, ctx->lr, ctx->msr, ctx->gpr);
+    ctx->msr |= 0x8000; // EE: interrupts on, so the parked thread can sleep
+}
+static void install_crash_hook(void) {
+    prev_panic = PPCExcptCurPanicFn;
+    PPCExcptCurPanicFn = wtb_panic;
+}
+#else
+// libogc 2.x: its exception vectors call c_default_exceptionhandler; the game links with
+// -Wl,--wrap=c_default_exceptionhandler so that calls arrive here first
+void __real_c_default_exceptionhandler(frame_context *ctx);
+void __wrap_c_default_exceptionhandler(frame_context *ctx) {
+    if (!active || crashed || ctx->EXCPT_Number == EX_SYS_RESET) {
+        __real_c_default_exceptionhandler(ctx);
+        return;
+    }
+    ctx->SRR0 = record_crash(ctx->EXCPT_Number, ctx->SRR0, ctx->LR, ctx->SRR1, ctx->GPR);
+    ctx->SRR1 |= 0x8000;
+}
+static void install_crash_hook(void) {
+}
+#endif
+
+static void send_report_and_exit(const char *file, const char *text, const char *status) {
+    wtb_send_file(file, text, strlen(text));
+    wtb_shots_send();
+    wtb_done(status);
+    // Back to the loader without running atexit handlers or flushing stdio: the stuck thread may
+    // hold their locks. libogc's _exit returns to the Homebrew Channel's reload stub.
+    _exit(0);
+}
+
+static void *watchdog(void *arg) {
+    (void)arg;
+    u32 last = alive_count;
+    unsigned last_change = now_ms();
+    for (;;) {
+        usleep(250 * 1000);
+        if (crashed) {
+            char status[160];
+            const char *nl = strchr(crash_text, '\n');
+            snprintf(status, sizeof(status), "%.*s", nl ? (int)(nl - crash_text) : 100, crash_text);
+            wtb_log("%s", status);
+            send_report_and_exit("crash.txt", crash_text, status);
+        }
+        const u32 a = alive_count;
+        const unsigned t = now_ms();
+        if (a != last) {
+            last = a;
+            last_change = t;
+            continue;
+        }
+        const unsigned limit = (a == 0 ? (hang_s > 60 ? hang_s : 60) : hang_s) * 1000;
+        if (hang_s && t - last_change > limit) {
+            static char text[1024];
+            int p = append(text, sizeof(text), 0,
+                           "hang: no progress for %u s (at %u.%03u s, %u frames shown)\n", (t - last_change) / 1000,
+                           t / 1000, t % 1000, (unsigned)a);
+            append_marks(text, sizeof(text), p);
+            char status[96];
+            snprintf(status, sizeof(status), "hang: no progress for %u s", (t - last_change) / 1000);
+            wtb_log("%s", status);
+            send_report_and_exit("hang.txt", text, status);
+        }
+    }
+    return NULL;
+}
+
+static void start_watchdog(void) {
+    install_crash_hook();
+    LWP_CreateThread(&watchdog_thread, watchdog, NULL, NULL, 32 * 1024, 120);
+}
+
+void wtb_alive(void) {
+    if (!active)
+        return;
+    alive_count++;
+    if (test_kind && now_ms() >= test_ms) {
+        const int k = test_kind;
+        test_kind = 0;
+        wtb_log("wtb_test: %s now", k == 1 ? "crash (trap)" : k == 2 ? "crash (null write)" : "freeze");
+        if (k == 1)
+            __builtin_trap();
+        else if (k == 2)
+            *(volatile u32 *)0x00000010 = 1; // no BAT maps address 0: DSI on hardware
+        else
+            for (;;) {
+            }
+    }
+}
+
 void wtb_done(const char *status) {
     if (!active)
         return;
@@ -331,5 +563,7 @@ bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_b
     (void)kind; (void)w; (void)h; (void)yuy2; (void)stride_bytes; return false;
 }
 void wtb_shots_send(void) {}
+void wtb_alive(void) {}
+void wtb_mark(const char *fmt, ...) { (void)fmt; }
 
 #endif

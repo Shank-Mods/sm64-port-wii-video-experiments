@@ -51,4 +51,15 @@ bool wtb_shot_again(void);
 bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes);
 void wtb_shots_send(void);
 
+// Crashes and freezes. Called by the game once per image it puts on screen (and from any long
+// loop that should count as progress): no call for wtb_hang_s seconds (cfg=wtb_hang_s=N, default
+// 20; 60 before the first call) counts as a freeze. A crash (DSI, ISI, program, alignment...)
+// is caught in test runs: the crashing thread is parked and a watchdog thread sends crash.txt
+// (exception, registers, call chain) or hang.txt, then DONE "crash: ..." / "hang: ...", and
+// returns to the Homebrew Channel, so the next run can start without anyone touching the Wii.
+// cfg=wtb_test=crash@T|dsi@T|hang@T makes the game crash or freeze T seconds in (to test this).
+void wtb_alive(void);
+// A short note of what the game is doing (scene, phase); the last 8 go into crash/hang reports
+void wtb_mark(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 #endif
