@@ -97,6 +97,7 @@ enum ConfigOptionType {
     CONFIG_TYPE_FIELDMODE,  // field / frame
     CONFIG_TYPE_PACING,     // vsync / realtime
     CONFIG_TYPE_CROPIL,     // 960i / 480p
+    CONFIG_TYPE_CROPTILES,  // reuse / keep
 };
 
 struct ConfigOption {
@@ -135,6 +136,7 @@ static unsigned int cfgAspectW = 16, cfgAspectH = 10; // as written, for saving
 bool configInterlaceField        = true;  // interlaced modes: field rendering (false: whole frames)
 float configVideoMaxPclk         = 125.0f; // MHz (124.2 is the fastest proven on hardware)
 unsigned int configCropInterlaced = CROP_IL_BOB; // crop of an interlaced mode: bob 480p / 960i / plain 480p
+bool configCropKeepTiles          = false; // crop_tiles keep: every hidden tile copied to its own MEM2 slot
 bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
 bool configOptPsVertex           = true;
 bool configOptNativeTex          = true;
@@ -235,6 +237,7 @@ static const struct ConfigOption options[] = {
     {.name = "interlace_render", .type = CONFIG_TYPE_FIELDMODE, .boolValue = &configInterlaceField},
     {.name = "video_max_pclk", .type = CONFIG_TYPE_FLOAT, .floatValue = &configVideoMaxPclk},
     {.name = "crop_480p",      .type = CONFIG_TYPE_BOOL, .boolValue = &configCrop480},
+    {.name = "crop_tiles",     .type = CONFIG_TYPE_CROPTILES, .boolValue = &configCropKeepTiles},
     {.name = "crop_interlaced", .type = CONFIG_TYPE_CROPIL, .uintValue = &configCropInterlaced},
     {.name = "opt_ps_vertex",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptPsVertex},
     {.name = "opt_native_tex", .type = CONFIG_TYPE_BOOL, .boolValue = &configOptNativeTex},
@@ -661,6 +664,12 @@ void configfile_load(const char *filename) {
                             else if (strcmp(tokens[1], "p") == 0 || strcmp(tokens[1], "progressive") == 0)
                                 *option->boolValue = false;
                             break;
+                        case CONFIG_TYPE_CROPTILES:
+                            if (strcmp(tokens[1], "keep") == 0)
+                                *option->boolValue = true;
+                            else if (strcmp(tokens[1], "reuse") == 0)
+                                *option->boolValue = false;
+                            break;
                         case CONFIG_TYPE_CROPIL:
                             if (strcmp(tokens[1], "960i") == 0)
                                 *option->uintValue = CROP_IL_960I;
@@ -809,6 +818,9 @@ void configfile_save(const char *filename) {
                 break;
             case CONFIG_TYPE_SCAN:
                 fprintf(file, "%s %s\n", option->name, *option->boolValue ? "i" : "p");
+                break;
+            case CONFIG_TYPE_CROPTILES:
+                fprintf(file, "%s %s\n", option->name, *option->boolValue ? "keep" : "reuse");
                 break;
             case CONFIG_TYPE_CROPIL:
                 fprintf(file, "%s %s\n", option->name, *option->uintValue == CROP_IL_960I ? "960i"

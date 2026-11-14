@@ -79,6 +79,7 @@ extern bool         configN64Controller; // N64 controllers on the GameCube port
 #define CROP_IL_960I 1u // 640x960i at the 480p line rate
 #define CROP_IL_BOB  2u // 480p showing one field of the interlaced frame per frame (bobs)
 extern unsigned int configCropInterlaced;
+extern bool         configCropKeepTiles; // crop_tiles keep: hidden tiles copied to their own MEM2 slots
 extern bool         configBenchRender;
 extern unsigned int configDebugFrameDelayMs;
 extern bool         configFramePacingRealtime; // frame_pacing realtime: game logic on a real-time clock

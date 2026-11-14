@@ -104,6 +104,12 @@ static int hw_proj_add(const Mtx44 m);
 
 static bool hr_enabled;
 static uint8_t *hr_crop_scratch; // crop modes: destination of every tile but the top left one
+// crop_tiles keep: a slot of its own for every tile of an image (both fields' when field
+// rendering draws two per image), in MEM2, so hidden tiles land in distinct memory instead of
+// one reused scratch tile
+static uint8_t *hr_crop_slots;
+static uint32_t hr_crop_slot_bytes;
+static int hr_crop_slot_passes;
 static int hr_tiles_x = 2, hr_tiles_y = 1;      // tile grid
 static int hr_tile_w = HIRES_TILE_WIDTH, hr_tile_h = 240;
 static uint8_t *hr_dl;
@@ -2166,6 +2172,27 @@ static void gx_init()
                 if (hr_crop_scratch != NULL)
                     DCInvalidateRange(hr_crop_scratch, bytes); // GPU-written only
                 dbglog("gx_init: crop scratch %p (%u bytes)", hr_crop_scratch, (unsigned)bytes);
+#ifdef __wii__
+                if (configCropKeepTiles) {
+                    // Taken off the bottom of the MEM2 arena (after the GPU heap)
+                    hr_crop_slot_passes = gfx_gx_wm_field_mode() ? 2 : 1;
+                    hr_crop_slot_bytes = bytes;
+                    const uint32_t total = bytes * (uint32_t)(hr_tiles_x * hr_tiles_y) * (uint32_t)hr_crop_slot_passes;
+                    uint8_t *lo = (uint8_t *)(((uintptr_t)SYS_GetArena2Lo() + 31) & ~31);
+                    uint8_t *hi = (uint8_t *)SYS_GetArena2Hi();
+                    if ((uint32_t)(hi - lo) >= total + 4u * 1024 * 1024) {
+                        SYS_SetArena2Lo(lo + total);
+                        hr_crop_slots = lo;
+                        DCInvalidateRange(hr_crop_slots, total);
+                        dbglog("gx_init: crop tiles kept: %d slots x %u bytes = %u KB in MEM2 at %p",
+                               hr_tiles_x * hr_tiles_y * hr_crop_slot_passes, (unsigned)bytes,
+                               (unsigned)(total / 1024), hr_crop_slots);
+                    } else {
+                        dbglog("gx_init: crop_tiles keep needs %u KB of MEM2, only %u KB free: reusing one tile",
+                               (unsigned)(total / 1024), (unsigned)((hi - lo) / 1024));
+                    }
+                }
+#endif
             }
             // Keep libogc's register shadows as recorded, rather than rolling them back at the
             // end of every display list segment
@@ -2281,7 +2308,7 @@ static void hr_load_tile_projection(const struct HiresSeg *seg, int tile_x0, int
     GX_LoadProjectionMtx(m, (seg->proj == PROJ_ORTHO || seg->proj == PROJ_SKY) ? GX_ORTHOGRAPHIC : GX_PERSPECTIVE);
 }
 
-static void hr_replay_pass(void *xfb, f32 shift);
+static void hr_replay_pass(void *xfb, f32 shift, int pass);
 
 // Replays the recorded frame once per render pass: once, or (field rendering at 30 fps) once
 // for each of the frame's two fields, a quarter line up and down
@@ -2289,11 +2316,11 @@ static void hr_replay(void)
 {
     const int passes = gfx_gx_wm_pass_count();
     for (int k = 0; k < passes; k++)
-        hr_replay_pass(gfx_gx_wm_get_pass_buffer(k), gfx_gx_wm_pass_shift(k));
+        hr_replay_pass(gfx_gx_wm_get_pass_buffer(k), gfx_gx_wm_pass_shift(k), k);
     GX_Flush();
 }
 
-static void hr_replay_pass(void *xfb, f32 shift)
+static void hr_replay_pass(void *xfb, f32 shift, int pass)
 {
     GXRModeObj *rmode = gfx_gx_wm_get_rmode();
     const bool remap_y = hr_tiles_y > 1 || shift != 0.0f;
@@ -2351,6 +2378,9 @@ static void hr_replay_pass(void *xfb, f32 shift)
             const int fbw = rmode->fbWidth;
             const bool shown = tile_x0 < fbw && tile_y0 < gfx_gx_wm_crop_lines();
             void *scratch = hr_crop_scratch != NULL ? hr_crop_scratch : xfb;
+            if (hr_crop_slots != NULL) // crop_tiles keep: this tile's own slot
+                scratch = hr_crop_slots + ((uint32_t)(pass % hr_crop_slot_passes) * (uint32_t)(hr_tiles_x * hr_tiles_y)
+                                           + (uint32_t)(ty * hr_tiles_x + tx)) * hr_crop_slot_bytes;
             if (shown) {
                 uint8_t *dst = (uint8_t *)xfb + ((uint32_t)tile_y0 * fbw + (uint32_t)tile_x0) * 2;
                 const int cw = MIN(hr_tile_w, fbw - tile_x0) & ~15;
