@@ -7,6 +7,7 @@
 #include "level_update.h"
 #ifdef TARGET_GX
 #include "pc/wtb.h"
+#include "pc/test_script.h"
 #endif
 #include "game_init.h"
 #include "level_update.h"
@@ -1155,6 +1156,7 @@ s32 update_level(void) {
 s32 init_level(void) {
 #ifdef TARGET_GX
     wtb_mark("level %d area %d", gCurrLevelNum, gCurrAreaIndex);
+    test_script_level_loaded();
 #endif
     s32 val4 = 0;
 

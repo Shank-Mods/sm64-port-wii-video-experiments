@@ -18,6 +18,7 @@
 #endif
 
 #include "configfile.h"
+#include "test_script.h"
 #include "early_console.h"
 #include <unistd.h>
 #include <stdarg.h>
@@ -161,6 +162,7 @@ bool configFog                   = true;  // Distance fog (turning it off also e
 bool configForceNearest          = false; // Force GX_NEAR (nearest-neighbour) texture filtering instead of bilinear
 bool configViDeflicker           = true;  // Apply the VI deflicker filter
 bool configPuppycam              = false; // Use the Puppycam analogue camera instead of the original camera
+unsigned int configBenchSeconds  = 0;     // timed pass: game seconds from the test level's start (or boot), then results
 bool configBenchmark             = true;  // bench_demo: timedemo, plays the attract-mode demos in a loop, input ignored
 bool configBenchOverlay          = true;  // Frame time overlay (in demo mode and in normal play)
 bool configBenchUncapped         = true;  // One game tick per rendered frame, no vsync wait: game logic runs fast too
@@ -239,6 +241,7 @@ static const struct ConfigOption options[] = {
     {.name = "video_max_pclk", .type = CONFIG_TYPE_FLOAT, .floatValue = &configVideoMaxPclk},
     {.name = "crop_480p",      .type = CONFIG_TYPE_BOOL, .boolValue = &configCrop480},
     {.name = "bench_passes",   .type = CONFIG_TYPE_UINT, .uintValue = &configBenchPasses},
+    {.name = "bench_seconds",  .type = CONFIG_TYPE_UINT, .uintValue = &configBenchSeconds},
     {.name = "crop_tiles",     .type = CONFIG_TYPE_CROPTILES, .boolValue = &configCropKeepTiles},
     {.name = "crop_interlaced", .type = CONFIG_TYPE_CROPIL, .uintValue = &configCropInterlaced},
     {.name = "opt_ps_vertex",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptPsVertex},
@@ -511,6 +514,8 @@ float configfile_video_dar(unsigned int w, unsigned int h) {
 
 // Applies one "name value" option (both modifiable: "benchmark" is renamed in place)
 static void config_apply(char **tokens) {
+                if (test_script_option(tokens[0], tokens[1]))
+                    return;
                 const struct ConfigOption *option = NULL;
 
                 // "benchmark" was the name of bench_demo on the wii-benchmark branch
@@ -708,6 +713,21 @@ void configfile_load(const char *filename) {
 
         while (isspace(*p))
             p++;
+        if (strncmp(p, "test_", 5) == 0) {
+            // test script lines take the rest of the line as their value
+            char *v = p;
+            while (*v != '\0' && !isspace(*v))
+                v++;
+            if (*v != '\0')
+                *v++ = '\0';
+            while (isspace(*v))
+                v++;
+            for (char *e = v + strlen(v); e > v && isspace(e[-1]); e--)
+                e[-1] = '\0';
+            test_script_option(p, v);
+            free(line);
+            continue;
+        }
         numTokens = tokenize_string(p, 2, tokens);
         if (numTokens != 0) {
             if (numTokens == 2) {

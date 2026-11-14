@@ -101,6 +101,7 @@ extern bool         configForceNearest;
 extern bool         configViDeflicker;
 extern bool         configPuppycam;
 extern bool         configBenchmark;
+extern unsigned int configBenchSeconds;
 extern bool         configBenchOverlay;
 extern bool         configBenchUncapped;
 extern unsigned int configBenchSplit;

@@ -33,6 +33,7 @@ static char cfg_value[WTB_MAX_CFG][96];
 static int ncfg;
 static bool net_ok;
 static u64 t_start;
+static unsigned (*game_clock)(void);
 
 // Screenshots: the schedule (milliseconds since wtb_init, sorted), the queue of captured images
 static unsigned shot_ms[WTB_MAX_SHOTS];
@@ -267,11 +268,15 @@ bool wtb_send_path(const char *name, const char *path) {
     return ok;
 }
 
+void wtb_set_clock(unsigned (*ms)(void)) {
+    game_clock = ms;
+}
+
 bool wtb_shot_due(void) {
     shot_no = -1;
     if (!active || shots_taken >= WTB_MAX_SHOTS)
         return false;
-    const unsigned now = (unsigned)ticks_to_millisecs(gettime() - t_start);
+    const unsigned now = game_clock ? game_clock() : (unsigned)ticks_to_millisecs(gettime() - t_start);
     unsigned due = ~0u;
     if (next_shot < nshot_ms && shot_ms[next_shot] <= now) {
         due = shot_ms[next_shot++];
@@ -582,6 +587,7 @@ bool wtb_send_file(const char *name, const void *data, size_t len) { (void)name;
 bool wtb_send_path(const char *name, const char *path) { (void)name; (void)path; return false; }
 void wtb_done(const char *status) { (void)status; }
 bool wtb_shot_due(void) { return false; }
+void wtb_set_clock(unsigned (*ms)(void)) { (void)ms; }
 bool wtb_shot_again(void) { return false; }
 bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes) {
     (void)kind; (void)w; (void)h; (void)yuy2; (void)stride_bytes; return false;

@@ -9,6 +9,9 @@
 #include "game/memory.h"
 #include "game/print.h"
 #include "game/save_file.h"
+#ifdef TARGET_GX
+#include "pc/test_script.h"
+#endif
 #include "game/sound_init.h"
 #include "level_table.h"
 #include "seq_ids.h"
@@ -88,6 +91,20 @@ s32 run_press_start_demo_timer(s32 timer) {
 
 s16 level_select_input_loop(void) {
     s32 stageChanged = FALSE;
+#ifdef TARGET_GX
+    {
+        int act = 1;
+        const int lv = test_script_take_level(&act);
+        if (lv > 0) {
+            // test_level: straight into the level, with level select's test save file
+            gCurrLevelNum = lv;
+            gCurrSaveFileNum = 4;
+            gCurrActNum = act;
+            gDebugLevelSelect = FALSE;
+            return lv;
+        }
+    }
+#endif
 
     // perform the ID updates per each button press.
     if (gPlayer1Controller->buttonPressed & A_BUTTON) {
@@ -148,6 +165,12 @@ s16 level_select_input_loop(void) {
 
 s32 intro_default(void) {
     s32 sp1C = 0;
+#ifdef TARGET_GX
+    if (test_script_level_wanted()) {
+        gDebugLevelSelect = TRUE; // 101: on to the level select, which takes test_level
+        return 101;
+    }
+#endif
 
 #ifndef VERSION_JP
     if (D_U_801A7C34 == 1) {
