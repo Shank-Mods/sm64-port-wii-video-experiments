@@ -403,36 +403,59 @@ static const char *exc_name(unsigned exid) {
 #endif
 }
 
-// Runs in exception context: record everything (no locks, no I/O), park the thread
+// Raw crash state, filled in exception context (no printf there: it can use the FPU, which is off
+// in an exception, and take locks); the watchdog thread formats it
+static struct {
+    unsigned exid, t_ms;
+    u32 pc, lr, msr, dar, dsisr, thread;
+    u32 gpr[32];
+    u32 chain[24];
+    int nchain;
+} crash;
+
 static u32 record_crash(unsigned exid, u32 pc, u32 lr, u32 msr, const u32 *gpr) {
-    u32 dar, dsisr;
-    __asm__ volatile("mfspr %0, 19" : "=r"(dar));
-    __asm__ volatile("mfspr %0, 18" : "=r"(dsisr));
-    char *b = crash_text;
-    const size_t z = sizeof(crash_text);
-    int p = append(b, z, 0, "crash: %s (exception %u) at %u.%03u s, thread %p\n", exc_name(exid), exid,
-                   now_ms() / 1000, now_ms() % 1000, (void *)LWP_GetSelf());
-    p = append(b, z, p, "pc %08X lr %08X sp %08X msr %08X dar %08X dsisr %08X\n", (unsigned)pc, (unsigned)lr,
-               (unsigned)gpr[1], (unsigned)msr, (unsigned)dar, (unsigned)dsisr);
-    for (int i = 0; i < 32; i += 4)
-        p = append(b, z, p, "r%-2d %08X  r%-2d %08X  r%-2d %08X  r%-2d %08X\n", i, (unsigned)gpr[i], i + 1,
-                   (unsigned)gpr[i + 1], i + 2, (unsigned)gpr[i + 2], i + 3, (unsigned)gpr[i + 3]);
-    // Call chain: pc, lr, then the saved LR of each frame up the back chain
-    p = append(b, z, p, "stack: %08X %08X", (unsigned)pc, (unsigned)lr);
+    __asm__ volatile("mfspr %0, 19" : "=r"(crash.dar));
+    __asm__ volatile("mfspr %0, 18" : "=r"(crash.dsisr));
+    crash.exid = exid;
+    crash.t_ms = now_ms();
+    crash.pc = pc;
+    crash.lr = lr;
+    crash.msr = msr;
+    crash.thread = (u32)LWP_GetSelf();
+    for (int i = 0; i < 32; i++)
+        crash.gpr[i] = gpr[i];
+    // Call chain: the saved LR of each frame up the back chain
     u32 sp = gpr[1];
+    crash.nchain = 0;
     for (int i = 0; i < 24 && code_addr(sp) && (sp & 3) == 0; i++) {
         const u32 next = *(volatile u32 *)sp;
         if (!code_addr(next) || next <= sp)
             break;
         const u32 saved_lr = *(volatile u32 *)(next + 4);
         if (code_addr(saved_lr))
-            p = append(b, z, p, " %08X", (unsigned)saved_lr);
+            crash.chain[crash.nchain++] = saved_lr;
         sp = next;
     }
-    p = append(b, z, p, "\n");
-    append_marks(b, z, p);
     crashed = 1;
     return (u32)(uintptr_t)parked;
+}
+
+static void format_crash(void) {
+    char *b = crash_text;
+    const size_t z = sizeof(crash_text);
+    int p = append(b, z, 0, "crash: %s (exception %u) at %u.%03u s, thread %08X\n", exc_name(crash.exid),
+                   crash.exid, crash.t_ms / 1000, crash.t_ms % 1000, (unsigned)crash.thread);
+    p = append(b, z, p, "pc %08X lr %08X sp %08X msr %08X dar %08X dsisr %08X\n", (unsigned)crash.pc,
+               (unsigned)crash.lr, (unsigned)crash.gpr[1], (unsigned)crash.msr, (unsigned)crash.dar,
+               (unsigned)crash.dsisr);
+    for (int i = 0; i < 32; i += 4)
+        p = append(b, z, p, "r%-2d %08X  r%-2d %08X  r%-2d %08X  r%-2d %08X\n", i, (unsigned)crash.gpr[i], i + 1,
+                   (unsigned)crash.gpr[i + 1], i + 2, (unsigned)crash.gpr[i + 2], i + 3, (unsigned)crash.gpr[i + 3]);
+    p = append(b, z, p, "stack: %08X %08X", (unsigned)crash.pc, (unsigned)crash.lr);
+    for (int i = 0; i < crash.nchain; i++)
+        p = append(b, z, p, " %08X", (unsigned)crash.chain[i]);
+    p = append(b, z, p, "\n");
+    append_marks(b, z, p);
 }
 
 #if _V_MAJOR_ >= 3
@@ -481,6 +504,7 @@ static void *watchdog(void *arg) {
     for (;;) {
         usleep(250 * 1000);
         if (crashed) {
+            format_crash();
             char status[160];
             const char *nl = strchr(crash_text, '\n');
             snprintf(status, sizeof(status), "%.*s", nl ? (int)(nl - crash_text) : 100, crash_text);

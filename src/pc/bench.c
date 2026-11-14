@@ -492,6 +492,7 @@ static void demo_start(void) {
         pass_nft = 0;
         memset(pass_demo, 0, sizeof(pass_demo));
     }
+    wtb_mark("pass %d demo %d", pass_no, pass_ndemo + 1);
     if (pass_ndemo < MAX_DEMOS) {
         cur_demo = &pass_demo[pass_ndemo++];
         cur_demo->ft_first = pass_nft;
