@@ -62,6 +62,10 @@ void wtb_shots_send(void);
 // returns to the Homebrew Channel, so the next run can start without anyone touching the Wii.
 // cfg=wtb_test=crash@T|dsi@T|hang@T makes the game crash or freeze T seconds in (to test this).
 void wtb_alive(void);
+// Streams a debug log line to the runner (game_log.txt there), batched about once a second by
+// the watchdog thread and before any report, so a run that dies still leaves its log. Lines
+// beyond 16 KB a second are dropped (counted). Any thread.
+void wtb_stream(const char *line);
 // A short note of what the game is doing (scene, phase); the last 8 go into crash/hang reports
 void wtb_mark(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 

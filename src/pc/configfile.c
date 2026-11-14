@@ -19,6 +19,7 @@
 
 #include "configfile.h"
 #include "test_script.h"
+#include "wtb.h"
 #include "early_console.h"
 #include <unistd.h>
 #include <stdarg.h>
@@ -70,6 +71,7 @@ void dbglog(const char *fmt, ...)
     vsnprintf(line, sizeof(line), fmt, ap);
     va_end(ap);
     early_console_line(line);
+    wtb_stream(line);
 
     for (unsigned int i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
         FILE *f = fopen(paths[i], header_done ? "a" : "w");
