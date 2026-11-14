@@ -177,11 +177,15 @@ unsigned test_script_ms(void) {
     return test_script_ticks() * 1000u / 30u;
 }
 
+extern signed char gDebugLevelSelect;
+
 void test_script_apply(unsigned short *button, signed char *stick_x, signed char *stick_y) {
     if (!any)
         return;
     if (!test_script_started())
         return;
+    if (ticks == 0 && test_level > 0)
+        gDebugLevelSelect = 0; // normal play from here (damage, deaths), as without the level select
     for (int i = 0; i < nevents; i++) {
         const struct Event *e = &events[i];
         if (ticks < e->start || ticks >= e->end)

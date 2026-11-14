@@ -100,7 +100,8 @@ s16 level_select_input_loop(void) {
             gCurrLevelNum = lv;
             gCurrSaveFileNum = 4;
             gCurrActNum = act;
-            gDebugLevelSelect = FALSE;
+            // gDebugLevelSelect stays on until the level has loaded (as the level select has it):
+            // that skips the star select and the new-save opening; the script's first tick clears it
             return lv;
         }
     }
