@@ -31,6 +31,7 @@ static unsigned shot_ms[WTB_MAX_SHOTS];
 static int nshot_ms, next_shot;
 static unsigned shot_every_ms;
 static int shot_no = -1;      // the shot being captured (wtb_shot_due returned true for it)
+static int last_shot = -1;
 static unsigned shot_t_ms;    // its time
 struct Shot { char name[64]; char *data; size_t len; };
 static struct Shot shots[WTB_MAX_SHOTS * 2];
@@ -248,8 +249,15 @@ bool wtb_shot_due(void) {
     } else {
         return false;
     }
-    shot_no = shots_taken++;
+    shot_no = last_shot = shots_taken++;
     shot_t_ms = due;
+    return true;
+}
+
+bool wtb_shot_again(void) {
+    if (!active || last_shot < 0)
+        return false;
+    shot_no = last_shot;
     return true;
 }
 
@@ -318,6 +326,7 @@ bool wtb_send_file(const char *name, const void *data, size_t len) { (void)name;
 bool wtb_send_path(const char *name, const char *path) { (void)name; (void)path; return false; }
 void wtb_done(const char *status) { (void)status; }
 bool wtb_shot_due(void) { return false; }
+bool wtb_shot_again(void) { return false; }
 bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes) {
     (void)kind; (void)w; (void)h; (void)yuy2; (void)stride_bytes; return false;
 }

@@ -1256,13 +1256,26 @@ static void shot_add(const char *kind, void *xfb)
     wtb_shot_add(kind, w, h, cached, w * 2);
 }
 
-static void shot_capture(void *single)
+// Field rendering with one field per image: a shot also takes the opposite field from the next
+// image, so the two make the interlaced frame the TV shows
+static int shot_partner = -1; // parity still wanted for the last shot, or -1
+
+static void shot_capture(void *single, int only_parity)
 {
     GX_DrawDone();
     if (field_mode) {
-        for (int k = 0; k < 2; k++)
-            if (fm_draw[k] >= 0)
-                shot_add(((fm_next_par + k) & 1) == 0 ? "top" : "bottom", framebuffer[fm_draw[k]]);
+        int got = 0, par = 0;
+        for (int k = 0; k < 2; k++) {
+            if (fm_draw[k] < 0)
+                continue;
+            const int p = (fm_next_par + k) & 1;
+            if (only_parity >= 0 && p != only_parity)
+                continue;
+            shot_add(p == 0 ? "top" : "bottom", framebuffer[fm_draw[k]]);
+            got++;
+            par = p;
+        }
+        shot_partner = only_parity < 0 && got == 1 ? par ^ 1 : -1;
     } else {
         shot_add("frame", single);
     }
@@ -1283,8 +1296,12 @@ static void gfx_gx_wm_swap_buffers_begin(void)
                draw_idx, shown_idx, pending_idx, VI[0x02 / 2], VI[0x1C / 2], VI[0x1E / 2]);
     if (frames == 120 && tiled_active)
         dbg_vi_regs("frame120");
-    if (triple && (field_mode ? fm_draw[0] >= 0 || fm_draw[1] >= 0 : draw_idx >= 0) && wtb_shot_due())
-        shot_capture(draw_idx >= 0 ? framebuffer[draw_idx] : NULL);
+    if (triple && (field_mode ? fm_draw[0] >= 0 || fm_draw[1] >= 0 : draw_idx >= 0)) {
+        if (field_mode && shot_partner >= 0 && wtb_shot_again())
+            shot_capture(NULL, shot_partner);
+        else if (wtb_shot_due())
+            shot_capture(draw_idx >= 0 ? framebuffer[draw_idx] : NULL, -1);
+    }
 
     if (triple && field_mode && hd->bob) {
         // Bob crop: fields shown in order, one per frame. At vsync, wait for room in the
@@ -1372,7 +1389,7 @@ static void gfx_gx_wm_swap_buffers_begin(void)
         GX_Flush();
     }
     if (wtb_shot_due())
-        shot_capture(framebuffer[fb]);
+        shot_capture(framebuffer[fb], -1);
 
     VIDEO_SetNextFramebuffer(framebuffer[fb]);
     VIDEO_Flush();

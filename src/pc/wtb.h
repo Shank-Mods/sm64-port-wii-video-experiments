@@ -44,6 +44,8 @@ void wtb_done(const char *status);
 // wtb_shots_send (call it before wtb_done), so sending doesn't disturb the run's timing.
 #define WTB_MAX_SHOTS 32
 bool wtb_shot_due(void);
+// Adds to the last shot again (its other field, from the next image): true if there was one
+bool wtb_shot_again(void);
 // kind: "frame" (a whole image), or "top" / "bottom" (one field of an interlaced image; the
 // runner weaves a top and a bottom added for the same shot into one frame)
 bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes);
