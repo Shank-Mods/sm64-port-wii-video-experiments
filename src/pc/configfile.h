@@ -56,6 +56,7 @@ extern unsigned int configVideoAspect;
 extern bool         configInterlaceField; // interlaced modes: render each field on its own
 extern float        configVideoMaxPclk;   // MHz: the custom timing generator stays below this
 float configfile_video_dar(unsigned int w, unsigned int h); // display aspect of a w x h mode
+void configfile_set(const char *name, const char *value);   // one option, as a config file line would set it
 
 extern bool         configFullscreen;
 extern bool         config60Fps;
@@ -79,6 +80,7 @@ extern bool         configN64Controller; // N64 controllers on the GameCube port
 #define CROP_IL_960I 1u // 640x960i at the 480p line rate
 #define CROP_IL_BOB  2u // 480p showing one field of the interlaced frame per frame (bobs)
 extern unsigned int configCropInterlaced;
+extern unsigned int configBenchPasses;   // demo mode: passes before exiting (0: run on)
 extern bool         configCropKeepTiles; // crop_tiles keep: hidden tiles copied to their own MEM2 slots
 extern bool         configBenchRender;
 extern unsigned int configDebugFrameDelayMs;

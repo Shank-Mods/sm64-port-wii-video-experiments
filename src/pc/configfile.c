@@ -136,6 +136,7 @@ static unsigned int cfgAspectW = 16, cfgAspectH = 10; // as written, for saving
 bool configInterlaceField        = true;  // interlaced modes: field rendering (false: whole frames)
 float configVideoMaxPclk         = 125.0f; // MHz (124.2 is the fastest proven on hardware)
 unsigned int configCropInterlaced = CROP_IL_BOB; // crop of an interlaced mode: bob 480p / 960i / plain 480p
+unsigned int configBenchPasses   = 0;     // demo mode: exit (and report to the test bench) after this many passes (0: run on)
 bool configCropKeepTiles          = false; // crop_tiles keep: every hidden tile copied to its own MEM2 slot
 bool configCrop480               = false; // render at video_mode's size, output the top left 640x480 as normal 480p
 bool configOptPsVertex           = true;
@@ -237,6 +238,7 @@ static const struct ConfigOption options[] = {
     {.name = "interlace_render", .type = CONFIG_TYPE_FIELDMODE, .boolValue = &configInterlaceField},
     {.name = "video_max_pclk", .type = CONFIG_TYPE_FLOAT, .floatValue = &configVideoMaxPclk},
     {.name = "crop_480p",      .type = CONFIG_TYPE_BOOL, .boolValue = &configCrop480},
+    {.name = "bench_passes",   .type = CONFIG_TYPE_UINT, .uintValue = &configBenchPasses},
     {.name = "crop_tiles",     .type = CONFIG_TYPE_CROPTILES, .boolValue = &configCropKeepTiles},
     {.name = "crop_interlaced", .type = CONFIG_TYPE_CROPIL, .uintValue = &configCropInterlaced},
     {.name = "opt_ps_vertex",  .type = CONFIG_TYPE_BOOL, .boolValue = &configOptPsVertex},
@@ -507,65 +509,8 @@ float configfile_video_dar(unsigned int w, unsigned int h) {
     }
 }
 
-void configfile_load(const char *filename) {
-    const char *path = filename;
-#ifdef __wii__
-    fat_init_once();
-    dbglog("config: fat ready");
-    // ALways prefer SD
-    configStorageDevice = STORAGE_DEVICE_SD;
-    char probe[64];
-    build_storage_path(probe, sizeof(probe), STORAGE_DEVICE_SD, filename);
-    FILE *probeFile = fopen(probe, "r");
-    dbglog("config: sd probe %s", probeFile ? "found" : "none");
-    if (probeFile != NULL) {
-        fclose(probeFile);
-    } else {
-        build_storage_path(probe, sizeof(probe), STORAGE_DEVICE_USB, filename);
-        probeFile = fopen(probe, "r");
-        dbglog("config: usb probe %s", probeFile ? "found" : "none");
-        if (probeFile != NULL) {
-            fclose(probeFile);
-            configStorageDevice = STORAGE_DEVICE_USB;
-        } else if (!storage_device_mounted(STORAGE_DEVICE_SD)
-                   && storage_device_mounted(STORAGE_DEVICE_USB)) {
-            // No SD card: keep the config and save on the USB drive
-            configStorageDevice = STORAGE_DEVICE_USB;
-        }
-    }
-    dbglog("config: mounted sd=%d usb=%d", storage_device_mounted(STORAGE_DEVICE_SD),
-           storage_device_mounted(STORAGE_DEVICE_USB));
-    path = get_storage_path(filename);
-    dbglog("config: path %s", path);
-#elif defined(TARGET_GX)
-    fat_init_once();
-#endif
-    FILE *file;
-    char *line;
-
-    printf("Loading configuration from '%s'\n", path);
-
-    file = fopen(path, "r");
-    if (file == NULL) {
-        // Create a new config file and save defaults
-        printf("Config file '%s' not found. Creating it.\n", path);
-        dbglog("config: not found, saving defaults");
-        configfile_save(filename);
-        dbglog("config: defaults saved");
-        return;
-    }
-
-    // Go through each line in the file
-    while ((line = read_file_line(file)) != NULL) {
-        char *p = line;
-        char *tokens[2];
-        int numTokens;
-
-        while (isspace(*p))
-            p++;
-        numTokens = tokenize_string(p, 2, tokens);
-        if (numTokens != 0) {
-            if (numTokens == 2) {
+// Applies one "name value" option (both modifiable: "benchmark" is renamed in place)
+static void config_apply(char **tokens) {
                 const struct ConfigOption *option = NULL;
 
                 // "benchmark" was the name of bench_demo on the wii-benchmark branch
@@ -695,6 +640,78 @@ void configfile_load(const char *filename) {
                     }
                     printf("option: '%s', value: '%s'\n", tokens[0], tokens[1]);
                 }
+}
+
+// Sets one option as a config file line would ("video_mode", "1280x720p120"); used for the
+// test bench's command line overrides
+void configfile_set(const char *name, const char *value) {
+    char n[64], v[96];
+    snprintf(n, sizeof(n), "%s", name);
+    snprintf(v, sizeof(v), "%s", value);
+    char *tokens[2] = { n, v };
+    config_apply(tokens);
+}
+
+void configfile_load(const char *filename) {
+    const char *path = filename;
+#ifdef __wii__
+    fat_init_once();
+    dbglog("config: fat ready");
+    // ALways prefer SD
+    configStorageDevice = STORAGE_DEVICE_SD;
+    char probe[64];
+    build_storage_path(probe, sizeof(probe), STORAGE_DEVICE_SD, filename);
+    FILE *probeFile = fopen(probe, "r");
+    dbglog("config: sd probe %s", probeFile ? "found" : "none");
+    if (probeFile != NULL) {
+        fclose(probeFile);
+    } else {
+        build_storage_path(probe, sizeof(probe), STORAGE_DEVICE_USB, filename);
+        probeFile = fopen(probe, "r");
+        dbglog("config: usb probe %s", probeFile ? "found" : "none");
+        if (probeFile != NULL) {
+            fclose(probeFile);
+            configStorageDevice = STORAGE_DEVICE_USB;
+        } else if (!storage_device_mounted(STORAGE_DEVICE_SD)
+                   && storage_device_mounted(STORAGE_DEVICE_USB)) {
+            // No SD card: keep the config and save on the USB drive
+            configStorageDevice = STORAGE_DEVICE_USB;
+        }
+    }
+    dbglog("config: mounted sd=%d usb=%d", storage_device_mounted(STORAGE_DEVICE_SD),
+           storage_device_mounted(STORAGE_DEVICE_USB));
+    path = get_storage_path(filename);
+    dbglog("config: path %s", path);
+#elif defined(TARGET_GX)
+    fat_init_once();
+#endif
+    FILE *file;
+    char *line;
+
+    printf("Loading configuration from '%s'\n", path);
+
+    file = fopen(path, "r");
+    if (file == NULL) {
+        // Create a new config file and save defaults
+        printf("Config file '%s' not found. Creating it.\n", path);
+        dbglog("config: not found, saving defaults");
+        configfile_save(filename);
+        dbglog("config: defaults saved");
+        return;
+    }
+
+    // Go through each line in the file
+    while ((line = read_file_line(file)) != NULL) {
+        char *p = line;
+        char *tokens[2];
+        int numTokens;
+
+        while (isspace(*p))
+            p++;
+        numTokens = tokenize_string(p, 2, tokens);
+        if (numTokens != 0) {
+            if (numTokens == 2) {
+                config_apply(tokens);
             } else
                 puts("error: expected value");
         }

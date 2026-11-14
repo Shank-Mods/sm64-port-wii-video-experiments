@@ -19,6 +19,7 @@
 #include "gfx/gfx_sdl.h"
 #include "gfx/gfx_dummy.h"
 #ifdef TARGET_GX
+#include "wtb.h"
 #include "gfx/gfx_gx_wm.h"
 #include "gfx/gfx_gx.h"
 #include "gx_shutdown.h"
@@ -326,7 +327,14 @@ static void on_anim_frame(double time) {
 }
 #endif
 
+static int main_argc;
+static char **main_argv;
+
 static void save_config(void) {
+#ifdef TARGET_GX
+    if (wtb_active())
+        return; // a test bench run's overrides must not end up in the user's config
+#endif
     configfile_save(CONFIG_FILE);
 }
 
@@ -346,6 +354,18 @@ void main_func(void) {
 
     dbglog("main_func start (build " __DATE__ " " __TIME__ ")");
     configfile_load(CONFIG_FILE);
+#ifdef TARGET_GX
+    // Test bench run (wiiload arguments, or apps/sm64/wtb.txt): network up, HELLO sent, and
+    // this run's config overrides applied on top of the config file
+    if (wtb_init(main_argc, main_argv, "sd:/apps/sm64/wtb.txt", "sm64", __DATE__ " " __TIME__)) {
+        for (int i = 0; i < wtb_cfg_count(); i++) {
+            configfile_set(wtb_cfg_name(i), wtb_cfg_value(i));
+            dbglog("wtb: %s %s", wtb_cfg_name(i), wtb_cfg_value(i));
+        }
+        if (configBenchPasses == 0)
+            configBenchPasses = 2; // one overlapped and one split pass, then report and exit
+    }
+#endif
 #ifdef HIRES_FORCE
     configHires1280 = HIRES_FORCE;
 #endif
@@ -459,7 +479,9 @@ int WINAPI WinMain(UNUSED HINSTANCE hInstance, UNUSED HINSTANCE hPrevInstance, U
     return 0;
 }
 #else
-int main(UNUSED int argc, UNUSED char *argv[]) {
+int main(int argc, char *argv[]) {
+    main_argc = argc;
+    main_argv = argv;
 #ifdef TARGET_GX
     early_console_init(); // diagnostic builds only
     early_console_line("main() reached");

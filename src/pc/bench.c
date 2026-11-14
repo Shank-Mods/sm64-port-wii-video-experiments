@@ -19,6 +19,7 @@
 
 #include "bench.h"
 #include "configfile.h"
+#include "wtb.h"
 
 bool gBenchOn;
 uint32_t gBenchMark;
@@ -327,6 +328,41 @@ static void sorted_order(const double *v, int n, int *order) {
     }
 }
 
+// This run's reports (appended to the results file, which also holds earlier runs')
+static char *report_buf;
+static size_t report_len;
+
+static void report_keep(const char *path, long start) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL)
+        return;
+    fseek(f, 0, SEEK_END);
+    const long end = ftell(f);
+    if (end > start) {
+        char *nb = realloc(report_buf, report_len + (size_t)(end - start));
+        if (nb != NULL) {
+            report_buf = nb;
+            fseek(f, start, SEEK_SET);
+            report_len += fread(report_buf + report_len, 1, (size_t)(end - start), f);
+        }
+    }
+    fclose(f);
+}
+
+// bench_passes: after the last pass, report to the test bench (if one asked for this run)
+// and exit to the loader
+static void passes_done_check(void) {
+    if (configBenchPasses == 0 || pass_no < (int)configBenchPasses)
+        return;
+    dbglog("bench: %d passes done, exiting", pass_no);
+    if (wtb_active()) {
+        wtb_send_file("sm64_bench.txt", report_buf, report_len);
+        wtb_send_path("sm64_debug.txt", "sd:/sm64_debug.txt");
+        wtb_done(report_len > 0 ? "ok" : "no results file (SD card?)");
+    }
+    exit(0);
+}
+
 static void finish_pass(void) {
     pass_running = false;
     measure_cpu_clock(); // ~50 ms; only ever done between passes so no measured frame pays for it
@@ -368,8 +404,11 @@ static void finish_pass(void) {
     FILE *f = fopen(path, "a");
     if (f == NULL) {
         snprintf(result_note, sizeof(result_note), "could not write results file");
+        passes_done_check();
         return;
     }
+    fseek(f, 0, SEEK_END);
+    const long report_start = ftell(f); // this pass's report is kept for the test bench
 
     fprintf(f, "\n=== SM64 Wii benchmark, pass %d (%s) ===\n", pass_no,
             pass_split ? "split: GPU runs after CPU" : "overlapped: normal pipelining");
@@ -437,6 +476,9 @@ static void finish_pass(void) {
             fps, low);
     fclose(f);
     snprintf(result_note, sizeof(result_note), "saved to %s", path);
+    report_keep(path, report_start);
+    wtb_log("pass %d %s: %.2f avg fps, %.2f 1%% low", pass_no, pass_split ? "split" : "overlapped", fps, low);
+    passes_done_check();
 }
 
 static void demo_start(void) {
