@@ -14,6 +14,7 @@
 #include <ogc/lwp_watchdog.h>
 #include <ogc/lwp.h>
 #include <ogc/irq.h>
+#include <ogc/system.h>
 #include <ogc/libversion.h>
 #if _V_MAJOR_ >= 3
 #include <tuxedo/ppc/exception.h>
@@ -65,6 +66,24 @@ const char *wtb_cfg_value(int i) {
     return (i >= 0 && i < ncfg) ? cfg_value[i] : "";
 }
 
+// Profiler, frame log, memory (see wtb.h)
+#define PROF_SLOTS 16384
+static u32 prof_pc[PROF_SLOTS];
+static u32 prof_cnt[PROF_SLOTS];
+static volatile u32 prof_total, prof_lost;
+static u32 prof_period;
+static unsigned prof_hz = 2000;
+static volatile int prof_state;      // 0 off, 1 waiting for T0, 2 sampling, 3 done
+static unsigned prof_t0, prof_t1 = ~0u;
+#define FRAMES_MAX 32768
+struct FrameRec { u32 t_us, retrace; };
+static struct FrameRec *fr_end, *fr_show;
+static volatile u32 fr_nend, fr_nshow;
+static int fr_state;                 // 0 off, 1 waiting, 2 logging, 3 done
+static unsigned fr_t0, fr_t1 = ~0u;
+static size_t mem_peak, mem_now, mem_arena;
+static u32 alive_calls;
+
 // Crash / freeze watchdog state
 static unsigned hang_s = 20;
 static int test_kind;            // wtb_test: 1 trap, 2 null write (DSI), 3 freeze
@@ -84,6 +103,18 @@ static volatile size_t stream_len;
 static volatile unsigned stream_dropped;
 
 static void start_watchdog(void);
+
+// "on" (the whole run) or "T0-T1" in seconds
+static void parse_window(const char *v, unsigned *t0, unsigned *t1) {
+    *t0 = 0;
+    *t1 = ~0u;
+    if (strncmp(v, "on", 2) == 0 || strncmp(v, "true", 4) == 0)
+        return;
+    const char *dash = strchr(v, '-');
+    *t0 = (unsigned)(atof(v) * 1000.0);
+    if (dash != NULL)
+        *t1 = (unsigned)(atof(dash + 1) * 1000.0);
+}
 
 static int cmp_uint(const void *a, const void *b) {
     unsigned x = *(const unsigned *)a, y = *(const unsigned *)b;
@@ -137,6 +168,19 @@ static void parse_item(const char *s) {
         }
         if ((size_t)(sep - n) == 10 && strncmp(n, "wtb_hang_s", 10) == 0) {
             hang_s = (unsigned)atoi(sep + 1);
+            return;
+        }
+        if ((size_t)(sep - n) == 8 && strncmp(n, "wtb_prof", 8) == 0) {
+            parse_window(sep + 1, &prof_t0, &prof_t1);
+            const char *sp = strchr(sep + 1, ' ');
+            if (sp != NULL && atoi(sp + 1) >= 50 && atoi(sp + 1) <= 20000)
+                prof_hz = (unsigned)atoi(sp + 1);
+            prof_state = 1;
+            return;
+        }
+        if ((size_t)(sep - n) == 10 && strncmp(n, "wtb_frames", 10) == 0) {
+            parse_window(sep + 1, &fr_t0, &fr_t1);
+            fr_state = 1;
             return;
         }
         if ((size_t)(sep - n) == 8 && strncmp(n, "wtb_test", 8) == 0) {
@@ -352,6 +396,155 @@ static unsigned now_ms(void) {
     return (unsigned)ticks_to_millisecs(gettime() - t_start);
 }
 
+static unsigned clock_ms(void) {
+    return game_clock ? game_clock() : now_ms();
+}
+
+// ---- profiler: the performance monitor interrupts every prof_period CPU cycles ---------------
+// MMCR0 (SPR 952): ENINT (enable the interrupt), PMC1INTCONTROL (PMC1 going negative signals
+// it), PMC1SELECT = 1 (count processor cycles). The CPU clears ENINT when it signals, so each
+// sample re-arms. PMC1 (SPR 953) counts up from 0x80000000 - period.
+#define MMCR0_SAMPLE 0x04008040u
+#define MMCR0_FREEZE 0x80000000u
+
+static void prof_arm(void) {
+    const u32 start = 0x80000000u - prof_period;
+    const u32 mmcr0 = MMCR0_SAMPLE;
+    __asm__ volatile("mtspr 953, %0" : : "r"(start));
+    __asm__ volatile("mtspr 952, %0" : : "r"(mmcr0));
+}
+
+static void prof_stop(void) {
+    const u32 mmcr0 = MMCR0_FREEZE;
+    __asm__ volatile("mtspr 952, %0" : : "r"(mmcr0));
+}
+
+// Exception context: count the sample, re-arm (no calls into anything that locks)
+static void prof_sample(u32 pc) {
+    if (prof_state != 2) {
+        prof_stop();
+        return;
+    }
+    prof_total++;
+    u32 h = ((pc >> 2) * 2654435761u) >> (32 - 14);
+    for (int i = 0; i < 32; i++, h = (h + 1) & (PROF_SLOTS - 1)) {
+        if (prof_pc[h] == pc) {
+            prof_cnt[h]++;
+            break;
+        }
+        if (prof_pc[h] == 0) {
+            prof_pc[h] = pc;
+            prof_cnt[h] = 1;
+            break;
+        }
+        if (i == 31)
+            prof_lost++;
+    }
+    prof_arm();
+}
+
+static void prof_send(void) {
+    if (prof_state == 0)
+        return;
+    prof_stop();
+    const int was = prof_state;
+    prof_state = 3;
+    size_t cap = 64 + (size_t)PROF_SLOTS * 20, len = 0;
+    char *t = malloc(cap);
+    if (t == NULL)
+        return;
+    len += (size_t)snprintf(t, cap, "WTBPROF1 hz %u samples %u lost %u%s\n", prof_hz, (unsigned)prof_total,
+                            (unsigned)prof_lost, was == 1 ? " (window never started)" : "");
+    for (int i = 0; i < PROF_SLOTS && len + 24 < cap; i++)
+        if (prof_pc[i] != 0)
+            len += (size_t)snprintf(t + len, cap - len, "%08X %u\n", (unsigned)prof_pc[i], (unsigned)prof_cnt[i]);
+    wtb_send_file("prof.txt", t, len);
+    free(t);
+}
+
+// ---- frame log ------------------------------------------------------------------------------
+static u32 now_us(void) {
+    return (u32)ticks_to_microsecs(gettime() - t_start);
+}
+
+void wtb_frame_shown(unsigned retrace) {
+    if (fr_state != 2 || fr_show == NULL || fr_nshow >= FRAMES_MAX)
+        return;
+    fr_show[fr_nshow].t_us = now_us();
+    fr_show[fr_nshow].retrace = retrace;
+    fr_nshow++;
+}
+
+static void frames_send(void) {
+    if (fr_state == 0)
+        return;
+    fr_state = 3;
+    if (fr_end == NULL)
+        return;
+    char header[96];
+    const int hl = snprintf(header, sizeof(header), "WTBFRAMES1 %u %u\n", (unsigned)fr_nend, (unsigned)fr_nshow);
+    const size_t len = (size_t)hl + (fr_nend + fr_nshow) * sizeof(struct FrameRec);
+    char *b = malloc(len);
+    if (b == NULL)
+        return;
+    memcpy(b, header, (size_t)hl);
+    memcpy(b + hl, fr_end, fr_nend * sizeof(struct FrameRec));
+    memcpy(b + hl + fr_nend * sizeof(struct FrameRec), fr_show, fr_nshow * sizeof(struct FrameRec));
+    wtb_send_file("frames.bin", b, len); // big-endian u32 pairs: finished (t_us, frame no), shown (t_us, retrace)
+    free(b);
+}
+
+// ---- memory ---------------------------------------------------------------------------------
+static void mem_sample(void) {
+    struct mallinfo mi = mallinfo();
+    mem_now = (size_t)mi.uordblks;
+    mem_arena = (size_t)mi.arena;
+    if (mem_now > mem_peak)
+        mem_peak = mem_now;
+}
+
+static void mem_send(void) {
+    char t[512];
+    const u32 a1 = (u32)SYS_GetArena1Hi() - (u32)SYS_GetArena1Lo();
+    const u32 a2 = (u32)SYS_GetArena2Hi() - (u32)SYS_GetArena2Lo();
+    const int n = snprintf(t, sizeof(t),
+                           "heap in use      %8u KB (last sample)\n"
+                           "heap peak        %8u KB (sampled every 30 frames)\n"
+                           "heap obtained    %8u KB (from sbrk)\n"
+                           "MEM1 arena free  %8u KB\n"
+                           "MEM2 arena free  %8u KB\n",
+                           (unsigned)(mem_now >> 10), (unsigned)(mem_peak >> 10), (unsigned)(mem_arena >> 10),
+                           (unsigned)(a1 >> 10), (unsigned)(a2 >> 10));
+    wtb_send_file("mem.txt", t, (size_t)n);
+}
+
+// Windows open and close on the game's own frames
+static void windows_update(void) {
+    const unsigned c = clock_ms();
+    if (prof_state == 1 && c >= prof_t0) {
+        prof_period = 729000000u / prof_hz; // Broadway clock
+        prof_state = 2;
+        wtb_mark("profiler on (%u Hz)", prof_hz);
+        prof_arm();
+    } else if (prof_state == 2 && c >= prof_t1) {
+        prof_state = 3;
+        prof_stop();
+        wtb_mark("profiler off: %u samples", (unsigned)prof_total);
+    }
+    if (fr_state == 1 && c >= fr_t0) {
+        fr_end = malloc(FRAMES_MAX * sizeof(struct FrameRec));
+        fr_show = malloc(FRAMES_MAX * sizeof(struct FrameRec));
+        if (fr_end == NULL || fr_show == NULL) {
+            wtb_log("frame log: out of memory");
+            fr_state = 3;
+        } else {
+            fr_state = 2;
+        }
+    } else if (fr_state == 2 && c >= fr_t1) {
+        fr_state = 3;
+    }
+}
+
 void wtb_mark(const char *fmt, ...) {
     if (!active)
         return;
@@ -474,6 +667,10 @@ static void format_crash(void) {
 #if _V_MAJOR_ >= 3
 static PPCExcptPanicFn prev_panic;
 static void wtb_panic(unsigned exid, PPCContext *ctx) {
+    if (exid == PPC_EXCPT_PM) {
+        prof_sample(ctx->pc);
+        return;
+    }
     if (crashed || exid == PPC_EXCPT_RESET) {
         prev_panic(exid, ctx);
         return;
@@ -490,6 +687,10 @@ static void install_crash_hook(void) {
 // -Wl,--wrap=c_default_exceptionhandler so that calls arrive here first
 void __real_c_default_exceptionhandler(frame_context *ctx);
 void __wrap_c_default_exceptionhandler(frame_context *ctx) {
+    if (active && ctx->EXCPT_Number == EX_PERF) {
+        prof_sample(ctx->SRR0);
+        return;
+    }
     if (!active || crashed || ctx->EXCPT_Number == EX_SYS_RESET) {
         __real_c_default_exceptionhandler(ctx);
         return;
@@ -599,6 +800,15 @@ void wtb_alive(void) {
     if (!active)
         return;
     alive_count++;
+    if (fr_state == 2 && fr_nend < FRAMES_MAX) {
+        fr_end[fr_nend].t_us = now_us();
+        fr_end[fr_nend].retrace = (u32)alive_count;
+        fr_nend++;
+    }
+    if (prof_state == 1 || prof_state == 2 || fr_state == 1 || fr_state == 2)
+        windows_update();
+    if (++alive_calls % 30 == 1)
+        mem_sample();
     if (test_kind && now_ms() >= test_ms) {
         const int k = test_kind;
         test_kind = 0;
@@ -616,6 +826,10 @@ void wtb_alive(void) {
 void wtb_done(const char *status) {
     if (!active)
         return;
+    prof_send();
+    frames_send();
+    mem_send();
+    wtb_shots_send();
     stream_flush();
     char line[200];
     snprintf(line, sizeof(line), "WTB/1 DONE %s %s\n", job, status);
@@ -647,6 +861,7 @@ bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_b
 void wtb_shots_send(void) {}
 void wtb_alive(void) {}
 void wtb_stream(const char *line) { (void)line; }
+void wtb_frame_shown(unsigned retrace) { (void)retrace; }
 void wtb_mark(const char *fmt, ...) { (void)fmt; }
 
 #endif

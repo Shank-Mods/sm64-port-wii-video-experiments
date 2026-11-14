@@ -472,6 +472,8 @@ static void retrace_callback(UNUSED u32 count)
         new_frame = true;
         last_flip_retrace = retrace_count;
     }
+    if (new_frame)
+        wtb_frame_shown(retrace_count);
     bench_on_retrace(new_frame);
 }
 
@@ -1395,6 +1397,7 @@ static void gfx_gx_wm_swap_buffers_begin(void)
     VIDEO_SetNextFramebuffer(framebuffer[fb]);
     VIDEO_Flush();
     VIDEO_WaitVSync();
+    wtb_frame_shown(retrace_count); // double buffering: up at this retrace
 
     // Hold each rendered frame for an extra field so the 30Hz game logic maps to a 30Hz display
     // Skipped at 60fps
