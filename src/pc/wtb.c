@@ -9,6 +9,7 @@
 #include <string.h>
 #include <malloc.h>
 #include <network.h>
+#include <unistd.h>
 #include <ogc/lwp_watchdog.h>
 
 #include "wtb.h"
@@ -78,6 +79,7 @@ static int connect_runner(void) {
         return -1;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
+    addr.sin_len = 8;          // BSD-style 8-byte sockaddr, as IOS expects
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (!inet_aton(host, &addr.sin_addr))
@@ -85,7 +87,7 @@ static int connect_runner(void) {
     s32 s = net_socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (s < 0)
         return -1;
-    if (net_connect(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (net_connect(s, (struct sockaddr *)&addr, 8) < 0) {   // IOS wants addrlen 8 (16 -> -22 on hardware)
         net_close(s);
         return -1;
     }
@@ -132,7 +134,21 @@ bool wtb_init(int argc, char **argv, const char *file_path, const char *game, co
 
     // DHCP; a few seconds
     char ip[16] = { 0 }, mask[16] = { 0 }, gw[16] = { 0 };
-    net_ok = if_config(ip, mask, gw, true, 20) >= 0;
+    // On real hardware, right after the Homebrew Channel starts us, IOS needs several seconds
+    // before the network is usable: if_config's own retries run out first (Dolphin hides this).
+    // Loop on net_init while it says -EAGAIN, then wait for DHCP to give us an address.
+    {
+        u64 t0 = gettime();
+        s32 r = -1;
+        while (ticks_to_secs(gettime() - t0) < 30 && (r = net_init()) < 0)
+            usleep(250 * 1000);
+        u32 hip = 0;
+        while (r >= 0 && (hip = net_gethostip()) == 0 && ticks_to_secs(gettime() - t0) < 40)
+            usleep(100 * 1000);
+        net_ok = r >= 0 && hip != 0;
+        if (net_ok)
+            snprintf(ip, sizeof(ip), "%u.%u.%u.%u", hip >> 24, (hip >> 16) & 255, (hip >> 8) & 255, hip & 255);
+    }
     char hello[256];
     snprintf(hello, sizeof(hello), "WTB/1 HELLO %s %s %s %s\n", job, game, net_ok ? ip : "-", build);
     send_msg(hello, NULL, 0);
