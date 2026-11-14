@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "../gfx/gfx_gx_wm.h" // gccore.h (which newer libogc's lwp_watchdog.h pulls in), with its Mtx/Vtx renamed away from the game's
 #include <ogc/si.h>
 #include <ogc/pad.h>
 #include <ogc/lwp_watchdog.h>
