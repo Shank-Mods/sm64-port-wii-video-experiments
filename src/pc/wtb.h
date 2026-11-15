@@ -33,6 +33,9 @@ void wtb_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 bool wtb_send_file(const char *name, const void *data, size_t len);
 // Sends a file from the SD card if it exists
 bool wtb_send_path(const char *name, const char *path);
+// Asks the runner for the ROM (recipes with "serve_rom"; for games that load it at run time and
+// don't have it on the Wii yet). alloc(size) provides the buffer; returns it with *len set, or NULL.
+void *wtb_fetch_rom(void *(*alloc)(size_t size), size_t *len);
 // Final report ("ok", or a short reason); the caller then exits
 void wtb_done(const char *status);
 

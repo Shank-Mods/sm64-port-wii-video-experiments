@@ -104,6 +104,32 @@ static volatile unsigned stream_dropped;
 
 static void start_watchdog(void);
 
+// The system clock the PLL is programmed for (overclocked test runs check it): Bollywood =
+// 243 MHz x (CLKF + fraction) / the firmware's stock multiplier, Vegas = 54 MHz x (CLKF+1) /
+// ((CLKR+1) x CLKO). Needs AHB access (Homebrew Channel apps with <ahb_access/>; wiiload).
+static void report_clock(void) {
+    volatile u32 *hw = (volatile u32 *)0xCD800000;
+    if (hw[0x64 / 4] != 0xFFFFFFFF) {
+        wtb_log("clock: unknown (no AHB access)");
+        return;
+    }
+    const u32 pll = hw[0x1B0 / 4], ext = hw[0x1B4 / 4], ver = hw[0x214 / 4];
+    const u32 clkr = pll & 0x3f, clkf = (pll >> 6) & 0xfff, clko = (pll >> 18) & 0x1ff;
+    u32 khz = 0;
+    if ((u8)ver >= 0x20) {
+        const u32 stock = (109u << 14) | 1492u;
+        if (clkr == 2 && clko == 8)
+            khz = (u32)((243000ull * ((clkf << 14) | ((ext >> 9) & 0x3fff)) + stock / 2) / stock);
+    } else if (clko != 0) {
+        khz = (u32)((54000ull * (clkf + 1)) / ((clkr + 1) * clko));
+    }
+    if (khz == 0)
+        wtb_log("clock: unknown PLL layout, PLLSYS %08X EXT %08X", (unsigned)pll, (unsigned)ext);
+    else
+        wtb_log("clock: %u.%03u MHz system (CPU %u MHz), %s, PLLSYS %08X EXT %08X", khz / 1000, khz % 1000,
+                (khz * 3 + 500) / 1000, (u8)ver >= 0x20 ? "Bollywood" : "Vegas", (unsigned)pll, (unsigned)ext);
+}
+
 // "on" (the whole run) or "T0-T1" in seconds
 static void parse_window(const char *v, unsigned *t0, unsigned *t1) {
     *t0 = 0;
@@ -278,6 +304,7 @@ bool wtb_init(int argc, char **argv, const char *file_path, const char *game, co
     char hello[256];
     snprintf(hello, sizeof(hello), "WTB/1 HELLO %s %s %s %s\n", job, game, net_ok ? ip : "-", build);
     send_msg(hello, NULL, 0);
+    report_clock();
     return true;
 }
 
@@ -836,6 +863,48 @@ void wtb_done(const char *status) {
     send_msg(line, NULL, 0);
 }
 
+
+// Asks the runner for the recipe's ROM (recipes with "serve_rom"): the game doesn't have it yet.
+// alloc(size) provides the buffer. Returns it with *len set, or NULL.
+void *wtb_fetch_rom(void *(*alloc)(size_t size), size_t *len) {
+    char header[256];
+    if (!active)
+        return NULL;
+    int s = connect_runner();
+    if (s < 0)
+        return NULL;
+    snprintf(header, sizeof(header), "WTB/1 GETROM %s\n", job);
+    void *buf = NULL;
+    if (send_all(s, header, strlen(header))) {
+        // reply header: "WTB/1 ROM <length>\n" or "WTB/1 NOROM\n"
+        char line[64];
+        size_t n = 0;
+        while (n < sizeof(line) - 1) {
+            s32 r = net_recv(s, line + n, 1, 0);
+            if (r <= 0 || line[n] == '\n')
+                break;
+            n++;
+        }
+        line[n] = '\0';
+        unsigned long size = 0;
+        if (sscanf(line, "WTB/1 ROM %lu", &size) == 1 && size > 0 && (buf = alloc(size)) != NULL) {
+            size_t got = 0;
+            while (got < size) {
+                s32 r = net_recv(s, (char *)buf + got, (size - got) > 65536 ? 65536 : (size - got), 0);
+                if (r <= 0)
+                    break;
+                got += (size_t)r;
+            }
+            if (got == size)
+                *len = size;
+            else
+                buf = NULL;
+        }
+    }
+    net_close(s);
+    return buf;
+}
+
 #else
 
 #include "wtb.h"
@@ -864,4 +933,5 @@ void wtb_stream(const char *line) { (void)line; }
 void wtb_frame_shown(unsigned retrace) { (void)retrace; }
 void wtb_mark(const char *fmt, ...) { (void)fmt; }
 
+void *wtb_fetch_rom(void *(*alloc)(size_t size), size_t *len) { (void)alloc; (void)len; return NULL; }
 #endif
