@@ -49,6 +49,10 @@ void wtb_done(const char *status);
 // Times screenshots by the game's own clock (milliseconds; e.g. game ticks, so a shot lands on
 // the same moment on any console speed) instead of real time since wtb_init
 void wtb_set_clock(unsigned (*ms)(void));
+// Called after a crash or freeze report is sent, just before returning to the loader (which
+// skips atexit handlers): restore anything the next program needs, e.g. a reprogrammed video
+// clock. Runs on the watchdog thread while the game's threads are stuck.
+void wtb_set_exit_hook(void (*fn)(void));
 bool wtb_shot_due(void);
 // Adds to the last shot again (its other field, from the next image): true if there was one
 bool wtb_shot_again(void);

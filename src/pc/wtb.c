@@ -89,6 +89,7 @@ static unsigned hang_s = 20;
 static int test_kind;            // wtb_test: 1 trap, 2 null write (DSI), 3 freeze
 static unsigned test_ms;
 static volatile u32 alive_count;
+static void (*exit_hook)(void); // wtb_set_exit_hook
 static volatile int crashed;     // set by the exception hook
 static char crash_text[3072];
 static char marks[8][64];
@@ -345,6 +346,10 @@ bool wtb_send_path(const char *name, const char *path) {
     free(buf);
     fclose(f);
     return ok;
+}
+
+void wtb_set_exit_hook(void (*fn)(void)) {
+    exit_hook = fn;
 }
 
 void wtb_set_clock(unsigned (*ms)(void)) {
@@ -696,6 +701,11 @@ static PPCExcptPanicFn prev_panic;
 static void wtb_panic(unsigned exid, PPCContext *ctx) {
     if (exid == PPC_EXCPT_PM) {
         prof_sample(ctx->pc);
+        // libogc 3's exception entry spills the FPU registers into the FPU owner's context, then
+        // clobbers f0 (mffs) and clears the owner (SPRG3): it expects a panic never to return.
+        // Return with FP off, so the interrupted thread's next FP instruction reloads its
+        // registers (f0 and FPSCR included) from what was just spilled.
+        ctx->msr &= ~0x2000u; // MSR[FP]
         return;
     }
     if (crashed || exid == PPC_EXCPT_RESET) {
@@ -771,6 +781,10 @@ static void send_report_and_exit(const char *file, const char *text, const char 
     wtb_send_file(file, text, strlen(text));
     wtb_shots_send();
     wtb_done(status);
+    // the game's own last step before the loader, e.g. putting the video clock back (a changed
+    // video mode would otherwise stay set in the Homebrew Channel and the runs after this one)
+    if (exit_hook != NULL)
+        exit_hook();
     // Back to the loader without running atexit handlers or flushing stdio: the stuck thread may
     // hold their locks. libogc's _exit returns to the Homebrew Channel's reload stub.
     _exit(0);
@@ -923,6 +937,7 @@ bool wtb_send_path(const char *name, const char *path) { (void)name; (void)path;
 void wtb_done(const char *status) { (void)status; }
 bool wtb_shot_due(void) { return false; }
 void wtb_set_clock(unsigned (*ms)(void)) { (void)ms; }
+void wtb_set_exit_hook(void (*fn)(void)) { (void)fn; }
 bool wtb_shot_again(void) { return false; }
 bool wtb_shot_add(const char *kind, int w, int h, const void *yuy2, int stride_bytes) {
     (void)kind; (void)w; (void)h; (void)yuy2; (void)stride_bytes; return false;
