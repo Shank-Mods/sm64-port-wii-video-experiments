@@ -105,30 +105,33 @@ static volatile unsigned stream_dropped;
 
 static void start_watchdog(void);
 
-// The system clock the PLL is programmed for (overclocked test runs check it): Bollywood =
-// 243 MHz x (CLKF + fraction) / the firmware's stock multiplier, Vegas = 54 MHz x (CLKF+1) /
-// ((CLKR+1) x CLKO). Needs AHB access (Homebrew Channel apps with <ahb_access/>; wiiload).
+// The system clock the PLL is programmed for (overclocked test runs check it), decoded as
+// OCedit does (oc/common/oc_config.h: oc_sys_avg_khz): VCO = 27 MHz x multiplier / (CLKR+1),
+// clock = 2 x VCO / CLKO; Bollywood's multiplier is CLKF + fraction/16384, and while its
+// spread spectrum is on (power-on) the average runs 17876/16384 of a CLKF unit below. Vegas:
+// CLKF + 1. Needs AHB access (Homebrew Channel apps with <ahb_access/>; wiiload).
 static void report_clock(void) {
     volatile u32 *hw = (volatile u32 *)0xCD800000;
-    if (hw[0x64 / 4] != 0xFFFFFFFF) {
+    if ((hw[0x64 / 4] & 0x80000000u) == 0) {
         wtb_log("clock: unknown (no AHB access)");
         return;
     }
-    const u32 pll = hw[0x1B0 / 4], ext = hw[0x1B4 / 4], ver = hw[0x214 / 4];
-    const u32 clkr = pll & 0x3f, clkf = (pll >> 6) & 0xfff, clko = (pll >> 18) & 0x1ff;
-    u32 khz = 0;
-    if ((u8)ver >= 0x20) {
-        const u32 stock = (109u << 14) | 1492u;
-        if (clkr == 2 && clko == 8)
-            khz = (u32)((243000ull * ((clkf << 14) | ((ext >> 9) & 0x3fff)) + stock / 2) / stock);
-    } else if (clko != 0) {
-        khz = (u32)((54000ull * (clkf + 1)) / ((clkr + 1) * clko));
-    }
-    if (khz == 0)
-        wtb_log("clock: unknown PLL layout, PLLSYS %08X EXT %08X", (unsigned)pll, (unsigned)ext);
+    const u32 chip = hw[0x214 / 4], pll = hw[0x1B0 / 4], ext = hw[0x1B4 / 4];
+    const bool bolly = (chip & 0xFF) >= 0x20;
+    const u32 sysext1 = bolly ? hw[0x1A0 / 4] : 0;
+    const u32 clkr = pll & 0x3F, clkf = (pll >> 6) & 0xFFF, clko = (pll >> 18) & 0x1FF;
+    u32 m = bolly ? (clkf << 14) | ((ext >> 9) & 0x3FFF) : (clkf + 1) << 14;
+    const bool ssc = bolly && (sysext1 & (1u << 26));
+    if (ssc && m > 17876u)
+        m -= 17876u;
+    const u32 vco = (27000u * (m >> 14) + (27000u * (m & 0x3FFF)) / 16384u) / (clkr + 1);
+    const u32 khz = clko ? 2u * vco / clko : 0;
+    if (chip == 0 || khz < 162000 || khz > 400000)
+        wtb_log("clock: unknown (PLL %08X EXT %08X chip %08X)", (unsigned)pll, (unsigned)ext, (unsigned)chip);
     else
-        wtb_log("clock: %u.%03u MHz system (CPU %u MHz), %s, PLLSYS %08X EXT %08X", khz / 1000, khz % 1000,
-                (khz * 3 + 500) / 1000, (u8)ver >= 0x20 ? "Bollywood" : "Vegas", (unsigned)pll, (unsigned)ext);
+        wtb_log("clock: %u.%03u MHz system (CPU %u MHz), %s%s, PLLSYS %08X EXT %08X", khz / 1000, khz % 1000,
+                (khz * 3 + 500) / 1000, bolly ? "Bollywood" : "Vegas", ssc ? ", spread spectrum on" : "",
+                (unsigned)pll, (unsigned)ext);
 }
 
 // "on" (the whole run) or "T0-T1" in seconds
