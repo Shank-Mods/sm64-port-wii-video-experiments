@@ -24,7 +24,9 @@
 
 #include "wtb.h"
 
-#define WTB_MAX_CFG 32
+#ifndef WTB_MAX_CFG
+#define WTB_MAX_CFG 256 // cfg entries kept; more are counted and reported (wtb_init)
+#endif
 
 static bool active;
 static char host[64];
@@ -33,6 +35,7 @@ static char job[64];
 static char cfg_name[WTB_MAX_CFG][48];
 static char cfg_value[WTB_MAX_CFG][96];
 static int ncfg;
+static int cfg_dropped; // entries past WTB_MAX_CFG
 static bool net_ok;
 static u64 t_start;
 static unsigned (*game_clock)(void);
@@ -187,6 +190,8 @@ static void parse_item(const char *s) {
         for (char *e = job + strlen(job); e > job && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' '); e--)
             e[-1] = '\0';
         active = host[0] && port && job[0];
+    } else if (strncmp(s, "cfg", 3) == 0 && (s[3] == '=' || s[3] == ' ') && ncfg >= WTB_MAX_CFG) {
+        cfg_dropped++;
     } else if (strncmp(s, "cfg", 3) == 0 && (s[3] == '=' || s[3] == ' ') && ncfg < WTB_MAX_CFG) {
         const char *n = s + 4;
         const char *sep = strpbrk(n, "= ");
@@ -309,6 +314,8 @@ bool wtb_init(int argc, char **argv, const char *file_path, const char *game, co
     snprintf(hello, sizeof(hello), "WTB/1 HELLO %s %s %s %s\n", job, game, net_ok ? ip : "-", build);
     send_msg(hello, NULL, 0);
     report_clock();
+    if (cfg_dropped)
+        wtb_log("wtb: %d cfg entries dropped (more than %d)", cfg_dropped, WTB_MAX_CFG);
     return true;
 }
 
