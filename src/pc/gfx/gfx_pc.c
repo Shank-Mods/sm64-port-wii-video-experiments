@@ -613,6 +613,13 @@ static void import_texture(int tile) {
     bench_pop();
 }
 
+#ifdef TARGET_GX
+// filter_3point: set while a texture the game draws filtered is decoded (gfx_gx.c resamples it
+// through the N64's 3-point filter), with the tile's wrap modes for the edges
+bool gfx_tex3pt_active;
+uint32_t gfx_tex3pt_cms, gfx_tex3pt_cmt;
+#endif
+
 static void import_texture_impl(int tile) {
     uint8_t fmt = rdp.texture_tile.fmt;
     uint8_t siz = rdp.texture_tile.siz;
@@ -626,6 +633,15 @@ static void import_texture_impl(int tile) {
         palette_hash = gfx_hash_cached(rdp.palette, palette_size);
     }
 
+#ifdef TARGET_GX
+    // filter_3point: a filtered texture is stored resampled, so it gets its own cache entry
+    // (the same image drawn point-sampled keeps the plain one)
+    const bool three_point = configFilter3Point && !configForceNearest &&
+                             (rdp.other_mode_h & (3U << G_MDSFT_TEXTFILT)) != G_TF_POINT;
+    if (three_point) {
+        palette_hash ^= 0x3B0F17A5u;
+    }
+#endif
     if (gfx_texture_cache_lookup(tile, &rendering_state.textures[tile], rdp.loaded_texture[tile].addr,
                                  fmt, siz, size_bytes, line_size_bytes, texture_hash, palette_hash)) {
         return;
@@ -633,10 +649,13 @@ static void import_texture_impl(int tile) {
 
 #ifdef TARGET_GX
     // opt_native_tex: straight from N64 data to a native GX format, with no RGBA32 step
-    if (configOptNativeTex && gfx_gx_upload_texture_n64(fmt, siz, rdp.loaded_texture[tile].addr, size_bytes,
+    if (!three_point && configOptNativeTex && gfx_gx_upload_texture_n64(fmt, siz, rdp.loaded_texture[tile].addr, size_bytes,
                                                         line_size_bytes, rdp.palette)) {
         return;
     }
+    gfx_tex3pt_active = three_point;
+    gfx_tex3pt_cms = rdp.texture_tile.cms;
+    gfx_tex3pt_cmt = rdp.texture_tile.cmt;
 #endif
     int t0 = get_time();
     if (fmt == G_IM_FMT_RGBA) {
@@ -676,6 +695,9 @@ static void import_texture_impl(int tile) {
     } else {
         abort();
     }
+#ifdef TARGET_GX
+    gfx_tex3pt_active = false;
+#endif
     int t1 = get_time();
     //printf("Time diff: %d\n", t1 - t0);
 }

@@ -913,8 +913,78 @@ static void convert_to_rgb5a3(uint16_t *dest, const uint8_t *data, uint32_t widt
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// filter_3point: the N64's 3-point texture filter on a GPU that only does 4-point bilinear.
+// The RDP blends 3 of the 4 texels around the sample point: with fx, fy the fractions inside
+// the texel square, T00 + fx (T10 - T00) + fy (T01 - T00) when fx + fy <= 1, else
+// T11 + (1 - fx) (T01 - T11) + (1 - fy) (T10 - T11). The GPU can't do that per pixel, so a
+// texture the game draws filtered is resampled once, when it's decoded, through that formula
+// onto a grid k times finer (k = 4 up to 32x32 texels, 2 up to 64x64); the GPU's bilinear between
+// those samples then follows the 3-point surface to within 1/k texel. Same texture coordinates
+// (they're normalized), same GPU cost per pixel; more texture memory (16x / 4x) and a slower
+// first decode, both cached. Edges wrap like the tile: clamp, mirror or repeat.
+
+extern bool gfx_tex3pt_active;
+extern uint32_t gfx_tex3pt_cms, gfx_tex3pt_cmt;
+
+static inline int tex3pt_wrap(int i, int n, uint32_t cm)
+{
+    if (cm & G_TX_CLAMP)
+        return i < 0 ? 0 : i >= n ? n - 1 : i;
+    if (cm & G_TX_MIRROR)
+    {
+        const int m = ((i % (2 * n)) + 2 * n) % (2 * n);
+        return m < n ? m : 2 * n - 1 - m;
+    }
+    return ((i % n) + n) % n;
+}
+
+// rgba32 (w x h) -> out (kw x kh), each output texel = the 3-point filter at its centre
+static void tex3pt_resample(const uint8_t *src, int w, int h, uint8_t *out, int k)
+{
+    const int kw = w * k, kh = h * k;
+    for (int oy = 0; oy < kh; oy++)
+    {
+        // output texel centre in source texel-centre coordinates
+        const float sy = (oy + 0.5f) / k - 0.5f;
+        const int y0 = (int)floorf(sy);
+        const float fy = sy - y0;
+        const int ya = tex3pt_wrap(y0, h, gfx_tex3pt_cmt), yb = tex3pt_wrap(y0 + 1, h, gfx_tex3pt_cmt);
+        for (int ox = 0; ox < kw; ox++)
+        {
+            const float sx = (ox + 0.5f) / k - 0.5f;
+            const int x0 = (int)floorf(sx);
+            const float fx = sx - x0;
+            const int xa = tex3pt_wrap(x0, w, gfx_tex3pt_cms), xb = tex3pt_wrap(x0 + 1, w, gfx_tex3pt_cms);
+            const uint8_t *t00 = src + 4 * (ya * w + xa), *t10 = src + 4 * (ya * w + xb);
+            const uint8_t *t01 = src + 4 * (yb * w + xa), *t11 = src + 4 * (yb * w + xb);
+            uint8_t *d = out + 4 * (oy * kw + ox);
+            if (fx + fy <= 1.0f)
+                for (int c = 0; c < 4; c++)
+                    d[c] = (uint8_t)(t00[c] + fx * (t10[c] - t00[c]) + fy * (t01[c] - t00[c]) + 0.5f);
+            else
+                for (int c = 0; c < 4; c++)
+                    d[c] = (uint8_t)(t11[c] + (1.0f - fx) * (t01[c] - t11[c]) + (1.0f - fy) * (t10[c] - t11[c]) + 0.5f);
+        }
+    }
+}
+
+static uint8_t tex3pt_buf[128 * 128 * 4] __attribute__((aligned(32)));
+
 static void gfx_gx_upload_texture(const uint8_t *rgba32_buf, int width, int height)
 {
+    if (gfx_tex3pt_active)
+    {
+        const int k = (width <= 32 && height <= 32) ? 4 : (width <= 64 && height <= 64) ? 2 : 1;
+        if (k > 1)
+        {
+            tex3pt_resample(rgba32_buf, width, height, tex3pt_buf, k);
+            rgba32_buf = tex3pt_buf;
+            width *= k;
+            height *= k;
+        }
+    }
+
     uint32_t buffer_width = round_up(width, 4);
     uint32_t buffer_height = round_up(height, 4);
     size_t texture_size = (size_t)buffer_width * buffer_height * sizeof(uint16_t);
