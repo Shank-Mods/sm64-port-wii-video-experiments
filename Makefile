@@ -865,6 +865,40 @@ $(BUILD_DIR)/src/pc/gfx/gfx_pc.o: CFLAGS += -Wa,-mgekko
 $(BUILD_DIR)/src/pc/mixer.o: CFLAGS += -O3 -funroll-loops
 endif
 
+ifeq ($(TARGET_WII),1)
+# Shareable builds: no ROM data in boot.dol. The asset objects are compiled with one section per
+# array; wii/tools/strip_rom_data.py finds the arrays whose bytes are the ROM's (as stored or in
+# an MIO0 segment; float vertices via their N64 form), moves them to .bss in copies of the
+# objects (build/<ver>_wii/romstrip/) and writes romdata_table.c, which src/pc/romdata.c uses to
+# put them back from the player's ROM at boot. STRIP_ROM_DATA=0 links everything in as before.
+STRIP_ROM_DATA ?= 1
+BASEROM := baserom.$(VERSION).z64
+# the game's objects (assets, and the game code's tables); not src/pc (the port's own, partly
+# used before the ROM is loaded) nor memory.c (its pools are set up before)
+ROMDATA_O_FILES := $(filter-out $(BUILD_DIR)/src/game/memory.o,$(filter $(addprefix $(BUILD_DIR)/,levels/% actors/% bin/% assets/% sound/% src/game/% src/engine/% src/audio/% src/menu/% src/goddard/%),$(O_FILES) $(GODDARD_O_FILES) $(SOUND_OBJ_FILES)))
+ROMSTRIP_DIR := $(BUILD_DIR)/romstrip
+$(ROMDATA_O_FILES): CFLAGS += -fdata-sections
+ifeq ($(STRIP_ROM_DATA),1)
+ROMDATA_TABLE := $(BUILD_DIR)/romdata_table.c
+ROMSTRIP_O_FILES := $(patsubst $(BUILD_DIR)/%,$(ROMSTRIP_DIR)/%,$(ROMDATA_O_FILES))
+LINK_O_FILES := $(filter-out $(ROMDATA_O_FILES),$(O_FILES) $(SOUND_OBJ_FILES) $(GODDARD_O_FILES)) $(ROMSTRIP_O_FILES) $(ROMDATA_TABLE:.c=.o)
+$(ROMDATA_TABLE): $(ROMDATA_O_FILES) wii/tools/strip_rom_data.py
+	@echo "strip_rom_data.py: ROM data out of the asset objects -> $(ROMSTRIP_DIR), $@"
+	@$(PYTHON) wii/tools/strip_rom_data.py --rom $(BASEROM) --objcopy $(OBJCOPY) --build $(BUILD_DIR) --out $(ROMSTRIP_DIR) --table $@ --report $(BUILD_DIR)/romdata_report.txt $(ROMDATA_O_FILES)
+$(ROMSTRIP_O_FILES): $(ROMDATA_TABLE)
+	@test -f $@
+else
+ROMDATA_TABLE := $(BUILD_DIR)/romdata_none.c
+LINK_O_FILES := $(O_FILES) $(SOUND_OBJ_FILES) $(GODDARD_O_FILES) $(ROMDATA_TABLE:.c=.o)
+$(ROMDATA_TABLE):
+	printf '#include "pc/romdata.h"\nconst unsigned int gWiiRomCrc[2], gWiiRomDataSum, gWiiRomSourceCount, gWiiRomPieceCount;\nconst struct WiiRomSource gWiiRomSources[1];\nconst struct WiiRomPiece gWiiRomPieces[1];\n' > $@
+endif
+$(ROMDATA_TABLE:.c=.o): $(ROMDATA_TABLE) src/pc/romdata.h
+	$(CC) -c $(CFLAGS) -o $@ $<
+else
+LINK_O_FILES := $(O_FILES) $(SOUND_OBJ_FILES) $(GODDARD_O_FILES)
+endif
+
 ifeq ($(TARGET_N64),1)
 $(BUILD_DIR)/$(LD_SCRIPT): $(LD_SCRIPT)
 	$(CPP) $(VERSION_CFLAGS) -MMD -MP -MT $@ -MF $@.d -I include/ -I . -DBUILD_DIR=$(BUILD_DIR) -o $@ $<
@@ -889,13 +923,27 @@ $(BUILD_DIR)/$(TARGET).objdump: $(ELF)
 else
 ifeq ($(TARGET_GX),1)
 
-$(BUILD_DIR)/$(TARGET).elf: $(O_FILES) $(MIO0_FILES:.mio0=.o) $(SOUND_OBJ_FILES) $(ULTRA_O_FILES) $(GODDARD_O_FILES)
-	$(LD) -L $(BUILD_DIR) -o $(BUILD_DIR)/$(TARGET).elf $(O_FILES) $(SOUND_OBJ_FILES) $(ULTRA_O_FILES) $(GODDARD_O_FILES) $(LDFLAGS)
+$(BUILD_DIR)/$(TARGET).elf: $(LINK_O_FILES) $(MIO0_FILES:.mio0=.o) $(ULTRA_O_FILES)
+	$(LD) -L $(BUILD_DIR) -o $(BUILD_DIR)/$(TARGET).elf $(LINK_O_FILES) $(ULTRA_O_FILES) $(LDFLAGS)
 
 %.dol: %.elf
 	elf2dol $< $(BUILD_DIR)/boot.dol
 	cp wii/meta.xml $(BUILD_DIR)/meta.xml
 	cp wii/icon.png $(BUILD_DIR)/icon.png
+	@ls -l $(BUILD_DIR)/boot.dol
+
+# Tester build: an SD card zip (apps/sm64/...) without the ROM; the player adds their own
+# US ROM as apps/sm64/sm64.z64. Its sm64config.txt turns the benchmark defaults (timedemo,
+# overlay, 720p) off, so the same boot.dol the bench tested plays normally.
+PKG_DIR := $(BUILD_DIR)/pkg
+PKG_ZIP := $(BUILD_DIR)/sm64-wii-sd.zip
+PKG_FILES := wii/dist/meta.xml wii/dist/README.txt wii/dist/PUT_YOUR_ROM_HERE.txt wii/dist/sm64config.txt wii/icon.png
+package: $(EXE) $(PKG_FILES)
+	rm -rf $(PKG_DIR) $(PKG_ZIP)
+	mkdir -p $(PKG_DIR)/apps/sm64
+	cp $(BUILD_DIR)/boot.dol $(PKG_FILES) $(PKG_DIR)/apps/sm64/
+	cd $(PKG_DIR) && $(PYTHON) -m zipfile -c $(abspath $(PKG_ZIP)) apps
+	@ls -l $(PKG_ZIP)
 
 else
 $(EXE): $(O_FILES) $(MIO0_FILES:.mio0=.o) $(SOUND_OBJ_FILES) $(ULTRA_O_FILES) $(GODDARD_O_FILES)
@@ -904,7 +952,7 @@ endif
 endif
 
 
-.PHONY: all clean distclean default diff test load libultra
+.PHONY: all clean distclean default diff test load libultra package
 # with no prerequisites, .SECONDARY causes no intermediate target to be removed
 .SECONDARY:
 

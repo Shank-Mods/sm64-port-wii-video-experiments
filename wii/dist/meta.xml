@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>Super Mario 64</name>
+  <coder>sm64-port by mkst &amp; PalindromicBreadLoaf, Wii port by Shank-Mods</coder>
+  <version>wii-share</version>
+  <release_date>20261119</release_date>
+  <short_description>Native Super Mario 64 (needs your ROM)</short_description>
+  <long_description>Native Wii build of Super Mario 64 (USA), compiled from the sm64 decompilation (sm64-port). No game data is included: put your own US ROM in this folder (apps/sm64) as sm64.z64. Settings: apps/sm64/sm64config.txt (see README.txt).</long_description>
+  <ahb_access/>
+</app>

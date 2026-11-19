@@ -1,0 +1,4 @@
+video_mode default
+bench_demo false
+bench_overlay false
+bench_uncapped false

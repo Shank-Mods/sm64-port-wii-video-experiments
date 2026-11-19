@@ -24,6 +24,7 @@
 #include "gfx/gfx_gx_wm.h"
 #include "gfx/gfx_gx.h"
 #include "gx_shutdown.h"
+#include "romdata.h"
 #endif
 
 #include "audio/audio_api.h"
@@ -370,6 +371,11 @@ void main_func(void) {
         if (test_script_active())
             wtb_set_clock(test_script_ms); // screenshots on the script's game clock
     }
+#endif
+#if defined(TARGET_GX) && defined(__wii__)
+    // The textures, sounds, models... aren't in boot.dol: they come from the player's ROM
+    // (apps/sm64/sm64.z64), before anything uses them
+    romdata_restore();
 #endif
 #ifdef HIRES_FORCE
     configHires1280 = HIRES_FORCE;

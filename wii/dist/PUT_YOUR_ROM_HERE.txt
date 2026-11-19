@@ -1,0 +1,4 @@
+Put your own Super Mario 64 (USA) ROM in this folder, named sm64.z64
+(.v64 and .n64 byte orders also work, but keep the name sm64.z64).
+No game data is included: the game loads its textures, sounds and models
+from that file every time it starts.
