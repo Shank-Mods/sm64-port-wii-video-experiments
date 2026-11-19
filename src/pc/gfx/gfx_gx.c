@@ -939,32 +939,54 @@ static inline int tex3pt_wrap(int i, int n, uint32_t cm)
     return ((i % n) + n) % n;
 }
 
-// rgba32 (w x h) -> out (kw x kh), each output texel = the 3-point filter at its centre
+// rgba32 (w x h) -> out (kw x kh), each output texel = the 3-point filter at its centre.
+// Output texel (X*k + sub) sits at source position X + (sub + 0.5)/k - 0.5, so its fractions take
+// only k values: integer weights in units of U = 2k (k = 4: eighths, k = 2: quarters).
+//   a + b <= U: (T00 (U - a - b) + T10 a + T01 b) / U
+//   else:       (T11 (a + b - U) + T01 (U - a) + T10 (U - b)) / U
 static void tex3pt_resample(const uint8_t *src, int w, int h, uint8_t *out, int k)
 {
-    const int kw = w * k, kh = h * k;
-    for (int oy = 0; oy < kh; oy++)
+    const int U = 2 * k, kw = w * k;
+    int8_t off[4];
+    uint8_t frac[4];
+    for (int sub = 0; sub < k; sub++)
     {
-        // output texel centre in source texel-centre coordinates
-        const float sy = (oy + 0.5f) / k - 0.5f;
-        const int y0 = (int)floorf(sy);
-        const float fy = sy - y0;
-        const int ya = tex3pt_wrap(y0, h, gfx_tex3pt_cmt), yb = tex3pt_wrap(y0 + 1, h, gfx_tex3pt_cmt);
-        for (int ox = 0; ox < kw; ox++)
+        const int t = 2 * sub + 1 - k; // (sub + 0.5)/k - 0.5 in units of 1/U
+        off[sub] = t < 0 ? -1 : 0;
+        frac[sub] = (uint8_t)(t < 0 ? t + U : t);
+    }
+    int xa[128], xb[128];
+    uint8_t fa[128];
+    for (int ox = 0; ox < kw; ox++)
+    {
+        const int x0 = ox / k + off[ox % k];
+        xa[ox] = 4 * tex3pt_wrap(x0, w, gfx_tex3pt_cms);
+        xb[ox] = 4 * tex3pt_wrap(x0 + 1, w, gfx_tex3pt_cms);
+        fa[ox] = frac[ox % k];
+    }
+    for (int oy = 0; oy < h * k; oy++)
+    {
+        const int y0 = oy / k + off[oy % k];
+        const int b = frac[oy % k];
+        const uint8_t *ra = src + 4 * w * tex3pt_wrap(y0, h, gfx_tex3pt_cmt);
+        const uint8_t *rb = src + 4 * w * tex3pt_wrap(y0 + 1, h, gfx_tex3pt_cmt);
+        uint8_t *d = out + 4 * kw * oy;
+        for (int ox = 0; ox < kw; ox++, d += 4)
         {
-            const float sx = (ox + 0.5f) / k - 0.5f;
-            const int x0 = (int)floorf(sx);
-            const float fx = sx - x0;
-            const int xa = tex3pt_wrap(x0, w, gfx_tex3pt_cms), xb = tex3pt_wrap(x0 + 1, w, gfx_tex3pt_cms);
-            const uint8_t *t00 = src + 4 * (ya * w + xa), *t10 = src + 4 * (ya * w + xb);
-            const uint8_t *t01 = src + 4 * (yb * w + xa), *t11 = src + 4 * (yb * w + xb);
-            uint8_t *d = out + 4 * (oy * kw + ox);
-            if (fx + fy <= 1.0f)
+            const int a = fa[ox];
+            const uint8_t *t00 = ra + xa[ox], *t10 = ra + xb[ox], *t01 = rb + xa[ox], *t11 = rb + xb[ox];
+            if (a + b <= U)
+            {
+                const int w00 = U - a - b;
                 for (int c = 0; c < 4; c++)
-                    d[c] = (uint8_t)(t00[c] + fx * (t10[c] - t00[c]) + fy * (t01[c] - t00[c]) + 0.5f);
+                    d[c] = (uint8_t)((t00[c] * w00 + t10[c] * a + t01[c] * b + k) / U);
+            }
             else
+            {
+                const int w11 = a + b - U, w01 = U - a, w10 = U - b;
                 for (int c = 0; c < 4; c++)
-                    d[c] = (uint8_t)(t11[c] + (1.0f - fx) * (t01[c] - t11[c]) + (1.0f - fy) * (t10[c] - t11[c]) + 0.5f);
+                    d[c] = (uint8_t)((t11[c] * w11 + t01[c] * w01 + t10[c] * w10 + k) / U);
+            }
         }
     }
 }
