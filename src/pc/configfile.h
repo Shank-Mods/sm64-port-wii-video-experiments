@@ -98,6 +98,7 @@ extern bool         configInvertCamera;
 extern bool         configRumble;
 extern bool         configFog;
 extern bool         configForceNearest;
+extern bool         configSmoothHud;
 extern bool         configViDeflicker;
 extern bool         configPuppycam;
 extern bool         configBenchmark;
