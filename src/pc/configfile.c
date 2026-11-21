@@ -162,6 +162,7 @@ bool configInvertCamera          = false; // Invert camera controls
 bool configRumble                = true;  // Shindou controller rumble
 bool configFog                   = true;  // Distance fog (turning it off also extends the level draw distance)
 bool configForceNearest          = false; // Force GX_NEAR (nearest-neighbour) texture filtering instead of bilinear
+bool configSmoothHud            = false; // Bilinear-filter the HUD and text font (the N64 draws them unfiltered)
 bool configViDeflicker           = true;  // Apply the VI deflicker filter
 bool configPuppycam              = false; // Use the Puppycam analogue camera instead of the original camera
 unsigned int configBenchSeconds  = 0;     // timed pass: game seconds from the test level's start (or boot), then results
@@ -267,6 +268,7 @@ static const struct ConfigOption options[] = {
     {.name = "rumble",         .type = CONFIG_TYPE_BOOL, .boolValue = &configRumble},
     {.name = "fog",            .type = CONFIG_TYPE_BOOL, .boolValue = &configFog},
     {.name = "force_nearest",  .type = CONFIG_TYPE_BOOL, .boolValue = &configForceNearest},
+    {.name = "smooth_hud",     .type = CONFIG_TYPE_BOOL, .boolValue = &configSmoothHud},
     {.name = "vi_deflicker",   .type = CONFIG_TYPE_BOOL, .boolValue = &configViDeflicker},
     {.name = "puppycam",       .type = CONFIG_TYPE_BOOL, .boolValue = &configPuppycam},
     {.name = "bench_demo",     .type = CONFIG_TYPE_BOOL, .boolValue = &configBenchmark},

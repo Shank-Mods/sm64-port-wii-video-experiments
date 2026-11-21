@@ -1908,11 +1908,16 @@ static void gfx_dp_set_fill_color(uint32_t packed_color) {
     rdp.fill_color.a = a * 255;
 }
 
+// Set while drawing a texture rectangle (HUD icons, text font) with the "smooth HUD" option on
+static bool s_smooth_rect = false;
+
 static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry) {
     uint32_t saved_other_mode_h = rdp.other_mode_h;
     uint32_t cycle_type = (rdp.other_mode_h & (3U << G_MDSFT_CYCLETYPE));
 
-    if (cycle_type == G_CYC_COPY) {
+    if (s_smooth_rect) {
+        rdp.other_mode_h = (rdp.other_mode_h & ~(3U << G_MDSFT_TEXTFILT)) | G_TF_BILERP;
+    } else if (cycle_type == G_CYC_COPY) {
         rdp.other_mode_h = (rdp.other_mode_h & ~(3U << G_MDSFT_TEXTFILT)) | G_TF_POINT;
     }
 
@@ -1971,7 +1976,7 @@ static void gfx_draw_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lr
     rdp.viewport = viewport_saved;
     rdp.viewport_or_scissor_changed = true;
 
-    if (cycle_type == G_CYC_COPY) {
+    if (s_smooth_rect || cycle_type == G_CYC_COPY) {
         rdp.other_mode_h = saved_other_mode_h;
     }
 }
@@ -2024,7 +2029,9 @@ static void gfx_dp_texture_rectangle(int32_t ulx, int32_t uly, int32_t lrx, int3
         ur->v = lrt;
     }
 
+    s_smooth_rect = configSmoothHud;
     gfx_draw_rectangle(ulx, uly, lrx, lry);
+    s_smooth_rect = false;
     rdp.combine_mode = saved_combine_mode;
 }
 
