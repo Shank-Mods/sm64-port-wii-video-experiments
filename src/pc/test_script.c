@@ -6,6 +6,7 @@
 //                              title screen and file select
 //   test_press T BUTTONS [N]   at T seconds, hold BUTTONS (A B Z START L R CU CD CL CR DU DD DL DR,
 //                              joined with +) for N game frames (default 3)
+//   test_pos X Y Z [YAW [T]]   put Mario there (facing YAW degrees, 0 = +Z, 90 = +X) at tick 3 or T seconds
 //   test_stick T X Y [S]       at T seconds, hold the stick at X,Y (-80..80) for S seconds
 //                              (default 0.5)
 //
@@ -19,6 +20,12 @@
 #include <string.h>
 
 #include <ultra64.h>
+#include "sm64.h"
+#include "game/area.h"
+#include "game/camera.h"
+#include "game/level_update.h"
+#include "engine/math_util.h"
+#include "game/object_list_processor.h"
 #include "level_table.h"
 #include "test_script.h"
 #include "configfile.h"
@@ -41,6 +48,10 @@ static bool level_pending;    // test_level set and not entered yet
 static bool started;          // the clock runs (level loaded, or no test_level)
 static unsigned ticks;        // game ticks since the clock started
 static bool any;              // any test_ option given
+static bool pos_pending;      // test_pos given
+static float pos_xyz[3];
+static int pos_yaw;           // degrees, 0 = facing +Z, 90 = facing +X
+static unsigned pos_tick = 3; // game tick of the move (after the level spawned Mario)
 
 static const struct { const char *name; int level; } levels[] = {
 #define STUB_LEVEL(_0, _1, _2, _3, _4, _5, _6, _7, _8)
@@ -101,6 +112,19 @@ bool test_script_option(const char *name, const char *value) {
         } else {
             level_pending = true;
             configBenchmark = false; // the attract demos would take over the input
+        }
+        return true;
+    }
+    if (strcmp(name, "test_pos") == 0) {
+        // test_pos X Y Z [YAW_DEG [T]]: put Mario here (at T seconds, default tick 3)
+        float x = 0, y = 0, z = 0, t = -1;
+        int yaw = 0;
+        if (sscanf(value, "%f %f %f %d %f", &x, &y, &z, &yaw, &t) >= 3) {
+            pos_xyz[0] = x; pos_xyz[1] = y; pos_xyz[2] = z;
+            pos_yaw = yaw;
+            if (t >= 0)
+                pos_tick = secs_to_ticks(t);
+            pos_pending = true;
         }
         return true;
     }
@@ -186,6 +210,22 @@ void test_script_apply(unsigned short *button, signed char *stick_x, signed char
         return;
     if (ticks == 0 && test_level > 0)
         gDebugLevelSelect = 0; // normal play from here (damage, deaths), as without the level select
+    if (pos_pending && ticks >= pos_tick && gMarioState != NULL && gMarioState->marioObj != NULL) {
+        pos_pending = false;
+        s16 yaw = (s16)(pos_yaw * 0x10000 / 360);
+        gMarioState->pos[0] = pos_xyz[0];
+        gMarioState->pos[1] = pos_xyz[1];
+        gMarioState->pos[2] = pos_xyz[2];
+        gMarioState->vel[0] = gMarioState->vel[1] = gMarioState->vel[2] = 0;
+        gMarioState->forwardVel = 0;
+        gMarioState->faceAngle[1] = yaw;
+        gMarioState->marioObj->oMoveAngleYaw = yaw;
+        gMarioState->marioObj->header.gfx.angle[1] = yaw;
+        vec3f_copy(gMarioState->marioObj->header.gfx.pos, gMarioState->pos);
+        if (gCurrentArea != NULL && gCurrentArea->camera != NULL)
+            reset_camera(gCurrentArea->camera);
+        dbglog("test_pos: Mario to %.0f %.0f %.0f yaw %d", pos_xyz[0], pos_xyz[1], pos_xyz[2], pos_yaw);
+    }
     for (int i = 0; i < nevents; i++) {
         const struct Event *e = &events[i];
         if (ticks < e->start || ticks >= e->end)
