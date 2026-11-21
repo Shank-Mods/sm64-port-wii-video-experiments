@@ -4,6 +4,7 @@
 #include "seq_ids.h"
 #include "dialog_ids.h"
 #include "audio/external.h"
+#include "audio/load.h"
 #include "level_update.h"
 #ifdef TARGET_GX
 #include "pc/wtb.h"
@@ -1325,6 +1326,16 @@ s32 lvl_set_current_level(UNUSED s16 arg0, s32 levelNum) {
  * Play the "thank you so much for to playing my game" sound.
  */
 s32 lvl_play_the_end_screen_sound(UNUSED s16 arg0, UNUSED s32 arg1) {
+#ifdef TARGET_GX
+    // Wait (at most 10 s of game time) for the ending music to finish fading before the line plays
+    static s32 sEndSoundWait = 0;
+    if (sEndSoundWait < 300 && gSequencePlayers[SEQ_PLAYER_LEVEL].enabled
+        && gSequencePlayers[SEQ_PLAYER_LEVEL].fadeTimer != 0) {
+        sEndSoundWait++;
+        return 0;
+    }
+    sEndSoundWait = 0;
+#endif
     play_sound(SOUND_MENU_THANK_YOU_PLAYING_MY_GAME, gDefaultSoundArgs);
     return 1;
 }

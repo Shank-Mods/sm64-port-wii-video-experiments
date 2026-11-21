@@ -12,6 +12,7 @@
 #include "sm64.h"
 #include "pc/configfile.h"
 #include "level_geo.h"
+#include "level_update.h"
 #include "skybox.h"
 #include <stdlib.h>
 
@@ -1258,6 +1259,14 @@ static s32 obj_is_in_view(struct GraphNodeObject *node, Mat4 matrix) {
     } else if (matrix[3][2] < -20000.0f - cullingRadius) {
         return FALSE;
     }
+
+#ifdef TARGET_GX
+    // Credits: the cameras cut and pan fast and the 60 fps in-between frames can show what the
+    // tick's camera doesn't, so pieces of the level went missing. Keep everything in front.
+    if (gCurrCreditsEntry != NULL) {
+        return TRUE;
+    }
+#endif
 
     // Check whether the object is horizontally in view
     if (matrix[3][0] > hScreenEdge + cullingRadius) {
