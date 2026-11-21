@@ -35,6 +35,7 @@ struct Event {
 
 static struct Event events[MAX_EVENTS];
 static int nevents;
+static bool test_wing_light;  // test_wing_light 1: always show the castle lobby wing cap light beam
 static int test_level = -1;   // -1: none
 static int test_act = 1;
 static bool level_pending;    // test_level set and not entered yet
@@ -76,6 +77,10 @@ static unsigned secs_to_ticks(double s) {
     return s <= 0 ? 0 : (unsigned)(s * 30.0 + 0.5);
 }
 
+bool test_script_wing_light(void) {
+    return test_wing_light;
+}
+
 bool test_script_option(const char *name, const char *value) {
     if (strncmp(name, "test_", 5) != 0)
         return false;
@@ -102,6 +107,10 @@ bool test_script_option(const char *name, const char *value) {
             level_pending = true;
             configBenchmark = false; // the attract demos would take over the input
         }
+        return true;
+    }
+    if (strcmp(name, "test_wing_light") == 0) {
+        test_wing_light = atoi(value) != 0;
         return true;
     }
     if (nevents >= MAX_EVENTS)

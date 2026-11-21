@@ -8,6 +8,8 @@
 // A "test_..." config option (true if it was one; the value is the rest of the line)
 bool test_script_option(const char *name, const char *value);
 bool test_script_active(void);
+// test_wing_light 1: show the castle lobby wing cap light beam whatever the save file says
+bool test_script_wing_light(void);
 
 // test_level: the title screen asks whether to go straight to a level; the level select takes it
 bool test_script_level_wanted(void);
